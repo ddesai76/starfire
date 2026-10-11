@@ -1,22 +1,17 @@
-"""
-jira_ticket.py -- Jira ticket creation for Starfire.
-
-starfire.py imports this module directly, and it is bundled into the
-binary. What is optional is the config: Jira is switched on only if a
-jira_config.json exists in the CURRENT WORKING DIRECTORY at startup
-(cwd is where .test/.camp files and captured photos already live; the
-config is user-specific, not part of the app install). Without it
-Starfire behaves as if Jira didn't exist -- no error, no missing-feature
-message. See CONFIG_TEMPLATE below for the shape.
-
-Dependencies: stdlib only.
-"""
+# jira_ticket.py: JIRA TICKET CREATION
+# AUTHOR:         DANIEL DESAI
+# UPDATED:        2026-10-11
+# VERSION:        0.2.0
+#
+# Imported by starfire.py. Jira connectivity is available only if jira_config.json is in the working
+# directory or in /dist.
 
 from __future__ import annotations
 
 import base64
 import json
 import os
+import sys
 import urllib.error
 import urllib.request
 
@@ -27,23 +22,21 @@ CONFIG_TEMPLATE = {
     "email": "you@example.com",
     "api_token": "",
     "project_key": "PROJ",
-    # Separate issue types: a test point's ticket is found-during-execution
-    # work (Bug); a Test row's ticket is planning-level work (Task).
+    # Bug for test point tickets, Task for campaign test rows.
     "issue_type": "Bug",
     "test_issue_type": "Task",
-    # Filled in automatically after the first ticket with an Epic key --
-    # "parent" (team-managed) or a "customfield_XXXXX" id (classic). Safe to leave alone.
+    # Set automatically after the first ticket with an epic key.
     "epic_link_field": None,
 }
 
 
 def _config_path() -> str:
-    # Deliberately cwd-relative, not __file__-relative: jira_ticket.py's
-    # own code is bundled into the starfire binary (see starfire.py's
-    # `import jira_ticket`), so __file__ would point inside the frozen
-    # bundle, not somewhere a person could actually edit. The config
-    # stays a genuinely external file, found the same way .test/.camp
-    # files and the measure binary already are -- wherever the app is run from.
+    # Working directory first, then beside the program (dist/ when run from source).
+    here = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    for d in (os.getcwd(), here, os.path.join(here, "dist")):
+        p = os.path.join(d, CONFIG_FILENAME)
+        if os.path.isfile(p):
+            return p
     return os.path.join(os.getcwd(), CONFIG_FILENAME)
 
 
@@ -66,8 +59,7 @@ def load_config() -> dict | None:
 
 
 def _save_epic_link_field(field_name: str) -> None:
-    # Best-effort cache write -- never worth failing a ticket creation over;
-    # the next ticket just re-detects it if this fails.
+    # Best-effort cache; a failed write just means re-detecting next time.
     path = _config_path()
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -113,8 +105,7 @@ def _jira_error_text(body: dict) -> str:
 
 
 def _find_epic_link_custom_field(cfg: dict) -> str | None:
-    """Company-managed/classic project fallback: look for a custom field
-    literally named 'Epic Link' in this project's create-issue metadata."""
+    """Classic projects: find the custom field named 'Epic Link'."""
     status, body = _api_request(
         cfg, "GET",
         f"/rest/api/2/issue/createmeta?projectKeys={cfg['project_key']}&expand=projects.issuetypes.fields",
@@ -131,19 +122,12 @@ def _find_epic_link_custom_field(cfg: dict) -> str | None:
 
 def create_ticket(summary: str, description: str, epic_key: str = "",
                     issue_type: str | None = None) -> dict:
-    """Creates a Jira issue. Returns {"success": True, "key": ..., "url": ...}
-    or {"success": False, "error": ...} -- never raises, so a UI caller can
-    always show *something* meaningful rather than a stack trace.
-
-    issue_type overrides cfg["issue_type"] for this one call -- the caller
-    decides which config key applies (a test point's ticket vs. a Test
-    Series/Ancillary Tests row's ticket use different ones; see
-    CONFIG_TEMPLATE). Defaults to cfg["issue_type"] when not given, so
-    existing point-ticket callers don't need to change."""
+    """Returns {"success": True, "key", "url"} or {"success": False, "error"}; never raises.
+    issue_type overrides the config's issue_type for this call."""
     cfg = load_config()
     if not cfg:
         return {"success": False,
-                 "error": f"No usable {CONFIG_FILENAME} found next to jira_ticket.py "
+                 "error": f"No usable {CONFIG_FILENAME} found "
                           f"(or it's missing base_url/email/api_token/project_key)."}
 
     fields = {
@@ -159,8 +143,7 @@ def create_ticket(summary: str, description: str, epic_key: str = "",
         if cached:
             fields[cached] = epic_key if cached != "parent" else {"key": epic_key}
         else:
-            # Try the modern (team-managed) approach first -- more common,
-            # no metadata lookup needed.
+            # Team-managed projects first; no metadata lookup needed.
             fields["parent"] = {"key": epic_key}
 
     status, body = _api_request(cfg, "POST", "/rest/api/2/issue", {"fields": fields})
@@ -171,8 +154,7 @@ def create_ticket(summary: str, description: str, epic_key: str = "",
         key = body.get("key", "")
         return {"success": True, "key": key, "url": f"{cfg['base_url'].rstrip('/')}/browse/{key}"}
 
-    # "parent" didn't work -- likely a company-managed/classic project
-    # where Epic Link is a custom field instead. Look it up once and retry.
+    # "parent" failed: likely a classic project, so retry with the Epic Link field.
     if epic_key and not cfg.get("epic_link_field") and "parent" in fields:
         custom_field = _find_epic_link_custom_field(cfg)
         if custom_field:
