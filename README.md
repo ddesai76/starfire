@@ -1,10 +1,8 @@
 # Starfire
 
-**Starfire** is a test campaign and test card designer for aerospace test programs, with hardware **sample** and **activate** buttons built into the card. It is one local program (Linux, single binary) that handles the documentation side of testing (campaigns, procedures, requirements traceability, sign-off) and, optionally, talks to bench instruments.
+**Starfire** is a test campaign and test card designer for aerospace test programs, with a **measure** button that sends SCPI lines to bench instruments and an **activate** button that runs your own scripts or programs, both built into the card. It is one local program (Linux, two small binaries) that handles the documentation side of testing (campaigns, procedures, requirements traceability, sign-off) and, optionally, talks to hardware.
 
-It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, `.docx`, `.tex`, and print/PDF.
-
-> **Status:** `starfire.py` (everything under *Implemented*) works today. `starfire.cpp` and the *Roadmap* items are scoped here but not built. Sample and Activate have only been exercised against a stand-in script, not real instruments.
+It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, `.docx`, and print/PDF.
 
 ---
 
@@ -20,23 +18,23 @@ python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 ### Build a standalone binary
 
 ```bash
-./build.sh                              # -> dist/starfire
+./build.sh                              # -> dist/starfire, dist/starfire-hw, dist/jira_config.json
 ./build.sh --install-desktop            # also adds a menu entry (uses assets/icon.png)
 ```
 
 ### Dependencies
 * **Runtime:** Python 3 standard library, plus `python-docx` for Word export.
-* **Tests:** `pytest`, then run `pytest` from the project root.
-* **Optional, dropped next to the binary (or in your working directory):**
-  * `jira_config.json` turns on Jira ticket creation (see `jira_config.example.json`).
-  * `measure` (compiled from `measure.cpp`) turns on the Sample and Activate buttons.
+* **SCPI interface:** `g++` to build `starfire-hw` from `starfire.cpp` (standard library and POSIX headers only).
+* **Optional:**
+  * `jira_config.json` in the working directory turns on Jira ticket creation (see `jira_config.example.json`).
+  * `starfire-hw` (built by `build.sh`, or `g++ -O2 -std=c++17 -o starfire-hw starfire.cpp`) turns on the Measure panel's SEND button. `starfire` looks for it in the working directory, then next to itself.
 
 ---
 
-## Implemented
+## Features
 
 ### Campaign
-* Metadata, a requirements table, and a numbered **Test Series** (plus ancillary tests). Open creates or opens the `.test` file in a tab.
+* Metadata, a requirements table, a **Modules** table, and a numbered **Test Series** (plus ancillary tests). Open creates or opens the `.test` file in a tab.
 * Free-form write-up sections.
 * **VCRM:** cross-references campaign requirements against each card's `Requirement(s)` field and reports `Covered`, `Partial`, `Planned`, or `Not Covered`. Exports to `.vcrm`, `.docx`, and PDF.
 
@@ -47,92 +45,76 @@ python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 * **Flag** a point (amber), **capture** a frame from a webcam or UVC device (saved as `<timestamp>.jpg`).
 * **Jira:** ticket button on `CAUTION`/`FAIL` points; task button on campaign test rows; auto-links to the campaign's epic key.
 
-### Hardware: Sample and Activate
-Each test point has a hardware panel with a **USB port** (for example `/dev/usbtmc0`) and two SCPI commands:
+### Test point tools: Camera, Measure, Activate
+Each test point has three tools in the button row. Each opens in its own column below the point, left to right: camera, measure, module.
 
-| Button | Icon | Command field | What it does |
-|:--|:--|:--|:--|
-| **Sample** | gauge | Sample Command (`MEAS:VOLT:DC?`) | Sends the query, then records the response as a timestamped row in the point's measurement table. Reads, never changes instrument state. |
-| **Activate** | lightning bolt | Activate Command (`OUTP ON`) | Sends the command to **change** instrument state. Asks for confirmation first, then shows `Sent <command> at HH:MM:SS`. Nothing is added to the measurement table. |
+| Button | Icon | What it does |
+|:--|:--|:--|
+| **Camera** | camera | Live preview and image capture (see above). |
+| **Measure** | gauge | Opens the measure column: a **USB port** (e.g. `/dev/usbtmc0`) and a **Command** box with a **send** button next to it. A query (contains `?`, e.g. `MEAS:VOLT:DC?`) is sent and its reply is added as a timestamped row in the point's measurement table. A command (e.g. `OUTP ON`) is sent and the status line shows `Sent OUTP ON at 14:03:22`; nothing is logged. Without `starfire-hw` the panel still works for manual entry and says nothing was sent. |
+| **Activate** | lightning bolt | Opens the module column. Type or pick a module name, press **run**, and watch the status: `RUNNING`, then `COMPLETE` or `FAILED` with the exit code, run time, and the tail of the module's output. |
 
-Both call the same `measure` binary; the server only forwards the port and command. Without `measure`, both buttons still open the panel for manual entry and say that `measure` wasn't found and nothing was sent.
+### Modules
+A **module** is a script or program you wrote that Starfire runs for you: warm up a feed system, power a supply on, start a logger. Starfire doesn't know what it does; it starts it, waits, and reports how it ended.
+
+1. **Put the file in `dist/`**, next to the `starfire` binary (when running `python3 starfire.py` from source, in a `dist/` folder next to `starfire.py`). How it is run depends on its name:
+
+| File | How Starfire runs it | Needs |
+|:--|:--|:--|
+| `*.py` | `python3 <file>` | `python3` on `PATH`. No `chmod`, no shebang. |
+| `*.sh` | `bash <file>` | `bash` on `PATH`. No `chmod`, no shebang. |
+| `*.jl` | `julia <file>` | `julia` on `PATH`. No `chmod`, no shebang. |
+| Anything else | `./<file>` directly | Execute permission (`chmod +x`). A compiled binary (`g++ -o dist/hello hello.cpp`), or a script of any other language with a shebang line such as `#!/usr/bin/env ruby`. |
+
+The extension decides: a `.py` file runs under `python3` even if it has a different shebang. Source files such as `hello.cpp` aren't listed until you compile them. The same rule is what fills the Modules picker, so an unrunnable file never shows up.
+2. **Register it** in the campaign's **Modules** table (below Requirements):
+
+| Column | Meaning |
+|:--|:--|
+| **Module** | Picked from a list of the runnable files in `dist/`, which refreshes when you return to the page. The name's color shows its kind: **green** a binary (no extension), **amber** `.py`, **blue** `.jl`, **white** `.sh`, **red** anything else. |
+| **Description** | Optional free text. |
+| **Scope** | Where it may be run. Blank means any test point. `TC-001` means any point on card TC-001. `TC-001-20` means only point 20 on card TC-001. Ids are compared exactly (not as prefixes), ignoring case. |
+
+3. **Run it** from a test point's bolt button. The module name must be registered with a scope that includes that point, so a card opened on its own (outside a campaign) has nothing to run.
+
+**What a module sees:**
+* It runs in the working directory (where your `.test` and `.camp` files are), not in `dist/`.
+* Environment: `STARFIRE_CARD` (card id), `STARFIRE_POINT` (point number), and `STARFIRE_HW` (path to `starfire-hw`, when found), so a shell script can drive an instrument with `"$STARFIRE_HW" send /dev/usbtmc0 "OUTP ON"`.
+* The environment is your own, except that `LD_LIBRARY_PATH` is restored to its original value when running from the built binary, so a system `python3` or a compiled module isn't pointed at Starfire's bundled libraries.
+* No standard input. Output (stdout and stderr together) is shown in the panel, last 4,000 characters.
+* A module may run for up to an hour; after that it is killed along with anything it started.
+
+**Safety.** Running a program on request from a web page needs care:
+* Only a bare filename that exists in `dist/`, is runnable (executable, or `.py` / `.sh` / `.jl`), and isn't `starfire` or `starfire-hw` can run. Paths and `..` are rejected.
+* `/run_module` accepts only JSON requests addressed to `localhost`/`127.0.0.1` on Starfire's own port. A form post from another website, or a DNS-rebinding trick, is refused.
+* The scope rule is enforced by the page, not the server: the server knows which files are runnable, but not your campaign. Treat `dist/` as the trust boundary; anything executable you put there can be run from the UI.
 
 ---
 
-## Scope: `starfire.cpp`
+## `starfire.cpp` (the SCPI interface)
 
-Today `measure.cpp` is a one-shot tool: open the device, write one SCPI line, read one reply if the command contains `?`, exit. `starfire.cpp` is the planned replacement that combines **measuring** and **controlling** in one program, so a test card can run a sequence rather than one command at a time.
+`starfire.cpp` builds to `starfire-hw`, the only part of Starfire that touches a device node. The Python side never opens one itself. It has one mode, `send`, used by the Measure panel's SEND button and available to your modules (see `STARFIRE_HW` above).
 
-**Goal:** a small, dependency-free C++ program (POSIX only, `g++ -O2`) that Starfire drives for everything that touches hardware, so the Python side never opens a device itself.
+```bash
+starfire-hw send [--timeout <sec>] [--opc] <device> <scpi line>
+#   "MEAS:VOLT:DC?"  query    -> written, then the reply is read
+#   "OUTP ON"        command  -> written only
+```
 
-### Operations
-| Mode | Behavior |
-|:--|:--|
-| `starfire sample <dev> <query>` | Today's measure: write, read, print. |
-| `starfire activate <dev> <command>` | Write only; optionally follow with `*OPC?` to confirm the instrument finished. |
-| `starfire run <script.json>` | Execute a sequence: set, wait, sample N times at an interval, set safe state. Emits one JSON line per event with a timestamp. |
-| `starfire list` | Enumerate `/dev/usbtmc*` and send `*IDN?` to each, so the UI can offer a port picker instead of a typed path. |
+Every result is one JSON line on stdout, which `starfire.py` parses:
 
-### Behavior to get right (not true of `measure.cpp` today)
-* **Timeouts** on every read and write, with a hard exit, so a wedged instrument can't hang a test.
-* **Safe state on exit:** a script declares a safe command (for example `OUTP OFF`). It runs on error, on timeout, and on SIGINT/SIGTERM.
-* **Structured output:** JSON lines (`{"t": ..., "dev": ..., "cmd": ..., "reply": ..., "ok": ...}`) instead of bare text, so results drop straight into a point's measurement table and, later, an as-run record.
-* **Transport-agnostic core:** USBTMC first; serial and raw TCP SCPI (port 5025) behind the same interface, since most bench supplies and scopes speak one of the three.
-* **Allow-list:** the UI cannot send arbitrary text to an arbitrary node. Devices and command prefixes come from an allow-list file next to the binary.
-* **Exit codes** as today: `0` success, `1` runtime failure, `2` usage error.
+```json
+{"t":"2026-10-11T14:03:22.418Z","mode":"send","dev":"/dev/usbtmc0","cmd":"MEAS:VOLT:DC?","kind":"query","ok":true,"reply":"+4.998E+00"}
+{"t":"...","mode":"send","dev":"/dev/usbtmc0","cmd":"OUTP ON","kind":"command","ok":false,"error":"timed out after 5 s"}
+```
 
-### How `measure` becomes `starfire`
+Exit codes: `0` success, `1` runtime failure (the JSON line has `error`), `2` usage error (message on stderr).
 
-`measure.cpp` is not extended in place. `starfire.cpp` is built beside it, takes over its job, and then `measure` is deleted. The browser UI doesn't change at any step.
-
-**Command mapping.** The old call is the new `sample` mode with one extra argument, and Activate gets its own mode instead of reusing the same call.
-
-| Today | After |
-|:--|:--|
-| `measure /dev/usbtmc0 "MEAS:VOLT:DC?"` | `starfire sample /dev/usbtmc0 "MEAS:VOLT:DC?"` |
-| `measure /dev/usbtmc0 "OUTP ON"` (Activate reuses it) | `starfire activate /dev/usbtmc0 "OUTP ON"` |
-| *(no equivalent)* | `starfire run seq.json`, `starfire list` |
-
-**What changes in `starfire.py`** (everything else stays as is):
-
-| Today | After |
-|:--|:--|
-| `_MEASURE_PATH` = `./measure` | `./starfire-hw` (the binary is renamed so it doesn't collide with the `starfire` Python app/binary) |
-| `MEASURE_AVAILABLE` | `HARDWARE_AVAILABLE`, same check: executable present in the working directory |
-| `POST /measure` and `POST /activate` both go to `_handle_hardware` | Same two routes, but `_handle_hardware` picks the `sample` or `activate` mode from the route instead of passing the raw command through. Parses the JSON-line reply and returns the same `{"success", "value"}` shape the UI already reads. |
-| 10 s subprocess timeout | Kept as an outer ceiling; the binary's own timeout fires first and reports why. |
-| Missing-binary behavior (panel opens, message says nothing was sent) | Unchanged. |
-
-**Stages.** Each stage ships on its own, and the app works after every one.
-
-1. **Drop-in.** `starfire.cpp` implements `sample` and `activate` with timeouts and JSON-line output, and `starfire.py` switches to it. No new UI.
-2. **Port picker.** `list` fills a dropdown in the hardware panel, replacing the typed `/dev/usbtmc0`.
-3. **Sequences.** `run` is added, with a streaming route so the browser shows steps as they execute and writes each reading to the point's measurement table.
-4. **Retire `measure`.** Once stage 1 passes against a real instrument, delete `measure.cpp`, drop the old binary name from `build.sh` and the README, and keep one release where both names are accepted.
-
-**Old files still work until stage 4.** If `./measure` is present and `./starfire-hw` isn't, `starfire.py` falls back to the old call, so nobody's bench setup breaks mid-migration.
-
-### Verification
-Unit tests against a pty-backed fake instrument first; then at least one real USBTMC device before anything is called supported.
-
----
-
-## Roadmap: toward a Revel + Epsilon3-style workflow
-
-Starfire's lane is **test documentation, traceability, and evidence**: the paper trail an acceptance test has to produce, tied to the hardware that produced the data. It is not a live control room. The two products it learns from:
-
-* **Epsilon3** (procedures and operations): authored procedures, step-by-step execution, sign-offs, as-run records, and revision history.
-* **Revel** (test and control for hardware): data acquisition, test automation, and results tied to requirements.
-
-What Starfire already has covers the *authoring* half of Epsilon3 (cards, locking, sign-off, VCRM) and a thin slice of the *acquisition* half of Revel (Sample, Activate, timestamped readings). What is missing, in build order:
-
-1. **Better evidence export.** PDF and `.docx` test cards that include captured images and the measurement tables.
-2. **As-run record.** Executing a locked card produces an immutable run: who, when, which step, observed value, sign-off, plus an audit trail of edits after the fact.
-3. **Live traceability view.** Requirement to test to run to result, updated as steps complete, with gaps highlighted.
-4. **Data capture and plots.** Time series from `starfire.cpp run`, CSV import from other loggers, plots embedded in the record, limits checked against expected values.
-5. **Showpiece package.** A synthetic propellant-feed-system acceptance campaign, end to end, with a recorded walkthrough.
-
-Not planned: multi-user, hosted/cloud, Windows, closed-loop real-time control.
+### Behavior
+* **`send`** decides query vs command from the `?` and says which in `kind`. A query returns the reply; a command is write-only.
+* **`--opc`** (commands only; with a query it is a usage error): follows with `*OPC?` and waits for `1`, so a success means the instrument finished.
+* **Timeouts:** a hard limit (default 5 s, max 60) covers open, write and read, so a wedged instrument can't hang a test. `starfire.py` keeps its 10 s limit as an outer ceiling.
+* **Device and command checks:** the device must be a path under `/dev/` with no `..`, so the UI can't make this write a command into an ordinary file; a command must be one printable line.
 
 ---
 
@@ -145,29 +127,6 @@ Not planned: multi-user, hosted/cloud, Windows, closed-loop real-time control.
 | `.vcrm` | VCRM snapshot JSON. |
 | `.csv` | Flat export of card metadata and test points. |
 | `.docx` | Word document with tables and styled callouts (campaign, VCRM, and single card). |
-| `.tex` | LaTeX test card. |
 | **Print / PDF** | Browser-rendered campaign, VCRM, or test card. |
 
----
-
-## Codebase
-
-```
-├── starfire.py              # server, data model, exports, both pages
-├── jira_ticket.py
-├── static/
-│   └── starfire.css
-├── tests/
-│   ├── test_card.py
-│   ├── test_campaign.py
-│   ├── test_server.py       # real HTTP server + fake `measure`
-│   └── test_jira_ticket.py
-├── assets/icon.png, icon.svg
-├── build.sh
-├── pytest.ini
-├── measure.cpp              # today's hardware helper; starfire.cpp will replace it
-├── jira_config.example.json
-└── README.md
-```
-
-`starfire.py`, `jira_ticket.py` and `static/` are everything the app needs at runtime; `build.sh` bundles them into `dist/starfire`.
+Scope, status and plans are in [PROJECT.md](PROJECT.md).
