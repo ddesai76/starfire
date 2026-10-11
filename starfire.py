@@ -1742,7 +1742,7 @@ _CAMPAIGN_HTML = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>\U0001F52D STARFIRE</title>
+<title>\U0001F680 \u2728 STARFIRE</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
