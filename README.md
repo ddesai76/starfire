@@ -26,7 +26,7 @@ python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 * **Runtime:** Python 3 standard library, plus `python-docx` for Word export.
 * **SCPI interface:** `g++` to build `starfire-hw` from `starfire.cpp` (standard library and POSIX headers only).
 * **Optional:**
-  * `jira_config.json` in the working directory turns on Jira ticket creation (see `jira_config.example.json`).
+  * `jira_config.json` in `dist/` next to the binary, or in the working directory, turns on Jira ticket creation (see `jira_config.example.json`).
   * `starfire-hw` (built by `build.sh`, or `g++ -O2 -std=c++17 -o starfire-hw starfire.cpp`) turns on the Measure panel's SEND button. `starfire` looks for it in the working directory, then next to itself.
 
 ---
@@ -73,12 +73,25 @@ The extension decides: a `.py` file runs under `python3` even if it has a differ
 |:--|:--|
 | **Module** | Picked from a list of the runnable files in `dist/`, which refreshes when you return to the page. The name's color shows its kind: **green** a binary (no extension), **amber** `.py`, **blue** `.jl`, **white** `.sh`, **red** anything else. |
 | **Description** | Optional free text. |
-| **Scope** | Where it may be run. Blank means any test point. `TC-001` means any point on card TC-001. `TC-001-20` means only point 20 on card TC-001. Ids are compared exactly (not as prefixes), ignoring case. |
+| **Scope** | Where it may be run. Blank means any test point. `TC-001` means any point on card TC-001. `TC-001-20` means only point 20 on card TC-001. Identifiers are compared exactly, ignoring case. |
 
 3. **Run it** from a test point's bolt button. The module name must be registered with a scope that includes that point, so a card opened on its own (outside a campaign) has nothing to run.
 
 **What a module sees:**
-* It runs in the working directory (where your `.test` and `.camp` files are), not in `dist/`.
+* It runs with your project folder (where your `.test` and `.camp` files are) as its current directory, not `dist/`, so a relative path like `results.csv` lands next to your cards. To find a file next to the module itself, build the path from the module's own location (in Python, `os.path.dirname(__file__)`).
+
+```
+Starfire/                    <- launch ./dist/starfire from here; modules run here
+├── TC-001.test
+├── CAMP-01.camp
+├── results.csv              <- written by example.py via a relative path
+└── dist/
+    ├── starfire
+    ├── starfire-hw
+    ├── jira_config.json
+    └── example.py            <- example module 
+```
+
 * Environment: `STARFIRE_CARD` (card id), `STARFIRE_POINT` (point number), and `STARFIRE_HW` (path to `starfire-hw`, when found), so a shell script can drive an instrument with `"$STARFIRE_HW" send /dev/usbtmc0 "OUTP ON"`.
 * The environment is your own, except that `LD_LIBRARY_PATH` is restored to its original value when running from the built binary, so a system `python3` or a compiled module isn't pointed at Starfire's bundled libraries.
 * No standard input. Output (stdout and stderr together) is shown in the panel, last 4,000 characters.
@@ -91,7 +104,7 @@ The extension decides: a `.py` file runs under `python3` even if it has a differ
 
 ---
 
-### `starfire.cpp` (the SCPI interface)
+## `starfire.cpp` (the SCPI interface)
 
 `starfire.cpp` builds to `starfire-hw`, the only part of Starfire that touches a device node. The Python side never opens one itself. It has one mode, `send`, used by the Measure panel's SEND button and available to your modules (see `STARFIRE_HW` above).
 
@@ -128,5 +141,4 @@ Exit codes: `0` success, `1` runtime failure (the JSON line has `error`), `2` us
 | `.csv` | Flat export of card metadata and test points. |
 | `.docx` | Word document with tables and styled callouts (campaign, VCRM, and single card). |
 | **Print / PDF** | Browser-rendered campaign, VCRM, or test card. |
-
 
