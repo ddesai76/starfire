@@ -91,7 +91,7 @@ The extension decides: a `.py` file runs under `python3` even if it has a differ
 
 ---
 
-## `starfire.cpp` (the SCPI interface)
+### `starfire.cpp` (the SCPI interface)
 
 `starfire.cpp` builds to `starfire-hw`, the only part of Starfire that touches a device node. The Python side never opens one itself. It has one mode, `send`, used by the Measure panel's SEND button and available to your modules (see `STARFIRE_HW` above).
 
@@ -129,4 +129,4 @@ Exit codes: `0` success, `1` runtime failure (the JSON line has `error`), `2` us
 | `.docx` | Word document with tables and styled callouts (campaign, VCRM, and single card). |
 | **Print / PDF** | Browser-rendered campaign, VCRM, or test card. |
 
-Scope, status and plans are in [PROJECT.md](PROJECT.md).
+
