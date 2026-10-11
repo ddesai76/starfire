@@ -47,13 +47,13 @@ python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 
 ### Test point tools: Camera, Measure, Activate
 Each test point has three tools in the button row. Each opens in its own column below the point, left to right: camera, measure, module.
-
+ 
 | Button | Icon | What it does |
 |:--|:--|:--|
 | **Camera** | camera | Live preview and image capture (see above). |
-| **Measure** | gauge | Opens the measure column: a **USB port** (e.g. `/dev/usbtmc0`) and a **Command** box with a **send** button next to it. A query (contains `?`, e.g. `MEAS:VOLT:DC?`) is sent and its reply is added as a timestamped row in the point's measurement table. A command (e.g. `OUTP ON`) is sent and the status line shows `Sent OUTP ON at 14:03:22`; nothing is logged. Without `starfire-hw` the panel still works for manual entry and says nothing was sent. |
-| **Activate** | lightning bolt | Opens the module column. Type or pick a module name, press **run**, and watch the status: `RUNNING`, then `COMPLETE` or `FAILED` with the exit code, run time, and the tail of the module's output. |
-
+| **Measure** | gauge | Opens the measure column: a **USB port** (e.g. `/dev/usbtmc0`) and a **Command** box with a **send** button next to it. A query (contains `?`, e.g. `MEAS:VOLT:DC?`) is sent and its reply is added as a timestamped row in the point's measurement table. A command (e.g. `OUTP ON`) is sent and the status line shows `Sent OUTP ON at 14:03:22`; nothing is logged. The **download** icon saves the point's readings as `<campaign>-<card>-<point>.csv` (e.g. `SC-001-TC-001-20.csv`) in the working folder. Without `starfire-hw` the panel still works for manual entry and says nothing was sent. |
+| **Activate** | lightning bolt | Opens the module column. Type or pick a module name, press **run**, and watch the status: `RUNNING`, then `COMPLETE`, `FAILED` or `BROKEN` with the exit code, run time, and the module's output. **break** stops a running module (and anything it started): it is sent SIGTERM, then SIGKILL after 3 seconds. The **download** icon under the output saves it as `<campaign>-<card>-<point>.txt`. A card outside a campaign uses `XX-000` as the campaign. |
+ 
 ### Modules
 A **module** is a script or program you wrote that Starfire runs for you: warm up a feed system, power a supply on, start a logger. Starfire doesn't know what it does; it starts it, waits, and reports how it ended.
 
