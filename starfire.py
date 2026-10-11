@@ -6,7 +6,7 @@
 # VERSION:        0.2.0
 #
 # Single stdlib file (plus python-docx); client-side editor state, the
-# server handles exports, saved files, and the optional `measure` binary.
+# server handles exports, saved files, and the optional `starfire-hw` binary.
 
 """
 Usage
@@ -21,7 +21,7 @@ test card (the campaign page embeds these as tabs).
 Tests: `pytest` from the project root.
 
 Dependencies: python-docx for the .docx exports. Optional: a compiled
-`measure` binary in the working directory (Sample / Activate buttons) and
+`starfire-hw` binary (Sample / Activate buttons; built from starfire.cpp) and
 jira_config.json (Jira tickets).
 """
 
@@ -35,11 +35,14 @@ import io
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
+import time
 import webbrowser
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -83,9 +86,6 @@ class TestPoint:
     # this app doesn't try to auto-discover.
     usb_port: str = ""
     measure_command: str = ""
-    # Write-only SCPI command the Activate (bolt) button sends to the same
-    # port -- e.g. "OUTP ON". Never a query; see _handle_hardware.
-    activate_command: str = ""
     # Each row: [command, value, timestamp, auto]. auto=True rows came
     # from measure and are read-only (delete-only); auto=False
     # rows were typed in by hand and stay fully editable.
@@ -141,7 +141,10 @@ class TestCard:
 
     @staticmethod
     def from_dict(d: dict) -> "TestCard":
-        pts = [TestPoint(**p) for p in d.get("points", [])]
+        # Unknown keys are dropped, so files saved by an older version (e.g.
+        # with the retired activate_command) still open.
+        known = {f.name for f in fields(TestPoint)}
+        pts = [TestPoint(**{k: v for k, v in p.items() if k in known}) for p in d.get("points", [])]
         nom = [tuple(x) for x in _normalize_pair_list(d.get("nomenclature", []), 4)]
         refs = _normalize_pair_list(d.get("references", []), 3)
         notes = _normalize_pair_list(d.get("notes", []), 2)
@@ -398,6 +401,17 @@ class CampaignTestRow:
 
 
 @dataclass
+class CampaignModule:
+    # A script or binary in the program's dist/ folder that a test point's
+    # Activate (bolt) button may run. See list_modules / run_module.
+    module: str = ""
+    description: str = ""
+    # "" = any test point; a card id (TC-001) = any point on that card;
+    # card id + "-" + point number (TC-001-20) = that one point.
+    scope: str = ""
+
+
+@dataclass
 class Campaign:
     id: str = "SC-001"
     title: str = "Untitled Campaign"
@@ -411,6 +425,8 @@ class Campaign:
     subsystem: str = ""
     # Requirement code + description, same shape as a TestCard's References.
     requirements: list = field(default_factory=list)   # list[(code, description)]
+    # Modules a test point's Activate button may run.
+    modules: list = field(default_factory=list)         # list[CampaignModule]
     tests: list = field(default_factory=list)           # list[CampaignTestRow] -- "Test Series"
     # Same shape as tests, for tests that support the series but aren't
     # part of its numbered sequence (one-off checkouts, vendor acceptance).
@@ -426,8 +442,10 @@ class Campaign:
     def from_dict(d: dict) -> "Campaign":
         tests = [CampaignTestRow(**t) for t in d.get("tests", [])]
         ancillary_tests = [CampaignTestRow(**t) for t in d.get("ancillary_tests", [])]
-        base = {k: v for k, v in d.items() if k not in ("tests", "ancillary_tests")}
-        return Campaign(tests=tests, ancillary_tests=ancillary_tests, **base)
+        known = {f.name for f in fields(CampaignModule)}
+        modules = [CampaignModule(**{k: v for k, v in m.items() if k in known}) for m in d.get("modules", [])]
+        base = {k: v for k, v in d.items() if k not in ("tests", "ancillary_tests", "modules")}
+        return Campaign(tests=tests, ancillary_tests=ancillary_tests, modules=modules, **base)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -522,6 +540,14 @@ def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
 {req_rows}
 </table>
 """
+    mods = [m for m in camp.modules if (m.module or "").strip()]
+    mod_rows = "\n".join(
+        f"<tr><td>{h(m.module)}</td><td>{h(m.description)}</td><td>{h(m.scope or 'any')}</td></tr>" for m in mods)
+    mod_section = "" if not mods else f"""<h2>Modules</h2>
+<table><tr><th style="width:25%">Module</th><th>Description</th><th style="width:15%">Scope</th></tr>
+{mod_rows}
+</table>
+"""
     test_rows = "\n".join(
         f"<tr><td>{t.seq}</td><td>{h(t.test_id)}</td><td>{h(t.title)}</td><td>{h(t.author)}</td>"
         f"<td>{h(t.requirements)}</td><td>{h(STATUS_LABELS.get(t.status, t.status))}</td></tr>"
@@ -563,7 +589,7 @@ def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
   <span><b>Quality Assurance:</b> {h(camp.quality_assurance)}</span>
   <span><b>Date:</b> {h(camp.date)}</span>
 </div>
-{req_section}<h2>Test Series</h2>
+{req_section}{mod_section}<h2>Test Series</h2>
 <table>
 <tr><th style="width:6%">#</th><th style="width:14%">Test ID</th><th>Title</th><th style="width:12%">Author</th><th style="width:16%">Requirements</th><th style="width:12%">Status</th></tr>
 {test_rows}
@@ -668,6 +694,12 @@ def export_campaign_docx(camp: Campaign) -> bytes:
     if reqs:
         doc.add_heading("Requirements", level=1)
         _add_table(doc, ["Requirement", "Description"], reqs)
+
+    mods = [m for m in camp.modules if (m.module or "").strip()]
+    if mods:
+        doc.add_heading("Modules", level=1)
+        _add_table(doc, ["Module", "Description", "Scope"],
+                   [(m.module, m.description, m.scope or "any") for m in mods])
 
     doc.add_heading("Test Series", level=1)
     _add_table(
@@ -852,9 +884,9 @@ if (window.self !== window.top) {
 // startup -- see jira_ticket.py's own docstring.
 const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
 
-// True only if a compiled measure binary was found -- the Measure
+// True only if the starfire-hw binary was found -- the Measure
 // panel opens either way, this just controls whether Sample/Activate send anything.
-const MEASURE_AVAILABLE = __MEASURE_AVAILABLE__;
+const HARDWARE_AVAILABLE = __HARDWARE_AVAILABLE__;
 
 // Set by the campaign page right after this iframe loads (openTestTab());
 // `var` (not `let`) so that external write reaches this binding.
@@ -1035,79 +1067,149 @@ function togglePreview(i) {
 // number of points can have it open simultaneously.
 let measureOpenIndices = new Set();
 
-function openMeasure(i) {
-  if (measureOpenIndices.has(i)) return;
-  measureOpenIndices.add(i);
-  // First open of a point with no readings -- seed one blank row so
-  // there's something to type into right away.
-  if (card.points[i].measurements.length === 0) {
-    card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
+// The gauge button opens/closes the panel (a point that already has readings keeps
+// its panel showing, so closing only hides an empty one).
+function toggleMeasure(i) {
+  if (!measureOpenIndices.delete(i)) {
+    measureOpenIndices.add(i);
+    // First open of a point with no readings -- seed one blank row so
+    // there's something to type into right away.
+    if (card.points[i].measurements.length === 0) {
+      card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
+    }
   }
   renderPoints();
 }
 
-async function readMeasurement(i) {
+// SEND: the line in the Command box goes to the instrument. starfire-hw says
+// whether it was a query or a command: a query's reply is logged as a reading,
+// a command is just confirmed here.
+async function sendMeasurement(i) {
   const p = card.points[i];
-  // If the panel isn't already open (e.g. Read was clicked straight from
-  // the main button cluster), open it now so there's somewhere to show
-  // the result -- otherwise the message/table the read produces would
-  // have no visible home at all.
-  openMeasure(i);
   const msgEl = document.getElementById("pt-measure-msg-" + i);
-  if (!MEASURE_AVAILABLE) {
-    if (msgEl) msgEl.textContent = "measure binary not found -- enter readings by hand.";
-    return;
-  }
-  if (p.measurements.length >= 8) {
-    if (msgEl) msgEl.textContent = "Maximum 8 readings -- delete a row first.";
-    return;
-  }
-  if (msgEl) msgEl.textContent = "Reading...";
+  const say = (cls, text) => { if (msgEl) { msgEl.className = "module-status " + cls; msgEl.textContent = text; } };
+  if (!HARDWARE_AVAILABLE) return say("failed", "starfire-hw not found -- nothing was sent.");
+  if (!p.usb_port || !p.measure_command) return say("failed", "Enter a USB port and a command first.");
+  say("running", "Sending...");
   try {
     const res = await fetch("/measure", {
       method: "POST",
       body: JSON.stringify({port: p.usb_port, command: p.measure_command}),
     });
     const result = await res.json();
-    if (result.success) {
-      const now = new Date();
-      const ts = now.toISOString().slice(0, 16).replace("T", " ");
-      p.measurements.push({command: p.measure_command, value: result.value, timestamp: ts, auto: true});
-      if (msgEl) msgEl.textContent = "";
-      renderPoints();
-    } else {
-      if (msgEl) msgEl.textContent = result.error || "Instrument not found";
+    if (!result.success) return say("failed", result.error || "Send failed");
+    if (result.kind !== "query") {
+      return say("complete", `Sent ${p.measure_command} at ${new Date().toLocaleTimeString("en-GB")}`);
     }
+    if (p.measurements.length >= 8) {
+      return say("failed", `Reply: ${result.value} (not logged: maximum 8 readings, delete a row first)`);
+    }
+    const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
+    p.measurements.push({command: p.measure_command, value: result.value, timestamp: ts, auto: true});
+    renderPoints();
   } catch (err) {
-    if (msgEl) msgEl.textContent = `Read failed: ${err}`;
+    say("failed", `Send failed: ${err}`);
   }
 }
 
-async function activateHardware(i) {
-  const p = card.points[i];
-  openMeasure(i);
-  const msgEl = document.getElementById("pt-measure-msg-" + i);
-  if (!MEASURE_AVAILABLE) {
-    if (msgEl) msgEl.textContent = "measure binary not found -- nothing was sent.";
-    return;
-  }
-  if (!p.usb_port || !p.activate_command) {
-    if (msgEl) msgEl.textContent = "Enter a USB port and an activate command first.";
-    return;
-  }
-  if (!confirm(`Send "${p.activate_command}" to ${p.usb_port}?`)) return;
-  if (msgEl) msgEl.textContent = "Activating...";
+// Modules (Activate / bolt): scripts or binaries in dist/ that the campaign's
+// Modules table registers. The registry is read live from the campaign page
+// we're embedded in; a standalone card has none, so nothing can be run.
+// Panel-open and run state are transient (never saved) and keyed by the point
+// object, so they follow a point when it's moved up or down.
+const moduleState = new WeakMap();
+
+function campaignModules() {
   try {
-    const res = await fetch("/activate", {
-      method: "POST",
-      body: JSON.stringify({port: p.usb_port, command: p.activate_command}),
-    });
-    const result = await res.json();
-    const when = new Date().toLocaleTimeString("en-GB");
-    if (msgEl) msgEl.textContent = result.success ? `Sent ${p.activate_command} at ${when}` : (result.error || "Activate failed");
-  } catch (err) {
-    if (msgEl) msgEl.textContent = `Activate failed: ${err}`;
+    return (window.parent !== window && window.parent.getCampaignModules) ? window.parent.getCampaignModules() : [];
+  } catch (e) { return []; }
+}
+
+// Scope "" = any point; "TC-001" = any point on that card; "TC-001-20" = that point only.
+function moduleInScope(m, cardId, seq) {
+  const s = (m.scope || "").trim().toLowerCase();
+  if (!s) return true;
+  const id = (cardId || "").trim().toLowerCase();
+  return s === id || s === id + "-" + seq;
+}
+
+function modulesFor(p) {
+  return campaignModules().filter(m => (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module);
+}
+
+function modulePanelHtml(i, p) {
+  const st = moduleState.get(p) || {};
+  const names = modulesFor(p);
+  const none = names.length === 0
+    ? `<div class="pt-cam-msg">No modules registered for this point. Add one in the campaign's Modules table.</div>` : "";
+  return `
+    <label>Module</label>
+    <div class="send-row">
+      <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(st.name || "")}" placeholder="module name">
+      <datalist id="pt-modlist-${i}">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>
+      <button class="btn mini" data-modrun="${i}"${st.status === "running" ? " disabled" : ""}>run</button>
+    </div>
+    ${none}
+    <div class="module-status ${esc(st.status || "")}">${esc(st.text || "")}</div>
+    ${st.output ? `<pre class="module-output">${esc(st.output)}</pre>` : ""}`;
+}
+
+function bindModulePanel(i) {
+  const root = document.getElementById("pt-module-" + i);
+  if (!root) return;
+  const p = card.points[i];
+  const inp = root.querySelector("input[data-modname]");
+  if (inp) inp.addEventListener("input", () => {
+    const st = moduleState.get(p) || {};
+    st.name = inp.value;
+    moduleState.set(p, st);
+  });
+  const btn = root.querySelector("button[data-modrun]");
+  if (btn) btn.addEventListener("click", () => runModule(p));
+}
+
+// Redraws just this point's module panel (not the whole list) so a run
+// finishing doesn't steal focus from whatever the person is typing elsewhere.
+function moduleIsOpen(p) { return !!(moduleState.get(p) || {}).open; }
+
+function refreshModulePanel(p) {
+  const i = card.points.indexOf(p);
+  const root = document.getElementById("pt-module-" + i);
+  if (!root || !moduleIsOpen(p)) return;
+  root.innerHTML = modulePanelHtml(i, p);
+  bindModulePanel(i);
+}
+
+async function runModule(p) {
+  const st = moduleState.get(p) || {};
+  moduleState.set(p, st);
+  const name = (st.name || "").trim();
+  if (!name) {
+    Object.assign(st, {status: "failed", text: "Enter a module name.", output: ""});
+    return refreshModulePanel(p);
   }
+  if (!modulesFor(p).includes(name)) {
+    Object.assign(st, {status: "failed", output: "",
+      text: `${name} isn't registered for this point. Add it to the campaign's Modules table, with a scope that includes it.`});
+    return refreshModulePanel(p);
+  }
+  Object.assign(st, {status: "running", text: "Running...", output: ""});
+  refreshModulePanel(p);
+  try {
+    const res = await fetch("/run_module", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({module: name, card: card.id, point: p.seq}),
+    });
+    const r = await res.json();
+    const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
+    st.status = r.status === "complete" ? "complete" : "failed";
+    st.text = `${st.status.toUpperCase()}${detail ? " (" + detail + ")" : ""}${r.error ? ": " + r.error : ""}`;
+    st.output = r.output || "";
+  } catch (err) {
+    Object.assign(st, {status: "failed", text: `FAILED: ${err}`, output: ""});
+  }
+  refreshModulePanel(p);
 }
 
 function measurePanelHtml(i, p) {
@@ -1136,10 +1238,13 @@ function measurePanelHtml(i, p) {
   const fields = open ? `
     <div class="measure-fields">
       <div><label>USB Port</label><input data-i="${i}" data-f="usb_port" value="${esc(p.usb_port)}" placeholder="/dev/usbtmc0"></div>
-      <div><label>Sample Command</label><input data-i="${i}" data-f="measure_command" value="${esc(p.measure_command)}" placeholder="MEAS:VOLT:DC?"></div>
-      <div class="wide"><label>Activate Command</label><input data-i="${i}" data-f="activate_command" value="${esc(p.activate_command)}" placeholder="OUTP ON"></div>
     </div>
-    <div class="pt-cam-msg" id="pt-measure-msg-${i}"></div>` : "";
+    <label>Command</label>
+    <div class="send-row">
+      <input data-i="${i}" data-f="measure_command" value="${esc(p.measure_command)}" placeholder="MEAS:VOLT:DC?  or  OUTP ON">
+      <button class="btn mini" data-msend="${i}">send</button>
+    </div>
+    <div class="module-status" id="pt-measure-msg-${i}"></div>` : "";
   return `
     ${fields}
     <table class="measure-table">
@@ -1173,8 +1278,8 @@ function renderPoints() {
           <button class="btn mini btn-icon flag-btn${flagged ? " flagged" : ""}" data-act="flag" data-i="${i}" title="flag">${ICON_FLAG}</button>
           <button class="btn mini btn-icon" data-act="preview" data-i="${i}" title="camera preview">${ICON_PHOTO_CAMERA}</button>
           <button class="btn mini btn-icon" data-act="capture" data-i="${i}" title="capture image">${ICON_ADD_A_PHOTO}</button>
-          <button class="btn mini btn-icon measure-read" data-mread="${i}" title="sample">${ICON_SPEED}</button>
-          <button class="btn mini btn-icon measure-activate" data-mactivate="${i}" title="activate">${ICON_BOLT}</button>
+          <button class="btn mini btn-icon measure-toggle" data-act="measure" data-i="${i}" title="measure">${ICON_SPEED}</button>
+          <button class="btn mini btn-icon module-toggle" data-act="module" data-i="${i}" title="activate (run a module)">${ICON_BOLT}</button>
           ${showJiraBtn ? `<button class="btn mini btn-icon" data-act="jira" data-i="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
           <span class="pt-btn-gap"></span>
           <button class="btn mini btn-icon" data-act="up" data-i="${i}" title="move up">${ICON_ARROW_UPWARD}</button>
@@ -1203,6 +1308,7 @@ function renderPoints() {
       <div class="pt-expand-row">
         <div class="pt-camera" id="pt-camera-${i}"></div>
         <div class="pt-measure" id="pt-measure-${i}">${(measureOpenIndices.has(i) || p.measurements.length > 0) ? measurePanelHtml(i, p) : ""}</div>
+        <div class="pt-module" id="pt-module-${i}">${moduleIsOpen(p) ? modulePanelHtml(i, p) : ""}</div>
       </div>
       <div class="pt-images" id="pt-images-${i}">${imgChips}</div>
       <div class="pt-cam-msg" id="pt-cam-msg-${i}"></div>
@@ -1238,15 +1344,19 @@ function renderPoints() {
       if (act === "capture") { capturePointImage(i); return; }
       if (act === "preview") { togglePreview(i); return; }
       if (act === "jira") { createJiraTicket(i); return; }
+      if (act === "measure") { toggleMeasure(i); return; }
+      if (act === "module") {
+        const st = moduleState.get(card.points[i]) || {};
+        st.open = !st.open;
+        moduleState.set(card.points[i], st);
+      }
       renderPoints();
     });
   });
-  list.querySelectorAll("button[data-mread]").forEach(btn => {
-    btn.addEventListener("click", () => readMeasurement(+btn.dataset.mread));
+  list.querySelectorAll("button[data-msend]").forEach(btn => {
+    btn.addEventListener("click", () => sendMeasurement(+btn.dataset.msend));
   });
-  list.querySelectorAll("button[data-mactivate]").forEach(btn => {
-    btn.addEventListener("click", () => activateHardware(+btn.dataset.mactivate));
-  });
+  card.points.forEach((_, i) => bindModulePanel(i));
   list.querySelectorAll("button[data-madd]").forEach(btn => {
     btn.addEventListener("click", () => {
       const i = +btn.dataset.madd;
@@ -1301,7 +1411,7 @@ document.getElementById("addPointBtn").addEventListener("click", () => {
   card.points.push({seq: nextSeq(), action:"", expected:"", observed:"", reference:"",
                      responsible_party:"", date:"", time:"", initial:"", quality:"",
                      locked: false, flagged: false, images: [],
-                     usb_port: "", measure_command: "", activate_command: "", measurements: []});
+                     usb_port: "", measure_command: "", measurements: []});
   renderPoints();
 });
 
@@ -1474,7 +1584,6 @@ function normalizeCard(c) {
     if (!("observed" in p)) p.observed = "";
     if (!("usb_port" in p)) p.usb_port = "";
     if (!("measure_command" in p)) p.measure_command = "";
-    if (!("activate_command" in p)) p.activate_command = "";
     if (!p.measurements) p.measurements = [];
   });
   return c;
@@ -1529,7 +1638,7 @@ bindMeta();
 card.points = [{seq:10, action:"", expected:"", observed:"", reference:"",
                 responsible_party:"", date:"", time:"", initial:"", quality:"",
                 locked:false, flagged:false, images:[],
-                usb_port:"", measure_command:"", activate_command:"", measurements:[]}];
+                usb_port:"", measure_command:"", measurements:[]}];
 renderPoints();
 renderNomenclature();
 renderReferences();
@@ -1593,6 +1702,14 @@ _CAMPAIGN_HTML = """<!doctype html>
     </table>
     <div class="row"><button class="btn btn-plus" id="addReqBtn" title="add requirement">+</button></div>
 
+    <h2 class="no-rule">Modules</h2>
+    <table class="datatable" id="modTable">
+      <colgroup><col style="width:28%"><col><col style="width:16%"><col style="width:60px"></colgroup>
+      <tr><th>Module</th><th>Description</th><th>Scope</th><th class="blank-th"></th></tr>
+    </table>
+    <div class="row"><button class="btn btn-plus" id="addModBtn" title="add module">+</button></div>
+    <div id="modHint" class="hint"></div>
+
     <h2 class="no-rule">Test Series</h2>
     <table class="datatable tests-format" id="testsTable">
       <colgroup>
@@ -1645,7 +1762,7 @@ let camp = {
   id: "SC-001", title: "Untitled Campaign", revision: "A", author: "",
   date: new Date().toISOString().slice(0,10), project: "", test_lead: "",
   quality_assurance: "", system: "", subsystem: "", jira_epic_key: "",
-  requirements: [], tests: [], ancillary_tests: [], sections: []
+  requirements: [], modules: [], tests: [], ancillary_tests: [], sections: []
 };
 
 // True only if jira_config.json was found in the working directory at startup.
@@ -1695,6 +1812,64 @@ document.getElementById("addReqBtn").addEventListener("click", () => {
   camp.requirements.push(["", ""]);
   renderRequirements();
 });
+
+// Modules: runnable files in dist/ (see /list_modules) that a test point's
+// Activate button may run. Scope blank = any point; TC-001 = any point on
+// that card; TC-001-20 = that point only.
+let moduleFiles = [];
+// Kind by name, mirroring how the server runs it (case-sensitive, like os.path.splitext):
+// no extension = a binary, .py/.jl/.sh = that language, anything else = "other".
+function moduleKind(name) {
+  if (!name) return "";
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot) : "";
+  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh"})[ext] || "other";
+}
+function renderModules() {
+  const t = document.getElementById("modTable");
+  t.querySelectorAll("tr.datarow").forEach(r => r.remove());
+  camp.modules.forEach((m, i) => {
+    // A saved module that's no longer in dist/ stays selectable, flagged, so it isn't silently dropped.
+    const names = moduleFiles.includes(m.module) || !m.module ? moduleFiles : [m.module, ...moduleFiles];
+    const opts = [`<option value="">[choose module]</option>`].concat(names.map(n =>
+      `<option class="mod-${moduleKind(n)}" value="${esc(n)}"${n === m.module ? " selected" : ""}>${esc(n)}${moduleFiles.includes(n) ? "" : " (missing)"}</option>`));
+    const tr = document.createElement("tr");
+    tr.className = "datarow";
+    tr.innerHTML = `
+      <td><select class="mod-${moduleKind(m.module)}" data-i="${i}" data-f="module">${opts.join("")}</select></td>
+      <td><input value="${esc(m.description)}" data-i="${i}" data-f="description" placeholder="optional"></td>
+      <td><input value="${esc(m.scope)}" data-i="${i}" data-f="scope" placeholder="any test point"></td>
+      <td><button class="btn mini btn-x" data-del="${i}">x</button></td>`;
+    t.appendChild(tr);
+  });
+  t.querySelectorAll("input[data-i], select[data-i]").forEach(el => {
+    el.addEventListener("input", () => {
+      camp.modules[+el.dataset.i][el.dataset.f] = el.value;
+      if (el.dataset.f === "module") el.className = "mod-" + moduleKind(el.value);
+    });
+  });
+  t.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => { camp.modules.splice(+btn.dataset.del, 1); renderModules(); });
+  });
+  document.getElementById("modHint").textContent = moduleFiles.length
+    ? "" : "No runnable files found. Put programs (chmod +x) or .py / .sh / .jl scripts in the dist/ folder next to starfire.";
+}
+async function loadModuleFiles() {
+  try {
+    const res = await fetch("/list_modules");
+    const next = (await res.json()).modules || [];
+    // Redrawing while a picker is open would close it, so only when the list actually changed.
+    if (JSON.stringify(next) !== JSON.stringify(moduleFiles)) { moduleFiles = next; renderModules(); }
+  } catch (err) { /* leave the list as it was */ }
+}
+document.getElementById("addModBtn").addEventListener("click", () => {
+  camp.modules.push({module: "", description: "", scope: ""});
+  renderModules();
+  loadModuleFiles();
+});
+window.addEventListener("focus", loadModuleFiles);
+// Test tabs (iframes) read the live list from here when they offer or run a module.
+window.getCampaignModules = () => camp.modules;
 
 // Google Material Symbols, embedded inline (not a file/CDN) so they work
 // fully offline; fill="currentColor" picks up each button's own hover color.
@@ -1936,11 +2111,12 @@ document.getElementById("loadCampFile").addEventListener("change", (e) => {
   f.text().then(txt => {
     camp = JSON.parse(txt);
     if (!camp.requirements) camp.requirements = [];
+    if (!camp.modules) camp.modules = [];
     if (!camp.tests) camp.tests = [];
     if (!camp.ancillary_tests) camp.ancillary_tests = [];
     if (!camp.sections) camp.sections = [];
     if (!camp.jira_epic_key) camp.jira_epic_key = "";
-    bindMeta(); renderRequirements(); renderTests(); renderAncillaryTests(); renderSections();
+    bindMeta(); renderRequirements(); renderModules(); renderTests(); renderAncillaryTests(); renderSections();
   });
 });
 document.getElementById("printCampBtn").addEventListener("click", async () => {
@@ -2148,6 +2324,8 @@ document.getElementById("genVcrmBtn").addEventListener("click", generateVcrm);
 bindMeta();
 camp.tests = [{seq: 1, test_id: "", title: "", author: "", requirements: "", status: ""}];
 renderRequirements();
+renderModules();
+loadModuleFiles();
 renderTests();
 renderAncillaryTests();
 renderSections();
@@ -2171,16 +2349,126 @@ def _safe_filename(stem: str, ext: str) -> str:
 
 
 # Optional integrations, each checked once at startup: jira_config.json
-# turns Jira tickets on; an executable `measure` in the working directory
-# turns Sample / Activate on (without it they open the panel for manual entry
-# and say nothing was sent).
+# turns Jira tickets on; an executable `starfire-hw` (built from starfire.cpp)
+# turns Sample / Activate on -- without it they open the panel for manual
+# entry and say nothing was sent.
 JIRA_AVAILABLE = jira_ticket.load_config() is not None
-_MEASURE_PATH = os.path.join(os.getcwd(), "measure")
-MEASURE_AVAILABLE = os.path.isfile(_MEASURE_PATH) and os.access(_MEASURE_PATH, os.X_OK)
+
+
+def _program_dir() -> str:
+    return os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+
+
+def _modules_dir() -> str:
+    # The dist/ folder: next to the built binary, or ./dist beside this
+    # script when run from source (where build.sh puts its output).
+    here = _program_dir()
+    return here if getattr(sys, "frozen", False) else os.path.join(here, "dist")
+
+
+def _find_hardware_binary() -> str:
+    # Working directory first, then beside the program itself (and dist/ when
+    # run from source), so a binary run from anywhere still finds the one built next to it.
+    for d in (os.getcwd(), _program_dir(), _modules_dir()):
+        path = os.path.join(d, "starfire-hw")
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return os.path.join(os.getcwd(), "starfire-hw")   # not found; HARDWARE_AVAILABLE says so
+
+
+_HW_PATH = _find_hardware_binary()
+HARDWARE_AVAILABLE = os.path.isfile(_HW_PATH) and os.access(_HW_PATH, os.X_OK)
+
+
+# Modules: scripts/binaries the user drops into dist/ and registers in a
+# campaign's Modules table; a test point's Activate button runs one.
+
+# Starfire's own files live in dist/ too; none of them is a module.
+_RESERVED_MODULES = {"starfire", "starfire-hw"}
+# A file with one of these extensions is run by its interpreter, so it needs
+# no execute bit or shebang. Anything else must be an executable file (a
+# compiled binary, or a script with a shebang and chmod +x) and is run directly.
+_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia"}
+_MODULE_TIMEOUT_S = 3600      # a module may legitimately run a whole test
+_MODULE_OUTPUT_TAIL = 4000    # characters of output returned to the browser
+
+
+def _is_module(d: str, name: str) -> bool:
+    path = os.path.join(d, name)
+    if name in _RESERVED_MODULES or name.startswith(".") or not os.path.isfile(path):
+        return False
+    return os.path.splitext(name)[1] in _INTERPRETERS or os.access(path, os.X_OK)
+
+
+def list_modules() -> list:
+    """Names of runnable files in dist/: regular, not hidden, not Starfire's
+    own, and either an interpreted type (.py, .sh, .jl) or executable."""
+    d = _modules_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    return sorted(n for n in names if _is_module(d, n))
+
+
+def _module_env(card_id, point_seq) -> dict:
+    env = dict(os.environ, STARFIRE_CARD=str(card_id), STARFIRE_POINT=str(point_seq))
+    if HARDWARE_AVAILABLE:
+        env["STARFIRE_HW"] = _HW_PATH
+    if getattr(sys, "frozen", False):
+        # The one-file bundle points LD_LIBRARY_PATH at its own libraries;
+        # a system python3 or a compiled module inheriting that can crash on
+        # a library mismatch. PyInstaller keeps the original in *_ORIG.
+        if "LD_LIBRARY_PATH_ORIG" in env:
+            env["LD_LIBRARY_PATH"] = env["LD_LIBRARY_PATH_ORIG"]
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    return env
+
+
+def run_module(name: str, card_id: str = "", point_seq: str = "") -> dict:
+    """Run one module from dist/ and wait for it. The name must be a bare
+    filename that list_modules() reports -- never a path, so the browser can't
+    point this at anything else. The module runs in the working directory
+    (where .test files live) with STARFIRE_CARD, STARFIRE_POINT and, if
+    found, STARFIRE_HW (path to starfire-hw) in its environment."""
+    if name not in list_modules():
+        return {"status": "failed", "error": f"{name!r} is not a runnable file in dist/"}
+    argv = [os.path.join(_modules_dir(), name)]
+    interpreter = _INTERPRETERS.get(os.path.splitext(name)[1])
+    if interpreter:
+        found = shutil.which(interpreter)
+        if not found:
+            return {"status": "failed", "error": f"{interpreter} not found on PATH (needed to run {name})"}
+        argv.insert(0, found)
+    started = time.monotonic()
+    try:
+        # Own session, so a timeout can take down the module's children too.
+        proc = subprocess.Popen(argv, cwd=os.getcwd(), env=_module_env(card_id, point_seq),
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+    except OSError as e:
+        return {"status": "failed", "error": f"could not start {name}: {e}"}
+    timed_out = False
+    try:
+        out, _ = proc.communicate(timeout=_MODULE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, _ = proc.communicate()
+    result = {
+        "status": "complete" if proc.returncode == 0 and not timed_out else "failed",
+        "exit_code": proc.returncode,
+        "seconds": round(time.monotonic() - started, 1),
+        "output": out.decode("utf-8", "replace")[-_MODULE_OUTPUT_TAIL:],
+    }
+    if timed_out:
+        result["error"] = f"timed out after {_MODULE_TIMEOUT_S} s"
+    return result
 
 def _fill_flags(html: str) -> str:
     return (html.replace("__JIRA_AVAILABLE__", "true" if JIRA_AVAILABLE else "false")
-                .replace("__MEASURE_AVAILABLE__", "true" if MEASURE_AVAILABLE else "false"))
+                .replace("__HARDWARE_AVAILABLE__", "true" if HARDWARE_AVAILABLE else "false"))
 
 _TEST_HTML = _fill_flags(_TEST_HTML)
 _CAMPAIGN_HTML = _fill_flags(_CAMPAIGN_HTML)
@@ -2227,6 +2515,8 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(200, "application/json", f.read().encode())
             except OSError as e:
                 self._send_json(500, {"error": str(e)})
+        elif path == "/list_modules":
+            self._send_json(200, {"modules": list_modules()})
         elif path == "/list_files":
             # Lists files in the working directory by extension -- lets a
             # picker browse what's already on disk.
@@ -2327,11 +2617,10 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, result)
 
     def _handle_hardware(self, raw_body: bytes):
-        # {"port": "/dev/usbtmc0", "command": "MEAS:VOLT:DC?"}. Sample and
-        # Activate both run `measure`; they differ only in which command
-        # the UI sends. A missing binary is a clean "not available".
-        if not MEASURE_AVAILABLE:
-            self._send_json(404, {"success": False, "error": "measure not available"})
+        # {"port": "/dev/usbtmc0", "command": "MEAS:VOLT:DC?"}. starfire-hw
+        # answers with one JSON line. A missing binary is a clean "not available".
+        if not HARDWARE_AVAILABLE:
+            self._send_json(404, {"success": False, "error": "starfire-hw not available"})
             return
         try:
             payload = json.loads(raw_body)
@@ -2344,18 +2633,44 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"success": False, "error": "port and command are both required"})
             return
         try:
-            proc = subprocess.run([_MEASURE_PATH, port, command],
+            # The binary enforces its own 5 s limit; this is the outer ceiling.
+            proc = subprocess.run([_HW_PATH, "send", port, command],
                                    capture_output=True, text=True, timeout=10)
         except subprocess.TimeoutExpired:
-            self._send_json(200, {"success": False, "error": "measure timed out"})
+            self._send_json(200, {"success": False, "error": "starfire-hw timed out"})
             return
         except Exception as e:
-            self._send_json(200, {"success": False, "error": f"measure raised: {e}"})
+            self._send_json(200, {"success": False, "error": f"starfire-hw raised: {e}"})
             return
-        if proc.returncode != 0:
+        try:
+            line = json.loads(proc.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            # Usage errors (exit 2) and crashes have no JSON line, only stderr.
             self._send_json(200, {"success": False, "error": proc.stderr.strip() or "unknown error"})
             return
-        self._send_json(200, {"success": True, "value": proc.stdout.strip()})
+        if line.get("ok"):
+            self._send_json(200, {"success": True, "value": line.get("reply", ""), "kind": line.get("kind", "")})
+        else:
+            self._send_json(200, {"success": False, "error": line.get("error", "unknown error")})
+
+    def _handle_run_module(self, raw_body: bytes):
+        # {"module": "warmup.sh", "card": "TC-001", "point": 20}. This runs a
+        # program, so it only accepts a request a web page on another site
+        # couldn't have sent: a JSON content type (which forces a CORS
+        # preflight this server never answers) and our own Host header (which
+        # stops DNS rebinding).
+        port = self.server.server_address[1]
+        if (self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json"
+                or self.headers.get("Host", "") not in (f"localhost:{port}", f"127.0.0.1:{port}")):
+            self._send_json(403, {"status": "failed", "error": "forbidden"})
+            return
+        try:
+            payload = json.loads(raw_body)
+            name = str(payload.get("module") or "")
+        except (json.JSONDecodeError, AttributeError) as e:
+            self._send_json(400, {"status": "failed", "error": f"bad request: {e}"})
+            return
+        self._send_json(200, run_module(name, payload.get("card", ""), payload.get("point", "")))
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -2364,8 +2679,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._handle_capture_image(raw)
         if path == "/create_jira_ticket":
             return self._handle_create_jira_ticket(raw)
-        if path in ("/measure", "/activate"):
+        if path == "/measure":
             return self._handle_hardware(raw)
+        if path == "/run_module":
+            return self._handle_run_module(raw)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
