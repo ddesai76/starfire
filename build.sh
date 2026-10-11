@@ -2,28 +2,25 @@
 #
 # build.sh:       LINUX EXECUTABLE GENERATOR
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-09-21
-# VERSION:        0.1.2
+# UPDATED:        2026-10-11
+# VERSION:        0.2.0
 
 
-# Builds the single "starscope" Linux binary (PERCEPTOR + STARSCOPE) via PyInstaller.
+# Builds the single "starfire" Linux binary via PyInstaller.
 #
 # Directory structure (pre-build):
 # ├── assets
 # │   └── icon.png
 # ├── build.sh
-# └── source
-#   ├── jira_ticket.py
-#   ├── perceptor.py
-#   ├── starscope.py
-#   └── static
-#     ├── perceptor.css
-#     └── starscope.css
+# ├── jira_ticket.py
+# ├── starfire.py
+# └── static
+#   └── starfire.css
 #
 # Usage: ./build.sh
 #        ./build.sh --install-desktop                   (uses assets/icon.png)
 #        ./build.sh --install-desktop path/to/icon.png   (overrides it)
-# Output: dist/starscope
+# Output: dist/starfire
 # Place jira_config.json into dist/ to enable jira ticketing
 
 set -euo pipefail
@@ -45,7 +42,7 @@ if [ "${1:-}" = "--install-desktop" ]; then
 fi
 
 missing=()
-for f in source/perceptor.py source/starscope.py source/jira_ticket.py source/static/perceptor.css source/static/starscope.css; do
+for f in starfire.py jira_ticket.py static/starfire.css; do
   [ -f "$f" ] || missing+=("$f")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -54,8 +51,8 @@ if [ "${#missing[@]}" -gt 0 ]; then
   exit 1
 fi
 
-if { [ -e dist/starscope ] && [ ! -w dist/starscope ]; } || { [ -d dist ] && [ ! -w dist ]; }; then
-  echo "ERROR: dist/ (or dist/starscope) exists but isn't writable by $(whoami)." >&2
+if { [ -e dist/starfire ] && [ ! -w dist/starfire ]; } || { [ -d dist ] && [ ! -w dist ]; }; then
+  echo "ERROR: dist/ (or dist/starfire) exists but isn't writable by $(whoami)." >&2
   echo "Usually means an earlier build ran as a different user (e.g. root)." >&2
   echo "Fix: sudo rm -rf dist   (then rebuild)" >&2
   exit 1
@@ -66,47 +63,53 @@ pip install --break-system-packages --quiet pyinstaller python-docx
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-pyinstaller --onefile --name starscope \
-  --add-data "$(pwd)/source/static:static" \
+pyinstaller --onefile --name starfire \
+  --add-data "$(pwd)/static:static" \
   --workpath "$WORKDIR" \
   --specpath "$WORKDIR" \
-  source/starscope.py
+  starfire.py
 
 echo
-echo "Built: dist/starscope"
+echo "Built: dist/starfire"
 echo "Optional (drop next to the binary before running, not required):"
 echo "  jira_config.json  -- enables Jira ticket creation"
-echo "  measure           -- enables the Measure Read button"
+echo "  measure           -- enables the Sample / Activate buttons"
 
 if [ -n "$ICON" ]; then
-  BINARY="$(realpath dist/starscope)"
-  WORKDIR="$HOME/Starscope"
-  mkdir -p "$WORKDIR"
+  BINARY="$(realpath dist/starfire)"
+  RUNDIR="$HOME/Starfire"
+  mkdir -p "$RUNDIR"
 
   for f in jira_config.json measure; do
     if [ -f "dist/$f" ]; then
-      mv "dist/$f" "$WORKDIR/"
-      echo "Moved dist/$f -> $WORKDIR/$f"
+      mv "dist/$f" "$RUNDIR/"
+      echo "Moved dist/$f -> $RUNDIR/$f"
     fi
   done
 
   ICON_DIR="$HOME/.local/share/icons"
   mkdir -p "$ICON_DIR"
   ICON_EXT="${ICON##*.}"
-  ICON_DEST="$ICON_DIR/starscope.$ICON_EXT"
+  ICON_DEST="$ICON_DIR/starfire.$ICON_EXT"
   cp "$ICON" "$ICON_DEST"
+
+  # Linux binaries can't embed an icon, so this is the closest equivalent:
+  # file managers that honor it (GNOME Files, Nemo, Caja) show it on the file.
+  if command -v gio >/dev/null 2>&1; then
+    gio set "$BINARY" metadata::custom-icon "file://$ICON_DEST" 2>/dev/null || true
+  fi
 
   DESKTOP_DIR="$HOME/.local/share/applications"
   mkdir -p "$DESKTOP_DIR"
-  DESKTOP_FILE="$DESKTOP_DIR/starscope.desktop"
+  DESKTOP_FILE="$DESKTOP_DIR/starfire.desktop"
 
   cat > "$DESKTOP_FILE" <<EOF
 [Desktop Entry]
 Type=Application
-Name=STARSCOPE
-Comment=Test campaign creator (includes Perceptor's test-card editor)
+Name=STARFIRE
+Comment=Test campaign and test card designer with hardware measure/activate
 Exec=$BINARY
-Path=$WORKDIR
+Path=$RUNDIR
 Icon=$ICON_DEST
 Terminal=false
 Categories=Development;Engineering;
@@ -118,8 +121,8 @@ EOF
   fi
 
   echo
-  echo "Installed. STARSCOPE should now appear in your application menu/search --"
+  echo "Installed. STARFIRE should now appear in your application menu/search --"
   echo "right-click it there to pin it to the dash/sidebar."
-  echo "Working directory: $WORKDIR"
+  echo "Working directory: $RUNDIR"
   echo "Binary:            $BINARY"
 fi
