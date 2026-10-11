@@ -7,8 +7,8 @@
   }
   .editor-doc { background: var(--bg); color: var(--nw); font-family: var(--mono);
                 height: 100%; margin: 0; display: flex; flex-direction: column; }
-  /* No standalone display font -- fakes a retro-italic 
-     look with B612 Mono instead: skew, vertical stretch, expanded tracking. */
+  /* No standalone display font -- fakes a retro-italic
+     look with B612 Mono: skew, vertical stretch, expanded tracking. */
   .editor-doc h1 { font-family: 'B612 Mono', monospace; font-size: 32px; font-weight: 700;
        color: var(--ebl); letter-spacing: .12em; margin-bottom: 6px;
        transform: skewX(-12deg) scaleY(1.1); transform-origin: left bottom;
@@ -92,10 +92,13 @@
   .send-row { display: flex; gap: 6px; margin-bottom: 8px; }
   .send-row input { flex: 1; min-width: 0; }
   .send-row .btn.mini { padding: 3px 12px; }
+  .panel-actions { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  .panel-actions .module-status { margin: 0; }
   .module-status { font-size: 12px; margin-bottom: 6px; overflow-wrap: anywhere; }
   .module-status.running { color: var(--amb); }
   .module-status.complete { color: var(--nvg); }
   .module-status.failed { color: var(--rd); }
+  .module-status.broken { color: var(--nw); }
   .module-output { margin: 0; padding: 6px 8px; max-height: 160px; overflow: auto; font-size: 11px;
                    white-space: pre-wrap; overflow-wrap: anywhere; color: var(--dim);
                    background: var(--panel); border: 1px solid var(--stroke); border-radius: 6px; }
@@ -162,6 +165,8 @@
   /* Green on hover, not the default blue -- .btn.btn-plus is deliberately
      more specific than .btn:hover so it wins regardless of file order. */
   .btn.btn-plus:hover, .btn.btn-plus:active { border-color: var(--nvg); color: var(--nvg); }
+  .btn.btn-download:hover, .btn.btn-download:active { border-color: var(--nvg); color: var(--nvg); }
+  .btn.break-btn:hover:not(:disabled), .btn.break-btn:active:not(:disabled) { border-color: var(--rd); color: var(--rd); }
   .btn:disabled { opacity: .4; cursor: not-allowed; }
   .btn:disabled:hover { border-color: var(--stroke-hi); color: var(--nw); }
   /* Structural actions (up/down/delete) are grouped and pinned right,
