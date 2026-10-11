@@ -1,6 +1,6 @@
 # Starfire
 
-**Starfire** is a test campaign and test card designer for aerospace test programs, with a **measure** button that sends SCPI lines to bench instruments and an **activate** button that runs your own scripts or programs, both built into the card. It is one local program (Linux, two small binaries) that handles the documentation side of testing (campaigns, procedures, requirements traceability, sign-off) and, optionally, talks to hardware.
+**Starfire** is a test campaign and test card designer for aerospace, automotive, and other engineering test programs, with a **measure** button that sends SCPI lines to bench instruments and an **activate** button that runs your own scripts or programs, both built into the card. It is one local program (Linux, two small binaries) that handles the documentation side of testing (campaigns, procedures, requirements traceability, sign-off) and, optionally, talks to hardware.
 
 It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, `.docx`, and print/PDF.
 
