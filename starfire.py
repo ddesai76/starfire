@@ -928,6 +928,7 @@ const ICON_FLAG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 9
 const ICON_PHOTO_CAMERA = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-260q75 0 127.5-52.5T660-440q0-75-52.5-127.5T480-620q-75 0-127.5 52.5T300-440q0 75 52.5 127.5T480-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29ZM160-120q-33 0-56.5-23.5T80-200v-480q0-33 23.5-56.5T160-760h126l74-80h240l74 80h126q33 0 56.5 23.5T880-680v480q0 33-23.5 56.5T800-120H160Zm0-80h640v-480H638l-73-80H395l-73 80H160v480Zm320-240Z"/></svg>';
 const ICON_ADD_A_PHOTO = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-440ZM120-120q-33 0-56.5-23.5T40-200v-480q0-33 23.5-56.5T120-760h126l74-80h240v80H355l-73 80H120v480h640v-360h80v360q0 33-23.5 56.5T760-120H120Zm640-560v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80ZM440-260q75 0 127.5-52.5T620-440q0-75-52.5-127.5T440-620q-75 0-127.5 52.5T260-440q0 75 52.5 127.5T440-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29Z"/></svg>';
 const ICON_SPEED = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-316.5q38-.5 56-27.5l224-336-336 224q-27 18-28.5 55t22.5 61q24 24 62 23.5Zm0-483.5q59 0 113.5 16.5T696-734l-76 48q-33-17-68.5-25.5T480-720q-133 0-226.5 93.5T160-400q0 42 11.5 83t32.5 77h552q23-38 33.5-79t10.5-85q0-36-8.5-70T766-540l48-76q30 47 47.5 100T880-406q1 57-13 109t-41 99q-11 18-30 28t-40 10H204q-21 0-40-10t-30-28q-26-45-40-95.5T80-400q0-83 31.5-155.5t86-127Q252-737 325-768.5T480-800Zm7 313Z"/></svg>';
+const ICON_DOWNLOAD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-320 280-520l56-58 104 104v-326h80v326l104-104 56 58-200 200ZM240-160q-33 0-56.5-23.5T160-240v-120h80v120h480v-120h80v120q0 33-23.5 56.5T720-160H240Z"/></svg>';
 const ICON_BOLT = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m422-232 207-248H469l29-227-185 267h139l-30 208ZM320-80l40-280H160l360-520h80l-40 320h240L400-80h-80Zm151-390Z"/></svg>';
 // Crosshair: "sample this reading". Children set fill="none" explicitly, since
 // .btn-icon svg's CSS fill would otherwise paint them solid.
@@ -1148,10 +1149,15 @@ function modulePanelHtml(i, p) {
       <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(st.name || "")}" placeholder="module name">
       <datalist id="pt-modlist-${i}">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>
       <button class="btn mini" data-modrun="${i}"${st.status === "running" ? " disabled" : ""}>run</button>
+      <button class="btn mini break-btn" data-modbreak="${i}"${st.status === "running" ? "" : " disabled"}>break</button>
     </div>
     ${none}
     <div class="module-status ${esc(st.status || "")}">${esc(st.text || "")}</div>
-    ${st.output ? `<pre class="module-output">${esc(st.output)}</pre>` : ""}`;
+    ${st.output ? `<pre class="module-output">${esc(st.output)}</pre>
+    <div class="panel-actions">
+      <button class="btn mini btn-icon btn-download" data-modsave="${i}" title="save output as ${esc(pointFileName(p, "txt"))}" aria-label="save module output">${ICON_DOWNLOAD}</button>
+      <span class="module-status complete">${esc(st.saved || "")}</span>
+    </div>` : ""}`;
 }
 
 function bindModulePanel(i) {
@@ -1166,6 +1172,14 @@ function bindModulePanel(i) {
   });
   const btn = root.querySelector("button[data-modrun]");
   if (btn) btn.addEventListener("click", () => runModule(p));
+  const brk = root.querySelector("button[data-modbreak]");
+  if (brk) brk.addEventListener("click", () => breakModule(p));
+  const sv = root.querySelector("button[data-modsave]");
+  if (sv) sv.addEventListener("click", async () => {
+    const st = moduleState.get(p);
+    st.saved = await savePointFile(p, "txt", st.output);
+    refreshModulePanel(p);
+  });
 }
 
 // Redraws just this point's module panel (not the whole list) so a run
@@ -1193,7 +1207,7 @@ async function runModule(p) {
       text: `${name} isn't registered for this point. Add it to the campaign's Modules table, with a scope that includes it.`});
     return refreshModulePanel(p);
   }
-  Object.assign(st, {status: "running", text: "Running...", output: ""});
+  Object.assign(st, {status: "running", text: "Running...", output: "", saved: ""});
   refreshModulePanel(p);
   try {
     const res = await fetch("/run_module", {
@@ -1203,13 +1217,60 @@ async function runModule(p) {
     });
     const r = await res.json();
     const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
-    st.status = r.status === "complete" ? "complete" : "failed";
+    st.status = ["complete", "broken"].includes(r.status) ? r.status : "failed";
     st.text = `${st.status.toUpperCase()}${detail ? " (" + detail + ")" : ""}${r.error ? ": " + r.error : ""}`;
     st.output = r.output || "";
   } catch (err) {
     Object.assign(st, {status: "failed", text: `FAILED: ${err}`, output: ""});
   }
   refreshModulePanel(p);
+}
+
+async function breakModule(p) {
+  const st = moduleState.get(p) || {};
+  try {
+    const res = await fetch("/break_module", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({card: card.id, point: p.seq}),
+    });
+    const r = await res.json();
+    if (!r.success) { st.text = r.error || "Break failed"; refreshModulePanel(p); }
+  } catch (err) {
+    st.text = `Break failed: ${err}`;
+    refreshModulePanel(p);
+  }
+}
+
+function pointCampaign() {
+  try { return (window.parent !== window && window.parent.getCampaignId) ? window.parent.getCampaignId() : ""; } catch (e) { return ""; }
+}
+
+// <campaign>-<card>-<point>.<ext>, as the server will name it.
+function pointFileName(p, ext) {
+  const part = s => String(s || "").trim().replace(/[^A-Za-z0-9._-]/g, "_");
+  return `${part(pointCampaign()) || "XX-000"}-${part(card.id) || "TC"}-${p.seq}.${ext}`;
+}
+
+// Saves text next to the .test files; returns the line to show.
+async function savePointFile(p, ext, content) {
+  try {
+    const res = await fetch("/save_point_file", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({campaign: pointCampaign() || "XX-000", card: card.id, point: p.seq, ext, content}),
+    });
+    const r = await res.json();
+    return r.saved ? `Saved ${r.filename}` : `Save failed: ${r.error || "unknown error"}`;
+  } catch (err) {
+    return `Save failed: ${err}`;
+  }
+}
+
+function measureCsv(p) {
+  const q = v => /[",\\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  const rows = p.measurements.filter(m => m.value).map(m => [m.auto ? m.command : "", m.value, m.timestamp].map(q).join(","));
+  return ["command,value,timestamp", ...rows].join("\\n") + "\\n";
 }
 
 function measurePanelHtml(i, p) {
@@ -1252,7 +1313,11 @@ function measurePanelHtml(i, p) {
       <tr><th>Command</th><th>Value</th><th>Timestamp</th><th class="blank-th"></th></tr>
       ${rows}
     </table>
-    ${open && canAddRow ? `<button class="btn mini btn-plus" data-madd="${i}" title="add row">+</button>` : ""}`;
+    <div class="panel-actions">
+      ${open && canAddRow ? `<button class="btn mini btn-plus" data-madd="${i}" title="add row">+</button>` : ""}
+      ${p.measurements.some(m => m.value) ? `<button class="btn mini btn-icon btn-download" data-msave="${i}" title="save readings as ${esc(pointFileName(p, "csv"))}" aria-label="save readings">${ICON_DOWNLOAD}</button>` : ""}
+      <span class="module-status complete" id="pt-measure-save-${i}"></span>
+    </div>`;
 }
 
 function renderPoints() {
@@ -1351,6 +1416,14 @@ function renderPoints() {
         moduleState.set(card.points[i], st);
       }
       renderPoints();
+    });
+  });
+  list.querySelectorAll("button[data-msave]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const i = +btn.dataset.msave;
+      const msg = await savePointFile(card.points[i], "csv", measureCsv(card.points[i]));
+      const el = document.getElementById("pt-measure-save-" + i);
+      if (el) el.textContent = msg;
     });
   });
   list.querySelectorAll("button[data-msend]").forEach(btn => {
@@ -1870,6 +1943,7 @@ document.getElementById("addModBtn").addEventListener("click", () => {
 window.addEventListener("focus", loadModuleFiles);
 // Test tabs (iframes) read the live list from here when they offer or run a module.
 window.getCampaignModules = () => camp.modules;
+window.getCampaignId = () => camp.id;
 
 // Google Material Symbols, embedded inline (not a file/CDN) so they work
 // fully offline; fill="currentColor" picks up each button's own hover color.
@@ -2390,7 +2464,20 @@ _RESERVED_MODULES = {"starfire", "starfire-hw"}
 # compiled binary, or a script with a shebang and chmod +x) and is run directly.
 _INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia"}
 _MODULE_TIMEOUT_S = 3600      # a module may legitimately run a whole test
-_MODULE_OUTPUT_TAIL = 4000    # characters of output returned to the browser
+_MODULE_OUTPUT_LINES = 4096   # output lines kept; a longer run keeps its first and last half
+_RUNS: dict = {}              # (card, point) -> running Popen, so BREAK can find it
+_BROKEN: set = set()          # runs a BREAK was sent to
+_RUNS_LOCK = threading.Lock()
+
+
+def _cap_lines(text: str, limit: int = None) -> str:
+    limit = limit or _MODULE_OUTPUT_LINES
+    lines = text.splitlines(keepends=True)
+    if len(lines) <= limit:
+        return text
+    half = limit // 2
+    omitted = len(lines) - 2 * half
+    return "".join(lines[:half]) + f"... {omitted} lines omitted ...\n" + "".join(lines[-half:])
 
 
 def _is_module(d: str, name: str) -> bool:
@@ -2441,14 +2528,19 @@ def run_module(name: str, card_id: str = "", point_seq: str = "") -> dict:
         if not found:
             return {"status": "failed", "error": f"{interpreter} not found on PATH (needed to run {name})"}
         argv.insert(0, found)
+    key = (str(card_id), str(point_seq))
     started = time.monotonic()
-    try:
-        # Own session, so a timeout can take down the module's children too.
-        proc = subprocess.Popen(argv, cwd=os.getcwd(), env=_module_env(card_id, point_seq),
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, start_new_session=True)
-    except OSError as e:
-        return {"status": "failed", "error": f"could not start {name}: {e}"}
+    with _RUNS_LOCK:
+        if key in _RUNS:
+            return {"status": "failed", "error": "a module is already running on this point"}
+        try:
+            # Own session, so a timeout or BREAK can take down the module's children too.
+            proc = subprocess.Popen(argv, cwd=os.getcwd(), env=_module_env(card_id, point_seq),
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            return {"status": "failed", "error": f"could not start {name}: {e}"}
+        _RUNS[key] = proc
     timed_out = False
     try:
         out, _ = proc.communicate(timeout=_MODULE_TIMEOUT_S)
@@ -2456,15 +2548,47 @@ def run_module(name: str, card_id: str = "", point_seq: str = "") -> dict:
         timed_out = True
         os.killpg(proc.pid, signal.SIGKILL)
         out, _ = proc.communicate()
+    finally:
+        with _RUNS_LOCK:
+            _RUNS.pop(key, None)
+            broken = key in _BROKEN
+            _BROKEN.discard(key)
+    if proc.returncode == 0 and not timed_out:
+        status = "complete"
+    else:
+        status = "broken" if broken else "failed"
     result = {
-        "status": "complete" if proc.returncode == 0 and not timed_out else "failed",
+        "status": status,
         "exit_code": proc.returncode,
         "seconds": round(time.monotonic() - started, 1),
-        "output": out.decode("utf-8", "replace")[-_MODULE_OUTPUT_TAIL:],
+        "output": _cap_lines(out.decode("utf-8", "replace")),
     }
     if timed_out:
         result["error"] = f"timed out after {_MODULE_TIMEOUT_S} s"
     return result
+
+def break_module(card_id, point_seq, grace: float = 3.0) -> dict:
+    """SIGTERM the module running on this point (and its children); SIGKILL if it is still alive after `grace` s."""
+    key = (str(card_id), str(point_seq))
+    with _RUNS_LOCK:
+        proc = _RUNS.get(key)
+        if proc is None:
+            return {"success": False, "error": "no module is running on this point"}
+        _BROKEN.add(key)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return {"success": True}
+
+    def _kill():
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    threading.Timer(grace, _kill).start()
+    return {"success": True}
+
 
 def _fill_flags(html: str) -> str:
     return (html.replace("__JIRA_AVAILABLE__", "true" if JIRA_AVAILABLE else "false")
@@ -2472,6 +2596,9 @@ def _fill_flags(html: str) -> str:
 
 _TEST_HTML = _fill_flags(_TEST_HTML)
 _CAMPAIGN_HTML = _fill_flags(_CAMPAIGN_HTML)
+
+_POINT_FILE_EXTS = ("csv", "txt")
+_POINT_FILE_MAX = 5_000_000   # characters
 
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -2653,24 +2780,58 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(200, {"success": False, "error": line.get("error", "unknown error")})
 
-    def _handle_run_module(self, raw_body: bytes):
-        # {"module": "warmup.sh", "card": "TC-001", "point": 20}. This runs a
-        # program, so it only accepts a request a web page on another site
-        # couldn't have sent: a JSON content type (which forces a CORS
-        # preflight this server never answers) and our own Host header (which
-        # stops DNS rebinding).
+    def _local_json_payload(self, raw_body: bytes):
+        """For routes that run or write things: only accept a request a web page on
+        another site couldn't have sent, a JSON content type (which forces a CORS
+        preflight this server never answers) and our own Host header (which stops
+        DNS rebinding). Returns the payload dict, or None after sending the error."""
         port = self.server.server_address[1]
         if (self.headers.get("Content-Type", "").split(";")[0].strip() != "application/json"
                 or self.headers.get("Host", "") not in (f"localhost:{port}", f"127.0.0.1:{port}")):
             self._send_json(403, {"status": "failed", "error": "forbidden"})
-            return
+            return None
         try:
             payload = json.loads(raw_body)
-            name = str(payload.get("module") or "")
-        except (json.JSONDecodeError, AttributeError) as e:
+        except json.JSONDecodeError as e:
             self._send_json(400, {"status": "failed", "error": f"bad request: {e}"})
+            return None
+        if not isinstance(payload, dict):
+            self._send_json(400, {"status": "failed", "error": "bad request: expected a JSON object"})
+            return None
+        return payload
+
+    def _handle_run_module(self, raw_body: bytes):
+        payload = self._local_json_payload(raw_body)
+        if payload is None:
             return
-        self._send_json(200, run_module(name, payload.get("card", ""), payload.get("point", "")))
+        self._send_json(200, run_module(str(payload.get("module") or ""), payload.get("card", ""), payload.get("point", "")))
+
+    def _handle_break_module(self, raw_body: bytes):
+        payload = self._local_json_payload(raw_body)
+        if payload is None:
+            return
+        self._send_json(200, break_module(payload.get("card", ""), payload.get("point", "")))
+
+    def _handle_save_point_file(self, raw_body: bytes):
+        # {"campaign", "card", "point", "ext": "csv"|"txt", "content"} -> <campaign>-<card>-<point>.<ext>
+        payload = self._local_json_payload(raw_body)
+        if payload is None:
+            return
+        ext = payload.get("ext")
+        content = payload.get("content")
+        if ext not in _POINT_FILE_EXTS or not isinstance(content, str) or len(content) > _POINT_FILE_MAX:
+            self._send_json(400, {"saved": False, "error": "bad request"})
+            return
+        stem = "-".join(re.sub(r"[^A-Za-z0-9._-]", "_", str(payload.get(k) or d))
+                        for k, d in (("campaign", "XX-000"), ("card", "TC"), ("point", "0")))
+        filename = _safe_filename(stem, "." + ext)
+        try:
+            with open(os.path.join(os.getcwd(), filename), "w", encoding="utf-8", newline="") as f:
+                f.write(content)
+        except OSError as e:
+            self._send_json(500, {"saved": False, "error": str(e)})
+            return
+        self._send_json(200, {"saved": True, "filename": filename})
 
     def do_POST(self):
         path = urlparse(self.path).path
@@ -2683,6 +2844,10 @@ class _Handler(BaseHTTPRequestHandler):
             return self._handle_hardware(raw)
         if path == "/run_module":
             return self._handle_run_module(raw)
+        if path == "/break_module":
+            return self._handle_break_module(raw)
+        if path == "/save_point_file":
+            return self._handle_save_point_file(raw)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
