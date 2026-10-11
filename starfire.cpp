@@ -1,202 +1,261 @@
-// starfire.cpp:   HARDWARE INTERFACE (builds to starfire-hw)
-// AUTHOR:         DANIEL DESAI
-// UPDATED:        2026-10-11
-// VERSION:        0.2.0
-//
-// Sends one SCPI line to a device node; a query (contains '?') also reads the reply.
-// Prints one JSON line on stdout. Exit: 0 ok, 1 runtime failure, 2 usage error.
-//
-// Usage:  starfire-hw send [--timeout <sec>] [--opc] <device> <scpi line>
-// Build:  g++ -O2 -std=c++17 -o starfire-hw starfire.cpp
+:root {
+    --bg:#080908; --panel:#0c0e0c; --hi:#101310;
+    --stroke:#243520; --stroke-hi:#405a3a;
+    --nw:#b8ffd0; --yl:#e8c000; --rd:#ff2800; --bl:#0077C8; --ebl:#00A3E0; --amb:#FFB300; --nvg:#39ff14; --magenta:#FD3DB5;
+    --dim:#618a6b; --faint:#2e4432;
+    --mono: 'B612 Mono', 'SF Mono', Menlo, Consolas, monospace;
+  }
+  .editor-doc { background: var(--bg); color: var(--nw); font-family: var(--mono);
+                height: 100%; margin: 0; display: flex; flex-direction: column; }
+  /* No standalone display font -- fakes a retro-italic
+     look with B612 Mono: skew, vertical stretch, expanded tracking. */
+  .editor-doc h1 { font-family: 'B612 Mono', monospace; font-size: 32px; font-weight: 700;
+       color: var(--ebl); letter-spacing: .12em; margin-bottom: 6px;
+       transform: skewX(-12deg) scaleY(1.1); transform-origin: left bottom;
+       display: inline-block; }
+  .sub { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+         color: var(--dim); font-size: 12px; text-transform: uppercase;
+         letter-spacing: .15em; margin-bottom: 1.2rem; }
+  .editor-doc h2 { font-size: 13px; font-weight: 700; margin: 1.2rem 0 10px;
+       color: var(--faint); text-transform: uppercase; letter-spacing: .12em;
+       border-bottom: 1px solid var(--stroke); padding-bottom: 5px; }
+  .editor-doc .meta { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px 20px; margin-bottom: 1rem; }
+  .field label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+  .editor-doc input, .editor-doc select, .editor-doc textarea {
+    width: 100%; padding: 5px 7px; font-size: 13px; box-sizing: border-box;
+    background: var(--panel); border: 1px solid var(--stroke-hi); border-radius: 6px;
+    color: var(--nw); font-family: var(--mono);
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--bl); }
+  .pt-card { border: 1px solid var(--stroke-hi); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .lock-tag { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; }
+  input:disabled, textarea:disabled, select:disabled {
+    opacity: .55; cursor: not-allowed;
+  }
+  .pt-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .pt-head input.seq { width: 60px; text-align: center; font-weight: 700; color: var(--bl); }
+  .pt-head .pt-btns { margin-left: auto; display: flex; gap: 4px; }
+  .pt-main { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 8px; }
+  .pt-main textarea { min-height: 44px; resize: vertical; }
+  .pt-sign { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; }
+  .pt-sign label { display: block; font-size: 10px; color: var(--dim); margin-bottom: 2px; }
+  .pt-sign .time-row { display: flex; gap: 4px; }
+  .pt-main label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+  /* Flag: amber instead of blue, on the point number and whichever
+     sign-off fields are currently active -- independent of locked. */
+  .pt-card.flagged .pt-head input.seq { color: var(--amb); }
+  .pt-card.flagged .pt-sign input:focus, .pt-card.flagged .pt-sign select:focus,
+  .pt-card.flagged .pt-main textarea:focus { border-color: var(--amb); }
+  .pt-card.flagged .pt-sign .time-row .btn:hover,
+  .pt-card.flagged .pt-sign .time-row .btn:focus { border-color: var(--amb); color: var(--amb); }
+  .flag-btn.flagged { color: var(--amb); border-color: var(--amb); }
+  /* Amber on hover regardless of flagged state. .btn.flag-btn:hover is
+     deliberately more specific than .btn:hover, so it wins regardless of file order. */
+  .btn.flag-btn:hover, .btn.flag-btn:active { border-color: var(--amb); color: var(--amb); }
+  /* Capture and Measure both get green on hover -- both are "record a
+     reading" actions (a photo, a future equipment measurement). */
+  .pt-btns button[data-act="capture"]:hover, .pt-btns button[data-act="capture"]:active {
+    border-color: var(--nvg); color: var(--nvg);
+  }
+  /* The measure and activate (module) buttons both get magenta on
+     hover, not green -- hover-only, matching every other icon button's
+     accent-color pattern (not persistent). .btn.measure-toggle (two
+     classes), not a bare .measure-toggle (one) -- the latter ties
+     .btn:hover's specificity exactly, so whichever rule sits later in
+     the file silently wins regardless of which is "correct". */
+  .btn.measure-toggle:hover, .btn.measure-toggle:active,
+  .btn.module-toggle:hover, .btn.module-toggle:active {
+    border-color: var(--magenta); color: var(--magenta);
+  }
+  /* Camera, Measure and Module each get a fixed third of the row,
+     left to right, whether or not they're open -- an empty column stays
+     blank space rather than letting its neighbours stretch. calc((100% -
+     32px) / 3), not a bare 33.33%: with flex-shrink:0 on all three, the
+     row's two 16px gaps would otherwise push the total past 100%. */
+  .pt-expand-row { display: flex; gap: 16px; align-items: flex-start; }
+  .pt-camera, .pt-measure, .pt-module { flex: 0 0 calc((100% - 32px) / 3); min-width: 0; }
+  .pt-measure, .pt-module { margin-top: 20px; box-sizing: border-box; }
+  .pt-module label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+  /* A module's text color is its language: green = binary, amber = .py, blue = .jl,
+     white = .sh, red = anything else. Two classes, to beat .editor-doc select/option. */
+  .editor-doc .mod-bin { color: var(--nvg); }
+  .editor-doc .mod-py { color: var(--amb); }
+  .editor-doc .mod-jl { color: var(--bl); }
+  .editor-doc .mod-sh { color: var(--nw); }
+  .editor-doc .mod-other { color: var(--rd); }
+  /* The native dropdown arrow takes the select's text color, so the arrow is
+     drawn separately in the normal text color (--nw, #b8ffd0) and only the name is tinted. */
+  #modTable select { appearance: none; padding-right: 26px; background-repeat: no-repeat;
+    background-position: right 9px center; background-size: 12px 8px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%23b8ffd0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5'/%3E%3C/svg%3E"); }
+  /* A text input with its action button beside it: module name + run, command + send. */
+  .send-row { display: flex; gap: 6px; margin-bottom: 8px; }
+  .send-row input { flex: 1; min-width: 0; }
+  .send-row .btn.mini { padding: 3px 12px; }
+  .panel-actions { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+  .panel-actions .module-status { margin: 0; }
+  .module-status { font-size: 12px; margin-bottom: 6px; overflow-wrap: anywhere; }
+  .module-status.running { color: var(--amb); }
+  .module-status.complete { color: var(--nvg); }
+  .module-status.failed { color: var(--rd); }
+  .module-status.broken { color: var(--nw); }
+  .module-output { margin: 0; padding: 6px 8px; max-height: 160px; overflow: auto; font-size: 11px;
+                   white-space: pre-wrap; overflow-wrap: anywhere; color: var(--dim);
+                   background: var(--panel); border: 1px solid var(--stroke); border-radius: 6px; }
+  .measure-fields { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 8px; }
+  .measure-fields > div { min-width: 0; }
+  .measure-fields input { box-sizing: border-box; }
+  .pt-measure > div { margin-bottom: 8px; }
+  .pt-measure label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+  /* table-layout: auto (the default) sizes columns from content's own
+     intrinsic width, which can overflow the container regardless of the
+     table's own width:100% -- fixed with explicit percentages instead. */
+  .measure-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 11px; margin-top: 6px; }
+  .measure-table th, .measure-table td { border: 1px solid var(--stroke); padding: 3px 5px;
+                                           overflow: hidden; text-overflow: ellipsis; box-sizing: border-box;
+                                           vertical-align: middle; }
+  /* The delete button here shares .btn.mini.btn-icon with the point
+     cluster's own buttons, sized ~30px tall to match the point-number
+     field -- massively oversized for this 11px table, and very likely
+     the actual tallest thing forcing the whole row taller than every
+     other cell needs, regardless of how well those other cells match
+     each other. Both overrides need genuinely higher specificity than
+     the rules they're overriding (4 and 2 classes respectively) to win
+     regardless of file order. */
+  .measure-table .btn.mini.btn-icon { padding: 2px; }
+  .measure-table .btn-icon svg { width: 12px; height: 12px; }
+  .measure-table th.blank-th { border: none; background: transparent; }
+  /* The measure column is a third of the row, so the delete column needs a
+     fixed-ish share to fit its button, and the timestamp cell wraps its "now". */
+  .measure-table col.mt-cmd { width: 24%; }
+  .measure-table col.mt-val { width: 26%; }
+  .measure-table col.mt-ts { width: 38%; }
+  .measure-table col.mt-del { width: 12%; }
+  .measure-table input { width: 100%; box-sizing: border-box; font-size: 11px; padding: 2px 4px; }
+  .measure-ts-cell { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px; }
+  .measure-ts-cell .btn.mini { padding: 1px 4px; font-size: 11px; }
+  .cam-preview { width: 100%; max-width: 320px; border: 1px solid var(--stroke-hi); border-radius: 8px;
+                 margin-top: 8px; display: block; }
+  .pt-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .pt-images:empty { margin-top: 0; }
+  .thumb-chip { font-size: 11px; color: var(--dim); background: var(--panel);
+                border: 1px solid var(--stroke-hi); border-radius: 6px; padding: 2px 6px;
+                display: inline-flex; align-items: center; gap: 6px; }
+  .thumb-chip svg { display: block; width: 12px; height: 12px; fill: currentColor; flex: none; }
+  .thumb-chip .btn.mini { padding: 0 4px; }
+  .pt-cam-msg { font-size: 11px; color: var(--amb); margin-top: 4px; }
+  .pt-cam-msg:empty { display: none; }
+  .btn { background: var(--panel); border: 1px solid var(--stroke-hi); color: var(--nw);
+         font-family: var(--mono); font-size: 12px; padding: 5px 10px; border-radius: 6px;
+         cursor: pointer; text-transform: uppercase; }
+  .btn:hover { border-color: var(--bl); color: var(--bl); }
+  /* Every "x"-style delete/remove control gets red on hover, not the
+     app-wide default blue -- a delete action reads differently. */
+  .btn-x:hover, .btn-x:active { border-color: var(--rd); color: var(--rd); }
+  .btn.mini { padding: 1px 6px; font-size: 12px; }
+  /* Sized to match the test point number field (~29px tall) -- same
+     vertical padding/icon size the campaign page uses, tighter horizontal padding since this cluster has up to 8 buttons. */
+  .btn.mini.btn-icon {
+    padding: 6px; display: inline-flex; align-items: center; justify-content: center;
+  }
+  .btn-icon svg { display: block; width: 16px; height: 16px; fill: currentColor; }
+  /* "+ add X" reads fine as a bare plus since context (the table/list it
+     sits under) does the labeling; a hover title keeps the original wording. */
+  .btn-plus { font-size: 19px; line-height: 1; padding: 4px 12px; }
+  /* Green on hover, not the default blue -- .btn.btn-plus is deliberately
+     more specific than .btn:hover so it wins regardless of file order. */
+  .btn.btn-plus:hover, .btn.btn-plus:active { border-color: var(--nvg); color: var(--nvg); }
+  .btn.btn-download:hover, .btn.btn-download:active { border-color: var(--nvg); color: var(--nvg); }
+  .btn.break-btn:hover:not(:disabled), .btn.break-btn:active:not(:disabled) { border-color: var(--rd); color: var(--rd); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn:disabled:hover { border-color: var(--stroke-hi); color: var(--nw); }
+  /* Structural actions (up/down/delete) are grouped and pinned right,
+     separated from the functional buttons by roughly one button's width. */
+  .pt-head .pt-btns .pt-btn-gap { width: 28px; }
+  /* Amber, matching the WINDBLADE cockpit palette -- color only shows on
+     hover/active, no constant glow; only the warning text itself is amber. */
+  #addWarningBtn:hover, #addWarningBtn:active { border-color: var(--amb); color: var(--amb); }
+  #warningsList textarea { color: var(--amb); }
+  .row { display: flex; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  /* Campaign panels have ids; the test card's single panel doesn't. */
+  .panel[id] .row { align-items: center; }
+  .list-row { display: flex; gap: 6px; margin-bottom: 6px; align-items: flex-start; }
+  .list-row textarea { flex: 1; min-height: 34px; resize: vertical; }
+  .nomtable { width: 100%; border-collapse: collapse; margin-bottom: 4px; font-size: 12px; }
+  .nomtable td, .nomtable th { border: 1px solid var(--stroke); padding: 4px 7px; }
+  .nomtable th.blank-th { border: none; background: transparent; }
+  /* A heading before a table or row-card list (Nomenclature, Test Points)
+     doesn't need its own rule line -- that content already separates it. */
+  h2.no-rule { border-bottom: none; padding-bottom: 0; }
+  .hint { color: var(--dim); font-size: 11px; margin-bottom: 10px; }
+  .panel[id] .hint { margin-bottom: 0; }
 
-#include <cerrno>
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <string>
-#include <fcntl.h>
-#include <sys/time.h>
-#include <unistd.h>
+  /* ---- Campaign page ---- */
+  table.datatable { width: 100%; border-collapse: collapse; margin-bottom: 4px; font-size: 12px; }
+  table.datatable td, table.datatable th { border: 1px solid var(--stroke); padding: 4px 7px; }
+  table.datatable th.blank-th { border: none; background: transparent; }
+  .tests-format { table-layout: fixed; }
+  .tests-format td { overflow: hidden; text-overflow: ellipsis; }
+  .tests-format td.actions-cell { white-space: nowrap; overflow: visible; text-align: right; }
+  .tests-format td.actions-cell .btn:not(.mini) { padding: 6px 22px; min-width: 60px; }
+  .tests-format td.actions-cell .btn:not(.mini) + .btn:not(.mini) { margin-left: 6px; }
+  /* Same vertical padding as the word-based buttons above (height stays
+     fixed); horizontal padding targets a landscape 1:1.4 height:width box. */
+  .tests-format td.actions-cell .btn.btn-icon {
+    padding: 6px 12px; min-width: 0; display: inline-flex;
+    align-items: center; justify-content: center;
+  }
+  .tests-format td.meta-cell { color: var(--dim); font-size: 12px; }
+  /* Green for the affirmative action, red for destructive -- color only
+     shows on hover/active, no constant glow. */
+  .tests-format button[data-open]:hover, .tests-format button[data-open]:active {
+    border-color: var(--nvg); color: var(--nvg); }
+  .tests-format button[data-del]:hover, .tests-format button[data-del]:active {
+    border-color: var(--rd); color: var(--rd); }
+  .sec-card { border: 1px solid var(--stroke-hi); border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+  .sec-card textarea { min-height: 80px; resize: vertical; }
+  .sec-head { display: flex; gap: 8px; margin-bottom: 6px; align-items: center; }
+  .sec-head input { flex: 1; }
 
-namespace {
+  /* Tab bar */
+  #tabbar { display: flex; gap: 2px; background: var(--panel); padding: 6px 12px 0;
+            border-bottom: 1px solid var(--stroke-hi); flex-wrap: wrap; }
+  .tab-btn { background: var(--hi); border: 1px solid var(--stroke-hi); border-bottom: none;
+             color: var(--dim); font-family: var(--mono); font-size: 12px; padding: 6px 12px;
+             border-radius: 6px 6px 0 0; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+  .tab-btn.active { color: var(--nw); background: var(--bg); border-color: var(--bl); }
+  .tab-btn .close-x { color: var(--dim); font-size: 11px; }
+  .tab-btn .close-x:hover { color: var(--rd); }
+  #panels { flex: 1; overflow: auto; }
+  .panel { display: none; max-width: 1080px; margin: 2rem auto; padding: 0 1rem 24px; }
+  .panel.active { display: block; }
+  .test-panel { display: none; padding: 0; height: calc(100vh - 46px); position: relative; }
+  .test-panel.active { display: block; }
+  .test-panel iframe { position: absolute; inset: 0; border: none; width: 100%; height: 100%; background: var(--bg); }
+  #saveStatus:not(.hint) { color: var(--dim); font-size: 11px; padding: 4px 16px; }
 
-const int kDefaultTimeoutSec = 5;
-const int kMaxTimeoutSec = 60;
-const size_t kMaxCommandLen = 1024;
 
-std::string g_mode, g_dev, g_cmd, g_kind;
-
-std::string json_escape(const std::string& s) {
-    std::string out;
-    for (unsigned char c : s) {
-        switch (c) {
-            case '"':  out += "\\\""; break;
-            case '\\': out += "\\\\"; break;
-            case '\n': out += "\\n"; break;
-            case '\r': out += "\\r"; break;
-            case '\t': out += "\\t"; break;
-            default:
-                if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); out += b; }
-                else out += static_cast<char>(c);
-        }
-    }
-    return out;
+/* Print / PDF (card, campaign, VCRM): separate documents, scoped under .print-doc so
+   they can share this file with the editor CSS without rules like .meta leaking across. */
+.print-doc { font-family: 'B612', -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+        color: #1a1a1a; max-width: 1100px; margin: 1in auto; }
+.print-doc h1 { font-size: 30pt; font-weight: 600; color: #3c5a76; margin-bottom: 4px; }
+.print-doc .meta { font-size: 16pt; color: #444; margin-bottom: 4px; }
+.print-doc .meta:last-of-type { margin-bottom: 20px; }
+.print-doc .meta span { margin-right: 18px; }
+.print-doc table { width: 100%; border-collapse: collapse; margin-bottom: 24px; font-size: 9.5pt; }
+.print-doc th, .print-doc td { border: 1px solid #d5dde3; padding: 8px 10px; text-align: left; vertical-align: top; }
+.print-doc th { background: #e7eef5; font-weight: 700; color: #1a1a1a; }
+.print-doc table.test-points { table-layout: fixed; font-size: 8.5pt; }
+.print-doc table.test-points th, .print-doc table.test-points td {
+  padding: 6px 6px; word-wrap: break-word; overflow-wrap: break-word;
 }
-
-std::string utc_now() {
-    timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    tm tmv;
-    gmtime_r(&ts.tv_sec, &tmv);
-    char buf[40];
-    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%S", &tmv);
-    char out[64];
-    std::snprintf(out, sizeof out, "%s.%03dZ", buf, static_cast<int>(ts.tv_nsec / 1000000));
-    return out;
-}
-
-std::string result_line(bool ok, const std::string& key, const std::string& value) {
-    return "{\"t\":\"" + utc_now() + "\",\"mode\":\"" + json_escape(g_mode) +
-           "\",\"dev\":\"" + json_escape(g_dev) + "\",\"cmd\":\"" + json_escape(g_cmd) +
-           "\",\"kind\":\"" + g_kind + "\",\"ok\":" + (ok ? "true" : "false") +
-           ",\"" + key + "\":\"" + json_escape(value) + "\"}\n";
-}
-
-[[noreturn]] void fail(const std::string& message) {
-    std::string line = result_line(false, "error", message);
-    std::fputs(line.c_str(), stdout);
-    std::fflush(stdout);
-    std::exit(1);
-}
-
-char g_timeout_line[1024];
-size_t g_timeout_len = 0;
-void on_timeout(int) {
-    ssize_t r = write(STDOUT_FILENO, g_timeout_line, g_timeout_len);
-    (void)r;
-    _exit(1);
-}
-
-[[noreturn]] void usage(const char* why) {
-    if (why) std::fprintf(stderr, "starfire-hw: %s\n", why);
-    std::fprintf(stderr,
-        "usage: starfire-hw send [--timeout <sec>] [--opc] <device> <scpi line>\n");
-    std::exit(2);
-}
-
-bool write_all(int fd, const std::string& data) {
-    size_t off = 0;
-    while (off < data.size()) {
-        ssize_t n = write(fd, data.data() + off, data.size() - off);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return false;
-        }
-        off += static_cast<size_t>(n);
-    }
-    return true;
-}
-
-bool read_reply(int fd, std::string& reply) {
-    char buf[65536];
-    ssize_t n;
-    do { n = read(fd, buf, sizeof buf); } while (n < 0 && errno == EINTR);
-    if (n < 0) return false;
-    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) --n;
-    reply.assign(buf, static_cast<size_t>(n));
-    return true;
-}
-
-bool valid_device(const std::string& dev) {
-    return dev.rfind("/dev/", 0) == 0 && dev.find("..") == std::string::npos;
-}
-
-bool valid_command(const std::string& cmd) {
-    if (cmd.empty() || cmd.size() > kMaxCommandLen) return false;
-    for (unsigned char c : cmd)
-        if (c < 0x20 || c == 0x7f) return false;
-    return true;
-}
-
-}
-
-int main(int argc, char* argv[]) {
-    if (argc < 2) usage(nullptr);
-    g_mode = argv[1];
-    if (g_mode != "send") usage("first argument must be 'send'");
-
-    int timeout_sec = kDefaultTimeoutSec;
-    bool opc = false;
-    std::string positional[2];
-    int npos = 0;
-    for (int i = 2; i < argc; ++i) {
-        std::string a = argv[i];
-        if (a == "--timeout") {
-            if (i + 1 >= argc) usage("--timeout needs a value");
-            char* end = nullptr;
-            long v = std::strtol(argv[++i], &end, 10);
-            if (*end != '\0' || v < 1 || v > kMaxTimeoutSec) usage("--timeout must be 1-60 seconds");
-            timeout_sec = static_cast<int>(v);
-        } else if (a == "--opc") {
-            opc = true;
-        } else if (npos < 2) {
-            positional[npos++] = a;
-        } else {
-            usage("too many arguments");
-        }
-    }
-    if (npos != 2) usage("need <device> and <command>");
-    g_dev = positional[0];
-    g_cmd = positional[1];
-    bool is_query = g_cmd.find('?') != std::string::npos;
-    g_kind = is_query ? "query" : "command";
-    if (opc && is_query) usage("--opc only applies to a command, not a query");
-
-    std::string tl = result_line(false, "error", "timed out after " + std::to_string(timeout_sec) + " s");
-    g_timeout_len = tl.size() < sizeof g_timeout_line ? tl.size() : sizeof g_timeout_line - 1;
-    std::memcpy(g_timeout_line, tl.data(), g_timeout_len);
-    struct sigaction sa;
-    std::memset(&sa, 0, sizeof sa);
-    sa.sa_handler = on_timeout;
-    sigaction(SIGALRM, &sa, nullptr);
-    alarm(static_cast<unsigned>(timeout_sec));
-
-    if (!valid_device(g_dev)) fail("device must be a path under /dev/");
-    if (!valid_command(g_cmd)) fail("command must be 1-1024 printable characters on one line");
-
-    int fd = open(g_dev.c_str(), O_RDWR);
-    if (fd < 0) fail("could not open " + g_dev + ": " + std::strerror(errno));
-
-    if (!write_all(fd, g_cmd + "\n")) {
-        std::string e = std::strerror(errno);
-        close(fd);
-        fail("write to " + g_dev + " failed: " + e);
-    }
-
-    std::string reply;
-    if (is_query) {
-        if (!read_reply(fd, reply)) {
-            std::string e = std::strerror(errno);
-            close(fd);
-            fail("read from " + g_dev + " failed: " + e);
-        }
-    } else if (opc) {
-        if (!write_all(fd, "*OPC?\n") || !read_reply(fd, reply)) {
-            std::string e = std::strerror(errno);
-            close(fd);
-            fail("*OPC? after the command failed: " + e);
-        }
-        if (reply != "1") {
-            close(fd);
-            fail("*OPC? returned '" + reply + "', expected '1'");
-        }
-        reply.clear();
-    }
-    close(fd);
-    alarm(0);
-
-    std::fputs(result_line(true, "reply", reply).c_str(), stdout);
-    return 0;
-}
+.print-doc h2 { font-size: 13pt; font-weight: 600; color: #3c5a76; margin: 0 0 8px; }
+.print-doc .note-bar { background: #e7eef5; border-radius: 4px; padding: 8px 12px;
+             margin-bottom: 6px; font-size: 9.5pt; }
+.print-doc .warn-bar { background: #f8d7d7; color: #7a1f1f; border-radius: 4px; padding: 8px 12px;
+             margin-bottom: 6px; font-size: 9.5pt; }
+.print-doc .section-text { font-size: 10pt; white-space: pre-wrap; margin-bottom: 8px; }
+/* Campaign headings after free text need the space a table's own margin gives elsewhere. */
+.print-doc .section-text + h2 { margin-top: 18px; }
+@media print { .print-doc { margin: 0.4in; } }
