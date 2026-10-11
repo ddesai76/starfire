@@ -3,16 +3,18 @@
 # build.sh:       LINUX EXECUTABLE GENERATOR
 # AUTHOR:         DANIEL DESAI
 # UPDATED:        2026-10-11
-# VERSION:        0.2.0
+# VERSION:        0.3.0
 
 
-# Builds the single "starfire" Linux binary via PyInstaller.
+# Builds two Linux binaries into dist/: "starfire" (the app, via PyInstaller)
+# and "starfire-hw" (the SCPI interface, from starfire.cpp via g++).
 #
 # Directory structure (pre-build):
 # ├── assets
 # │   └── icon.png
 # ├── build.sh
 # ├── jira_ticket.py
+# ├── starfire.cpp
 # ├── starfire.py
 # └── static
 #   └── starfire.css
@@ -20,8 +22,9 @@
 # Usage: ./build.sh
 #        ./build.sh --install-desktop                   (uses assets/icon.png)
 #        ./build.sh --install-desktop path/to/icon.png   (overrides it)
-# Output: dist/starfire
-# Place jira_config.json into dist/ to enable jira ticketing
+# Output: dist/ containing starfire, starfire-hw, and (if you have one next to
+#         build.sh) jira_config.json, which build.sh copies over. Modules you
+#         have put in dist/ are left alone.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -42,7 +45,7 @@ if [ "${1:-}" = "--install-desktop" ]; then
 fi
 
 missing=()
-for f in starfire.py jira_ticket.py static/starfire.css; do
+for f in starfire.py starfire.cpp jira_ticket.py static/starfire.css; do
   [ -f "$f" ] || missing+=("$f")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
@@ -58,6 +61,11 @@ if { [ -e dist/starfire ] && [ ! -w dist/starfire ]; } || { [ -d dist ] && [ ! -
   exit 1
 fi
 
+if ! command -v g++ >/dev/null 2>&1; then
+  echo "ERROR: g++ not found (needed to build starfire-hw). On Debian/Ubuntu: sudo apt install g++" >&2
+  exit 1
+fi
+
 pip install --break-system-packages --quiet pyinstaller python-docx
 
 WORKDIR="$(mktemp -d)"
@@ -69,23 +77,31 @@ pyinstaller --onefile --name starfire \
   --specpath "$WORKDIR" \
   starfire.py
 
+g++ -O2 -Wall -Wextra -std=c++17 -o dist/starfire-hw starfire.cpp
+
+# Jira is optional: copied in only if you have a config next to build.sh.
+if [ -f jira_config.json ]; then
+  cp jira_config.json dist/jira_config.json
+  JIRA_NOTE="copied jira_config.json"
+else
+  JIRA_NOTE="no jira_config.json here -- Jira ticketing stays off"
+fi
+
 echo
-echo "Built: dist/starfire"
-echo "Optional (drop next to the binary before running, not required):"
-echo "  jira_config.json  -- enables Jira ticket creation"
-echo "  measure           -- enables the Sample / Activate buttons"
+echo "Built: dist/starfire, dist/starfire-hw ($JIRA_NOTE)"
+echo "starfire finds starfire-hw next to itself, so keep the two together."
 
 if [ -n "$ICON" ]; then
   BINARY="$(realpath dist/starfire)"
   RUNDIR="$HOME/Starfire"
   mkdir -p "$RUNDIR"
 
-  for f in jira_config.json measure; do
-    if [ -f "dist/$f" ]; then
-      mv "dist/$f" "$RUNDIR/"
-      echo "Moved dist/$f -> $RUNDIR/$f"
-    fi
-  done
+  # Jira reads jira_config.json from the working directory, which for the
+  # menu entry is RUNDIR; starfire-hw is found beside the binary, so stays put.
+  if [ -f dist/jira_config.json ]; then
+    cp dist/jira_config.json "$RUNDIR/"
+    echo "Copied dist/jira_config.json -> $RUNDIR/jira_config.json"
+  fi
 
   ICON_DIR="$HOME/.local/share/icons"
   mkdir -p "$ICON_DIR"
