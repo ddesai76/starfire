@@ -1,6 +1,6 @@
 # Starfire
 
-**Starfire** is a test campaign and test card designer for aerospace, automotive, and other engineering test programs, with a **measure** button that sends SCPI lines to bench instruments and an **activate** button that runs your own scripts or programs, both built into the card. It is one local program (Linux, two small binaries) that handles the documentation side of testing (campaigns, procedures, requirements traceability, sign-off) and, optionally, talks to hardware.
+**Starfire** is a test campaign and test card designer for aerospace, automotive, and other engineering test programs. It runs either as a Python script or as a standalone Linux binary, and handles the documentation side of testing: campaigns, procedures (test cards), requirements traceability, and sign-off. The documentation features also run as a Python script on other platforms. It offers two optional hardware-interface tools: **Measure** sends SCPI commands to bench instruments through the small starfire-hw helper binary, and **Activate** runs your own scripts or binaries.
 
 It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, `.docx`, and print/PDF.
 
@@ -20,6 +20,7 @@ python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 ```bash
 ./build.sh                              # -> dist/starfire, dist/starfire-hw, dist/jira_config.json
 ./build.sh --install-desktop            # also adds a menu entry (uses assets/icon.png)
+./build.sh --run                       # build, then start dist/starfire
 ```
 
 ### Dependencies
@@ -39,21 +40,38 @@ python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 * **VCRM:** cross-references campaign requirements against each card's `Requirement(s)` field and reports `Covered`, `Partial`, `Planned`, or `Not Covered`. Exports to `.vcrm`, `.docx`, and PDF.
 
 ### Test card
-* Metadata, nomenclature (raw LaTeX symbols), references, notes, and warnings.
+* Metadata (including **Article / S/N**, editable on a locked card), nomenclature (raw LaTeX symbols), references, notes, and warnings.
 * Test points numbered 10, 20, 30... with action, expected result, **observed result**, reference, responsible party, date, time, initial, and a sign-off quality (`RFI`, `PASS`, `CAUTION`, `FAIL`).
 * **Locking:** save a card as Locked to freeze the baseline; sign-off fields and newly added points stay editable.
 * **Flag** a point (amber), **capture** a frame from a webcam or UVC device (saved as `<timestamp>.jpg`).
 * **Jira:** ticket button on `CAUTION`/`FAIL` points; task button on campaign test rows; auto-links to the campaign's epic key.
 
+### Test Card and Test Report
+There are two exports for a card:
+
+* **Test Card**, from the card tab ("generate card" for print/PDF, "export .docx"): the procedure only, for reference and manual operation. Observed results, quality, sign-offs, measurements, images and the article are left blank.
+* **Test Report**, from the report button on a campaign's test row. It opens a `TR-xxx` tab (`TC-001` gets `TR-001`) beside the campaign and card tabs, showing the card **as last saved** (save the card tab first; **refresh** re-reads it). The report always has the header (`TR-001 <test name> REV A`, then campaign, article, conductor, QA, date), the requirements covered, and each point's observed result, quality, measurements, captured images and sign-off. **print / pdf** and **.docx** export it.
+
+Files belong to a test point by name: `<campaign>-<card>-<point>[-anything].<ext>`, for example `SC-001-TC-001-20.csv` from the measure download, `SC-001-TC-001-20.txt` from the module output download, or `SC-001-TC-001-20-sweep.png` written by your own module. Click a point in the report to make it active; the left panel lists that point's files, and ticking one embeds it:
+
+| File | In the report |
+|:--|:--|
+| `.csv` | Shown as raw text (capped at 4,096 lines). Press **plot** beside a ticked csv to plot it instead (the `value` column if there is one, else the last numeric column, against the first numeric column or the row number). The `.docx` lists the values in a table instead of a plot. |
+| `.png` `.jpg` `.gif` | Embedded image. |
+| `.txt` | Shown as text output (capped at 4,096 lines). |
+| anything else | Listed by name. |
+
+The ticks are saved in the campaign's `.camp` file.
+
 ### Test point tools: Camera, Measure, Activate
 Each test point has three tools in the button row. Each opens in its own column below the point, left to right: camera, measure, module.
- 
+
 | Button | Icon | What it does |
 |:--|:--|:--|
 | **Camera** | camera | Live preview and image capture (see above). |
 | **Measure** | gauge | Opens the measure column: a **USB port** (e.g. `/dev/usbtmc0`) and a **Command** box with a **send** button next to it. A query (contains `?`, e.g. `MEAS:VOLT:DC?`) is sent and its reply is added as a timestamped row in the point's measurement table. A command (e.g. `OUTP ON`) is sent and the status line shows `Sent OUTP ON at 14:03:22`; nothing is logged. The **download** icon saves the point's readings as `<campaign>-<card>-<point>.csv` (e.g. `SC-001-TC-001-20.csv`) in the working folder. Without `starfire-hw` the panel still works for manual entry and says nothing was sent. |
 | **Activate** | lightning bolt | Opens the module column. Type or pick a module name, press **run**, and watch the status: `RUNNING`, then `COMPLETE`, `FAILED` or `BROKEN` with the exit code, run time, and the module's output. **break** stops a running module (and anything it started): it is sent SIGTERM, then SIGKILL after 3 seconds. The **download** icon under the output saves it as `<campaign>-<card>-<point>.txt`. A card outside a campaign uses `XX-000` as the campaign. |
- 
+
 ### Modules
 A **module** is a script or program you wrote that Starfire runs for you: warm up a feed system, power a supply on, start a logger. Starfire doesn't know what it does; it starts it, waits, and reports how it ended.
 
@@ -73,7 +91,7 @@ The extension decides: a `.py` file runs under `python3` even if it has a differ
 |:--|:--|
 | **Module** | Picked from a list of the runnable files in `dist/`, which refreshes when you return to the page. The name's color shows its kind: **green** a binary (no extension), **amber** `.py`, **blue** `.jl`, **white** `.sh`, **red** anything else. |
 | **Description** | Optional free text. |
-| **Scope** | Where it may be run. Blank means any test point. `TC-001` means any point on card TC-001. `TC-001-20` means only point 20 on card TC-001. Identifiers are compared exactly, ignoring case. |
+| **Scope** | Where it may be run. Blank means any test point. `TC-001` means any point on card TC-001. `TC-001-20` means only point 20 on card TC-001. Ids are compared exactly (not as prefixes), ignoring case. |
 
 3. **Run it** from a test point's bolt button. The module name must be registered with a scope that includes that point, so a card opened on its own (outside a campaign) has nothing to run.
 
@@ -89,12 +107,12 @@ Starfire/                    <- launch ./dist/starfire from here; modules run he
     ├── starfire
     ├── starfire-hw
     ├── jira_config.json
-    └── example.py            <- example module 
+    └── example.py            <- the module (runs as: python3 example.py)
 ```
 
-* Environment: `STARFIRE_CARD` (card id), `STARFIRE_POINT` (point number), and `STARFIRE_HW` (path to `starfire-hw`, when found), so a shell script can drive an instrument with `"$STARFIRE_HW" send /dev/usbtmc0 "OUTP ON"`.
+* Environment: `STARFIRE_CAMPAIGN` (campaign id, `XX-000` outside a campaign), `STARFIRE_CARD` (card id), `STARFIRE_POINT` (point number), and `STARFIRE_HW` (path to `starfire-hw`, when found), so a shell script can drive an instrument with `"$STARFIRE_HW" send /dev/usbtmc0 "OUTP ON"` and name a file for its point with `"$STARFIRE_CAMPAIGN-$STARFIRE_CARD-$STARFIRE_POINT-plot.png"`.
 * The environment is your own, except that `LD_LIBRARY_PATH` is restored to its original value when running from the built binary, so a system `python3` or a compiled module isn't pointed at Starfire's bundled libraries.
-* No standard input. Output (stdout and stderr together) is shown in the panel, last 4,000 characters.
+* No standard input. Output (stdout and stderr together) is shown in the panel and saved by the download icon. It is capped at 4,096 lines; a longer run keeps its first and last 2,048 with a marker between.
 * A module may run for up to an hour; after that it is killed along with anything it started.
 
 **Safety.** Running a program on request from a web page needs care:
@@ -139,6 +157,5 @@ Exit codes: `0` success, `1` runtime failure (the JSON line has `error`), `2` us
 | `.test` | Native JSON test card (supports locked/unlocked state). |
 | `.vcrm` | VCRM snapshot JSON. |
 | `.csv` | Flat export of card metadata and test points. |
-| `.docx` | Word document with tables and styled callouts (campaign, VCRM, and single card). |
-| **Print / PDF** | Browser-rendered campaign, VCRM, or test card. |
-
+| `.docx` | Word document with tables and styled callouts (campaign, VCRM, Test Card, and Test Report). |
+| **Print / PDF** | Browser-rendered campaign, VCRM, Test Card, or Test Report. |
