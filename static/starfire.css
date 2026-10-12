@@ -7,8 +7,8 @@
   }
   .editor-doc { background: var(--bg); color: var(--nw); font-family: var(--mono);
                 height: 100%; margin: 0; display: flex; flex-direction: column; }
-  /* No standalone display font -- fakes a retro-italic
-     look with B612 Mono: skew, vertical stretch, expanded tracking. */
+  /* No standalone display font -- fakes a retro-italic 
+     look with B612 Mono instead: skew, vertical stretch, expanded tracking. */
   .editor-doc h1 { font-family: 'B612 Mono', monospace; font-size: 32px; font-weight: 700;
        color: var(--ebl); letter-spacing: .12em; margin-bottom: 6px;
        transform: skewX(-12deg) scaleY(1.1); transform-origin: left bottom;
@@ -232,6 +232,26 @@
   .test-panel { display: none; padding: 0; height: calc(100vh - 46px); position: relative; }
   .test-panel.active { display: block; }
   .test-panel iframe { position: absolute; inset: 0; border: none; width: 100%; height: 100%; background: var(--bg); }
+  /* Test Report tab: file panel on the left, the printable report on the right. */
+  .test-panel.report-panel.active { display: flex; }
+  .test-panel.report-panel iframe { position: static; flex: 1; width: auto; height: 100%; background: #fff; }
+  .report-side { width: 320px; flex: none; box-sizing: border-box; overflow: auto; padding: 16px;
+                 display: flex; flex-direction: column; gap: 14px; border-right: 1px solid var(--stroke); }
+  .report-box { border: 1px solid var(--stroke); background: var(--panel); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .report-label { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: var(--dim); }
+  .report-file { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+  .report-file input { accent-color: var(--nvg); margin-top: 2px; width: auto; flex: none; }
+  .report-file > span { flex: 1; min-width: 0; }
+  .report-fname { display: block; font-size: 12px; overflow-wrap: anywhere; }
+  .btn.btn-plot { flex: none; padding: 1px 8px; font-size: 11px; }
+  .btn.btn-plot.on { color: var(--nvg); border-color: var(--nvg); }
+  .report-kind { display: block; font-size: 11px; }
+  .report-kind.kind-csv { color: var(--nvg); }
+  .report-kind.kind-image { color: var(--amb); }
+  .report-kind.kind-txt { color: var(--nw); }
+  .report-kind.kind-other { color: var(--rd); }
+  .report-hint { font-size: 11px; color: var(--dim); line-height: 1.5; overflow-wrap: anywhere; }
+  .report-btns { display: flex; flex-wrap: wrap; gap: 8px; }
   #saveStatus:not(.hint) { color: var(--dim); font-size: 11px; padding: 4px 16px; }
 
 
@@ -259,3 +279,67 @@
 /* Campaign headings after free text need the space a table's own margin gives elsewhere. */
 .print-doc .section-text + h2 { margin-top: 18px; }
 @media print { .print-doc { margin: 0.4in; } }
+/* Test Report (print and the TR tab preview). */
+.report-doc.preview .rp-point { cursor: pointer; }
+.report-doc .rp-point { margin-bottom: 16px; }
+.report-doc .rp-point.rp-active { background: #eef3f8; }
+.report-doc .rp-head { display: flex; justify-content: space-between; gap: 16px; font-weight: 700; font-size: 11pt; margin-bottom: 6px; }
+.report-doc .rp-right { display: flex; flex-direction: column; align-items: flex-end; }
+.report-doc .rp-when { font-weight: 400; font-size: 8.5pt; color: #555; }
+.report-doc .rp-q-pass { color: #1d6b2b; }
+.report-doc .rp-q-caution { color: #8a5a00; }
+.report-doc .rp-q-fail { color: #a11a1a; }
+.report-doc .rp-line { font-size: 10pt; margin-bottom: 4px; }
+.report-doc .rp-meas { width: auto; min-width: 50%; margin: 8px 0; }
+.report-doc .rp-imgs { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
+.report-doc .rp-img { margin: 8px 0; }
+.report-doc .rp-img img { max-width: 320px; max-height: 240px; border: 1px solid #d5dde3; display: block; }
+.report-doc .rp-cap, .report-doc .rp-sign, .report-doc figcaption, .report-doc .rp-missing { font-size: 8.5pt; color: #555; }
+.report-doc .rp-file { margin: 8px 0; }
+.report-doc .rp-plot { display: block; width: 100%; max-width: 640px; border: 1px solid #d5dde3; background: #fff; }
+.report-doc .rp-plot line { stroke: #1a1a1a; }
+.report-doc .rp-plot polyline { fill: none; stroke: #0077C8; stroke-width: 2; }
+.report-doc .rp-plot circle { fill: #0077C8; }
+.report-doc .rp-plot text { font-size: 10px; fill: #1a1a1a; }
+.report-doc .rp-out { font-size: 8.5pt; white-space: pre-wrap; overflow-wrap: anywhere; background: #f3f5f7;
+                      border: 1px solid #d5dde3; padding: 8px; margin: 4px 0; max-height: none; }
+/* On-screen preview uses the app's dark theme and the test card's type scale; print stays light. */
+.report-doc .rp-point { border: 1px solid #d5dde3; border-radius: 8px; padding: 10px; }
+.report-doc .rp-b-pass { border-color: #1d6b2b; }
+.report-doc .rp-b-caution { border-color: #8a5a00; }
+.report-doc .rp-b-fail { border-color: #a11a1a; }
+.report-doc.preview { background: var(--bg); color: var(--nw); font-family: var(--mono); font-size: 13px; min-height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }
+.report-doc.preview h1 { font-family: var(--mono); font-size: 32px; font-weight: 700; color: var(--bl); letter-spacing: .12em; margin: 0 0 10px;
+                         }
+.report-doc.preview h2 { font-size: 13px; font-weight: 700; color: var(--dim); text-transform: uppercase; letter-spacing: .12em;
+                         margin: 1.2rem 0 10px; }
+.report-doc.preview .meta { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+.report-doc.preview .meta:last-of-type { margin-bottom: 8px; }
+.report-doc.preview .meta b { font-weight: 400; font-size: 11px; }
+.report-doc.preview p { font-size: 12px; color: var(--dim); }
+.report-doc.preview table { font-size: 11px; }
+.report-doc.preview th, .report-doc.preview td { border-color: var(--stroke); padding: 4px 6px; }
+.report-doc.preview th { background: var(--hi); color: var(--dim); font-weight: 400; }
+.report-doc.preview .rp-point { border-color: var(--stroke-hi); margin-bottom: 18px; }
+.report-doc.preview .rp-b-pass { border-color: var(--nvg); }
+.report-doc.preview .rp-b-caution { border-color: var(--amb); }
+.report-doc.preview .rp-b-fail { border-color: var(--rd); }
+.report-doc.preview .rp-b-rfi { border-color: var(--bl); }
+.report-doc.preview .rp-point.rp-active { background: var(--hi) }
+.report-doc.preview .rp-head { font-size: 13px; color: var(--bl); }
+.report-doc.preview .rp-line { font-size: 13px; }
+.report-doc.preview .rp-line b { font-weight: 400; font-size: 11px; color: var(--dim); }
+.report-doc.preview .rp-when, .report-doc.preview .rp-cap, .report-doc.preview .rp-sign,
+.report-doc.preview figcaption, .report-doc.preview .rp-missing { font-size: 11px; color: var(--dim); }
+.report-doc.preview .rp-q-pass { color: var(--nvg); }
+.report-doc.preview .rp-q-caution { color: var(--amb); }
+.report-doc.preview .rp-q-fail { color: var(--rd); }
+.report-doc.preview .rp-q-rfi { color: var(--bl); }
+.report-doc.preview .rp-img img { border-color: var(--stroke); }
+.report-doc.preview .rp-plot { border-color: var(--stroke); background: var(--panel); }
+.report-doc.preview .rp-plot line { stroke: var(--dim); }
+.report-doc.preview .rp-plot polyline { stroke: var(--nvg); }
+.report-doc.preview .rp-plot circle { fill: var(--nvg); }
+.report-doc.preview .rp-plot text { fill: var(--nw); }
+.report-doc.preview .rp-out { font-size: 11px; background: var(--panel); border-color: var(--stroke); color: var(--nw); }
+@media print { .report-doc .rp-point { break-inside: avoid; } .report-doc .rp-point.rp-active { background: none; outline: none; } }
