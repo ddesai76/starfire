@@ -2,8 +2,8 @@
 #
 # build.sh:       LINUX EXECUTABLE GENERATOR
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-11
-# VERSION:        0.3.0
+# UPDATED:        2026-10-12
+# VERSION:        0.3.2
 
 
 # Builds two Linux binaries into dist/: "starfire" (the app, via PyInstaller)
@@ -22,6 +22,7 @@
 # Usage: ./build.sh
 #        ./build.sh --install-desktop                   (uses assets/icon.png)
 #        ./build.sh --install-desktop path/to/icon.png   (overrides it)
+#        ./build.sh --run                               (runs dist/starfire from dist/ when built)
 # Output: dist/ containing starfire, starfire-hw, and (if you have one next to
 #         build.sh) jira_config.json, which build.sh copies over. Modules you
 #         have put in dist/ are left alone.
@@ -34,15 +35,22 @@ if [ "$(id -u)" -eq 0 ]; then
 fi
 
 ICON=""
-if [ "${1:-}" = "--install-desktop" ]; then
-  ICON="${2:-assets/icon.png}"
-  if [ ! -f "$ICON" ]; then
-    echo "ERROR: icon not found at $ICON" >&2
-    echo "Usage: $0 --install-desktop [path-to-icon-image]" >&2
-    echo "Defaults to assets/icon.png if no path is given." >&2
-    exit 1
-  fi
-fi
+RUN=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --run) RUN=1; shift ;;
+    --install-desktop)
+      ICON="assets/icon.png"; shift
+      if [ $# -gt 0 ] && [ "${1#--}" = "$1" ]; then ICON="$1"; shift; fi
+      if [ ! -f "$ICON" ]; then
+        echo "ERROR: icon not found at $ICON" >&2
+        echo "Usage: $0 [--install-desktop [path-to-icon-image]] [--run]" >&2
+        echo "Defaults to assets/icon.png if no path is given." >&2
+        exit 1
+      fi ;;
+    *) echo "Usage: $0 [--install-desktop [path-to-icon-image]] [--run]" >&2; exit 2 ;;
+  esac
+done
 
 missing=()
 for f in starfire.py starfire.cpp jira_ticket.py static/starfire.css; do
@@ -141,4 +149,11 @@ EOF
   echo "right-click it there to pin it to the dash/sidebar."
   echo "Working directory: $RUNDIR"
   echo "Binary:            $BINARY"
+fi
+
+# Runs from dist/, where the cards and modules of a source checkout live.
+if [ "$RUN" -eq 1 ]; then
+  echo
+  cd dist
+  exec ./starfire
 fi
