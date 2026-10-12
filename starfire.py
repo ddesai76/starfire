@@ -48,7 +48,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from docx import Document
-from docx.shared import Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -122,6 +123,8 @@ class TestCard:
     system: str = ""
     subsystem: str = ""
     test_type: str = ""
+    # Serial number / article under test; run data, so editable on a locked card.
+    article: str = ""
     # Free-text requirement code(s) this test verifies. Deliberately
     # unstructured -- tracing coverage is a manual, unenforced responsibility.
     requirements: str = ""
@@ -437,6 +440,8 @@ class Campaign:
     # Optional Jira Epic every ticket from this campaign links to. Passed
     # down into each open test tab once its iframe loads -- see openTestTab() below.
     jira_epic_key: str = ""
+    # Files ticked into each card's Test Report: {card_id: {point_seq: [filename, ...]}}.
+    reports: dict = field(default_factory=dict)
 
     @staticmethod
     def from_dict(d: dict) -> "Campaign":
@@ -801,6 +806,281 @@ def export_test_docx(card: "TestCard") -> bytes:
     return buf.getvalue()
 
 
+# Test Card (procedure only) vs Test Report (as-run record).
+
+def procedure_only(card: TestCard) -> TestCard:
+    """A copy with every run result cleared, so the card prints as a blank procedure."""
+    d = card.to_dict()
+    d["article"] = ""
+    for p in d["points"]:
+        for k in ("observed", "responsible_party", "date", "time", "initial", "quality"):
+            p[k] = ""
+        p["measurements"], p["images"] = [], []
+    return TestCard.from_dict(d)
+
+
+def report_id(card_id: str) -> str:
+    cid = (card_id or "").strip()
+    return "TR-" + cid[3:] if cid.upper().startswith("TC-") else "TR-" + (cid or "000")
+
+
+
+def report_head(card: TestCard) -> str:
+    rev = (card.revision or "").strip()
+    return " ".join(x for x in (report_id(card.id), (card.title or "").strip(), f"REV {rev.upper()}" if rev else "") if x)
+
+
+_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
+
+
+def _file_kind(name: str) -> str:
+    ext = os.path.splitext(name)[1].lower()
+    return "csv" if ext == ".csv" else "image" if ext in _IMAGE_TYPES else "txt" if ext == ".txt" else "other"
+
+
+def _point_prefix(campaign_id: str, card_id: str) -> str:
+    part = lambda s, d: re.sub(r"[^A-Za-z0-9._-]", "_", str(s or "").strip()) or d
+    return part(campaign_id, "XX-000") + "-" + part(card_id, "TC")
+
+
+def list_point_files(campaign_id: str, card_id: str) -> dict:
+    """{seq: [{"name", "kind"}]} for files in the working folder named
+    <campaign>-<card>-<point>[-anything].<ext>."""
+    pat = re.compile(r"^" + re.escape(_point_prefix(campaign_id, card_id)) + r"-(\d+)(?:-[^/]*)?\.[A-Za-z0-9]+$")
+    out = {}
+    try:
+        names = sorted(os.listdir(os.getcwd()))
+    except OSError:
+        return out
+    for n in names:
+        m = pat.match(n)
+        if m and os.path.isfile(n):
+            out.setdefault(m.group(1), []).append({"name": n, "kind": _file_kind(n)})
+    return out
+
+
+def _num(s):
+    m = re.match(r"\s*([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)", str(s))
+    return float(m.group(1)) if m else None
+
+
+def csv_series(path: str, limit: int = 5000):
+    """(x_label, y_label, xs, ys) from a csv: y is the "value" column if there is
+    one, else the last numeric column; x is the first column if numeric, else the row number."""
+    with open(path, newline="", encoding="utf-8", errors="replace") as f:
+        rows = [r for r in csv.reader(f) if any(c.strip() for c in r)][:limit + 1]
+    if not rows:
+        return None
+    header = rows[0] if any(_num(c) is None for c in rows[0]) else []
+    body = rows[1:] if header else rows
+    width = max(len(r) for r in body) if body else 0
+    numeric = [i for i in range(width) if any(i < len(r) and _num(r[i]) is not None for r in body)]
+    if not numeric:
+        return None
+    names = [c.strip().lower() for c in header]
+    y = names.index("value") if "value" in names and names.index("value") in numeric else numeric[-1]
+    x = numeric[0] if numeric[0] != y else None
+    pts = []
+    for i, r in enumerate(body):
+        yv = _num(r[y]) if y < len(r) else None
+        xv = (_num(r[x]) if x < len(r) else None) if x is not None else i + 1
+        if yv is not None and xv is not None:
+            pts.append((xv, yv))
+    if not pts:
+        return None
+    label = lambda i, d: header[i] if header and i < len(header) and header[i].strip() else d
+    return (label(x, "x") if x is not None else "sample", label(y, "y"), [p[0] for p in pts], [p[1] for p in pts])
+
+
+def csv_plot_svg(path: str) -> str:
+    s = csv_series(path)
+    if not s:
+        return ""
+    xl, yl, xs, ys = s
+    x0, x1 = min(xs), max(xs)
+    lo, hi = min(ys), max(ys)
+    pad = (hi - lo) * 0.1 or 1.0
+    y0, y1 = lo - pad, hi + pad
+    sx = lambda v: 56 + (v - x0) / ((x1 - x0) or 1) * 484
+    sy = lambda v: 176 - (v - y0) / (y1 - y0) * 156
+    line = " ".join(f"{sx(a):.1f},{sy(b):.1f}" for a, b in zip(xs, ys))
+    dots = "".join(f'<circle cx="{sx(a):.1f}" cy="{sy(b):.1f}" r="3"/>' for a, b in zip(xs, ys)) if len(xs) <= 60 else ""
+    g = lambda v: f"{v:.4g}"
+    return (f'<svg class="rp-plot" viewBox="0 0 560 210" role="img" aria-label="{_h(yl)} vs {_h(xl)}">'
+            f'<line x1="56" y1="176" x2="540" y2="176"/><line x1="56" y1="20" x2="56" y2="176"/>'
+            f'<text x="50" y="24" text-anchor="end">{g(y1)}</text><text x="50" y="176" text-anchor="end">{g(y0)}</text>'
+            f'<text x="56" y="194">{g(x0)}</text><text x="540" y="194" text-anchor="end">{g(x1)}</text>'
+            f'<text x="298" y="206" text-anchor="middle">{_h(xl)}</text>'
+            f'<text x="12" y="98" transform="rotate(-90 12 98)" text-anchor="middle">{_h(yl)}</text>'
+            f'<polyline points="{line}"/><g>{dots}</g></svg>')
+
+
+def _meas_rows(p: TestPoint) -> list:
+    # Saved rows are objects from the UI; older files may hold [command, value, timestamp, auto].
+    out = []
+    for m in p.measurements:
+        if isinstance(m, dict):
+            out.append((m.get("command", "") if m.get("auto") else "--", m.get("value", ""), m.get("timestamp", "")))
+        elif isinstance(m, (list, tuple)) and len(m) >= 3:
+            out.append((m[0] if (len(m) < 4 or m[3]) else "--", m[1], m[2]))
+    return [r for r in out if str(r[1]).strip()]
+
+
+def _cwd_file(name: str):
+    path = os.path.join(os.getcwd(), os.path.basename(name or ""))
+    return path if name and os.path.isfile(path) else None
+
+
+def _img_tag(name: str) -> str:
+    path = _cwd_file(name)
+    mime = _IMAGE_TYPES.get(os.path.splitext(name)[1].lower())
+    if not path or not mime:
+        return f'<div class="rp-missing">{_h(name)} (not found)</div>'
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    return f'<figure class="rp-img"><img src="data:{mime};base64,{data}" alt="{_h(name)}"><figcaption>{_h(name)}</figcaption></figure>'
+
+
+def _read_text(path: str, limit: int = 200_000) -> str:
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return f.read(limit)
+
+
+def _ticked(files: dict, card: TestCard, campaign_id: str, seq) -> list:
+    """Ticked names for a point, kept only if they really belong to it."""
+    pat = re.compile(r"^" + re.escape(_point_prefix(campaign_id, card.id)) + "-" + str(seq) + r"(?:-[^/]*)?\.[A-Za-z0-9]+$")
+    return [n for n in (files or {}).get(str(seq), []) if isinstance(n, str) and pat.match(n) and _cwd_file(n)]
+
+
+def _plotted(files: dict, seq) -> list:
+    """Names the user chose to plot; stored under files["plot"] as {seq: [names]}."""
+    p = (files or {}).get("plot")
+    return p.get(str(seq), []) if isinstance(p, dict) else []
+
+
+def _point_file_html(name: str, plot: bool = False) -> str:
+    kind, path = _file_kind(name), _cwd_file(name)
+    if kind == "csv" and not plot:
+        return f'<div class="rp-file"><div class="rp-cap">{_h(name)}</div><pre class="rp-out">{_h(_cap_lines(_read_text(path)))}</pre></div>'
+    if kind == "csv":
+        svg = csv_plot_svg(path)
+        return f'<div class="rp-file"><div class="rp-cap">{_h(name)}</div>{svg or "<div class=rp-missing>no numeric data to plot</div>"}</div>'
+    if kind == "image":
+        return _img_tag(name)
+    if kind == "txt":
+        return f'<div class="rp-file"><div class="rp-cap">{_h(name)}</div><pre class="rp-out">{_h(_cap_lines(_read_text(path)))}</pre></div>'
+    return f'<div class="rp-file rp-cap">Attached: {_h(name)}</div>'
+
+
+def export_report_html(card: TestCard, campaign_id: str = "", files: dict = None,
+                       host: str = "localhost", preview: bool = False) -> str:
+    rid = report_id(card.id)
+    pts = []
+    for p in card.points:
+        signed = _h(p.initial)
+        when = _h(f"{p.date} {p.time}".strip())
+        under = "".join(f'<span class="rp-when">{x}</span>' for x in (when, signed) if x)
+        meas = _meas_rows(p)
+        meas_tbl = "" if not meas else (
+            '<table class="rp-meas"><tr><th>Command</th><th>Value</th><th>Timestamp</th></tr>'
+            + "".join(f"<tr><td>{_h(str(c))}</td><td>{_h(str(v))}</td><td>{_h(str(t))}</td></tr>" for c, v, t in meas)
+            + "</table>")
+        imgs = "".join(_img_tag(n) for n in p.images)
+        extra = "".join(_point_file_html(n, n in _plotted(files, p.seq)) for n in _ticked(files, card, campaign_id, p.seq))
+        q = (p.quality or "").upper()
+        pts.append(f'''<section class="rp-point rp-b-{_h(q.lower()) or "none"}" data-seq="{p.seq}">
+<div class="rp-head"><span>{p.seq} &nbsp; {_h(p.action)}</span><span class="rp-right"><span class="rp-q rp-q-{_h(q.lower())}">{_h(q) or "&mdash;"}</span>{under}</span></div>
+<div class="rp-line"><b>Expected:</b> {_h(p.expected)}</div>
+<div class="rp-line"><b>Observed:</b> {_h(p.observed) or "&mdash;"}</div>
+{meas_tbl}{imgs and f'<div class="rp-imgs">{imgs}</div>'}{extra}
+</section>''')
+    head = report_head(card)
+    nom = sorted_nomenclature(card)
+    nom_html = "" if not nom else "<h2>Nomenclature</h2><table><tr><th>Symbol</th><th>Definition</th><th>Units</th></tr>" + "".join(
+        f"<tr><td>{_h(symbol_display(a))}</td><td>{_h(b)}</td><td>{_h(u)}</td></tr>" for a, b, u, _l in nom) + "</table>"
+    refs = [(a, b) for a, b, _l in card.references if (a or "").strip() or (b or "").strip()]
+    ref_html = "" if not refs else "<h2>References</h2><table><tr><th>Reference</th><th>Description</th></tr>" + "".join(
+        f"<tr><td>{_h(a)}</td><td>{_h(b)}</td></tr>" for a, b in refs) + "</table>"
+    script = "" if preview else "<script>window.onload = () => window.print();</script>"
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{_h(head)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612:wght@400;700&family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="http://{host}/static/starfire.css"></head>
+<body class="print-doc report-doc{' preview' if preview else ''}">
+<h1>{_h(head)}</h1>
+<div class="meta">
+  <span><b>Campaign:</b> {_h(campaign_id or "XX-000")}</span>
+  <span><b>Article:</b> {_h(card.article) or "&mdash;"}</span>
+  <span><b>System/Subsystem:</b> {_h(card.system)} / {_h(card.subsystem)}</span>
+</div>
+<div class="meta">
+  <span><b>Test Conductor:</b> {_h(card.test_conductor)}</span>
+  <span><b>Quality Assurance:</b> {_h(card.quality_assurance)}</span>
+  <span><b>Date:</b> {_h(card.date)}</span>
+</div>
+<h2>Requirements covered</h2>
+<p>{_h(card.requirements) or "&mdash;"}</p>
+{nom_html}{ref_html}<h2>Test points</h2>
+{"".join(pts)}
+{script}
+</body></html>"""
+
+
+def export_report_docx(card: TestCard, campaign_id: str = "", files: dict = None) -> bytes:
+    doc = Document()
+    doc.add_heading(report_head(card), level=0)
+    doc.add_paragraph().add_run(
+        f"Campaign: {campaign_id or 'XX-000'}    "
+        f"Article: {card.article}    System/Subsystem: {card.system} / {card.subsystem}\nTest Conductor: {card.test_conductor}    "
+        f"Quality Assurance: {card.quality_assurance}    Date: {card.date}"
+    ).font.size = Pt(9.5)
+    doc.add_heading("Requirements covered", level=1)
+    doc.add_paragraph(card.requirements or "--")
+    nom = sorted_nomenclature(card)
+    if nom:
+        doc.add_heading("Nomenclature", level=1)
+        _add_table(doc, ["Symbol", "Definition", "Units"], [(symbol_display(a), b, u) for a, b, u, _l in nom])
+    refs = [(a, b) for a, b, _l in card.references if (a or "").strip() or (b or "").strip()]
+    if refs:
+        doc.add_heading("References", level=1)
+        _add_table(doc, ["Reference", "Description"], refs)
+    doc.add_heading("Test points", level=1)
+    for p in card.points:
+        doc.add_heading(f"{p.seq}  {p.action}    [{(p.quality or '--').upper()}]", level=2)
+        doc.add_paragraph(f"Expected: {p.expected}\nObserved: {p.observed or '--'}")
+        meas = _meas_rows(p)
+        if meas:
+            _add_table(doc, ["Command", "Value", "Timestamp"], meas)
+        for n in list(p.images) + _ticked(files, card, campaign_id, p.seq):
+            path, kind = _cwd_file(n), _file_kind(n)
+            if kind == "image" and path:
+                doc.add_picture(path, width=Inches(3.5))
+                doc.add_paragraph(n).runs[0].font.size = Pt(8)
+            elif kind == "csv" and path and n not in _plotted(files, p.seq):
+                doc.add_paragraph(n).runs[0].font.size = Pt(8)
+                run = doc.add_paragraph().add_run(_cap_lines(_read_text(path), 200))
+                run.font.name, run.font.size = "Courier New", Pt(8)
+            elif kind == "csv" and path:
+                s = csv_series(path)
+                doc.add_paragraph(f"{n} (plot in the PDF export)").runs[0].font.size = Pt(8)
+                if s:
+                    _add_table(doc, [s[0], s[1]], [(f"{a:g}", f"{b:g}") for a, b in list(zip(s[2], s[3]))[:50]])
+            elif kind == "txt" and path:
+                doc.add_paragraph(n).runs[0].font.size = Pt(8)
+                run = doc.add_paragraph().add_run(_cap_lines(_read_text(path), 200))
+                run.font.name, run.font.size = "Courier New", Pt(8)
+            else:
+                doc.add_paragraph(f"Attached: {n}" if path else f"{n} (not found)")
+        sign = [x for x in (f"{p.date} {p.time}".strip(), p.initial) if x]
+        if sign:
+            doc.add_paragraph("    ".join(sign)).alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 
 # Browser UI
 
@@ -831,6 +1111,7 @@ _TEST_HTML = """<!doctype html>
   <div class="field"><label>Date</label><input id="m-date"></div>
   <div class="field"><label>System / Subsystem</label><input id="m-system"></div>
   <div class="field"><label>Test type</label><input id="m-test_type"></div>
+  <div class="field"><label>Article / S/N</label><input id="m-article"></div>
   <div class="field"><label>Requirement(s)</label><input id="m-requirements"></div>
 </div>
 
@@ -895,16 +1176,16 @@ var starfireJiraEpicKey = "";
 let card = {
   id: "TC-001", title: "Untitled Test Card", revision: "A", author: "",
   date: new Date().toISOString().slice(0,10), project: "", test_conductor: "",
-  quality_assurance: "", system: "", subsystem: "", test_type: "", requirements: "",
+  quality_assurance: "", system: "", subsystem: "", test_type: "", article: "", requirements: "",
   points: [], nomenclature: [], references: [], notes: [], warnings: [], locked: false
 };
 
-const metaFields = ["id","title","revision","author","date","project","test_conductor","quality_assurance","test_type","requirements"];
-const ALWAYS_EDITABLE_META = new Set(["test_conductor", "quality_assurance", "date"]);
+const metaFields = ["id","title","revision","author","date","project","test_conductor","quality_assurance","test_type","article","requirements"];
+const ALWAYS_EDITABLE_META = new Set(["test_conductor", "quality_assurance", "date", "article"]);
 function bindMeta() {
   metaFields.forEach(f => {
     const el = document.getElementById("m-" + f);
-    el.value = card[f];
+    el.value = card[f] ?? "";
     el.disabled = !!card.locked && !ALWAYS_EDITABLE_META.has(f);
     el.addEventListener("input", () => { card[f] = el.value; });
   });
@@ -1213,7 +1494,7 @@ async function runModule(p) {
     const res = await fetch("/run_module", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({module: name, card: card.id, point: p.seq}),
+      body: JSON.stringify({module: name, card: card.id, point: p.seq, campaign: pointCampaign() || "XX-000"}),
     });
     const r = await res.json();
     const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
@@ -1835,7 +2116,7 @@ let camp = {
   id: "SC-001", title: "Untitled Campaign", revision: "A", author: "",
   date: new Date().toISOString().slice(0,10), project: "", test_lead: "",
   quality_assurance: "", system: "", subsystem: "", jira_epic_key: "",
-  requirements: [], modules: [], tests: [], ancillary_tests: [], sections: []
+  requirements: [], modules: [], tests: [], ancillary_tests: [], sections: [], reports: {}
 };
 
 // True only if jira_config.json was found in the working directory at startup.
@@ -1947,6 +2228,7 @@ window.getCampaignId = () => camp.id;
 
 // Google Material Symbols, embedded inline (not a file/CDN) so they work
 // fully offline; fill="currentColor" picks up each button's own hover color.
+const ICON_SUMMARIZE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M320-600q17 0 28.5-11.5T360-640q0-17-11.5-28.5T320-680q-17 0-28.5 11.5T280-640q0 17 11.5 28.5T320-600Zm0 160q17 0 28.5-11.5T360-480q0-17-11.5-28.5T320-520q-17 0-28.5 11.5T280-480q0 17 11.5 28.5T320-440Zm0 160q17 0 28.5-11.5T360-320q0-17-11.5-28.5T320-360q-17 0-28.5 11.5T280-320q0 17 11.5 28.5T320-280ZM200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h440l200 200v440q0 33-23.5 56.5T760-120H200Zm0-80h560v-400H600v-160H200v560Zm0-560v160-160 560-560Z"/></svg>';
 const ICON_OPEN_IN_NEW = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z"/></svg>';
 const ICON_CLOSE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>';
 const ICON_BOOKMARK_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-640q0-33 23.5-56.5T280-840h240v80H280v518l200-86 200 86v-278h80v400L480-240 200-120Zm80-640h240-240Zm400 160v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80Z"/></svg>';
@@ -1991,6 +2273,7 @@ function renderTestsTable(list, tableId) {
       <td>${statusSelect(i, row.status)}</td>
       <td class="actions-cell">
         <button class="btn btn-icon" data-open="${i}" title="open">${ICON_OPEN_IN_NEW}</button>
+        <button class="btn btn-icon" data-report="${i}" title="test report">${ICON_SUMMARIZE}</button>
         <button class="btn btn-icon" data-del="${i}" title="remove">${ICON_CLOSE}</button>
         ${JIRA_AVAILABLE ? `<button class="btn btn-icon" data-jira="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
       </td>`;
@@ -2014,6 +2297,12 @@ function renderTestsTable(list, tableId) {
     btn.addEventListener("click", () => {
       const row = list[+btn.dataset.open];
       if ((row.test_id || "").trim()) openTestTab(row.test_id, row.title);
+    });
+  });
+  t.querySelectorAll("button[data-report]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const row = list[+btn.dataset.report];
+      if ((row.test_id || "").trim()) openReportTab(row.test_id);
     });
   });
   t.querySelectorAll("button[data-jira]").forEach(btn => {
@@ -2186,6 +2475,7 @@ document.getElementById("loadCampFile").addEventListener("change", (e) => {
     camp = JSON.parse(txt);
     if (!camp.requirements) camp.requirements = [];
     if (!camp.modules) camp.modules = [];
+    if (!camp.reports) camp.reports = {};
     if (!camp.tests) camp.tests = [];
     if (!camp.ancillary_tests) camp.ancillary_tests = [];
     if (!camp.sections) camp.sections = [];
@@ -2246,6 +2536,7 @@ function renderTabBar() {
 
 function switchTab(key) {
   activeTab = key;
+  if (key.startsWith("report-")) loadReport(key, key.slice(7));
   document.getElementById("panel-campaign").classList.toggle("active", key === "campaign");
   openTabs.forEach(tab => {
     const panel = document.getElementById("panel-" + tab.key);
@@ -2276,6 +2567,159 @@ function openTestTab(testId, title) {
     });
   }
   switchTab(filename);
+}
+
+// ---- Test Report (TR) tabs: one card's saved .test file, rendered by the server ----
+function reportIdFor(testId) {
+  const id = String(testId || "").trim();
+  return /^tc-/i.test(id) ? "TR-" + id.slice(3) : "TR-" + (id || "000");
+}
+const REPORT_KINDS = {csv: "csv", image: "image", txt: "text output", other: "listed by name"};
+const reportState = {};   // tab key -> {card, files, active}
+
+function openReportTab(testId) {
+  const key = "report-" + testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test";
+  if (!openTabs.some(t => t.key === key)) {
+    openTabs.push({key, label: reportIdFor(testId)});
+    const panel = document.createElement("div");
+    panel.className = "test-panel report-panel";
+    panel.id = "panel-" + key;
+    panel.innerHTML = `
+      <div class="report-side">
+        <div class="report-box"><div class="report-label">Report for</div><div class="report-for"></div></div>
+        <div class="report-box">
+          <div class="report-label report-files-title">Files for point</div>
+          <div class="report-files"></div>
+          <div class="report-hint">Files named <span class="report-prefix"></span>-anything.ext appear here. Tick the ones to add to the report. Click a point in the report to switch.</div>
+        </div>
+        <div class="report-btns">
+          <button class="btn" data-rrefresh>refresh</button>
+          <button class="btn" data-rprint>print / pdf</button>
+          <button class="btn" data-rdocx>.docx</button>
+        </div>
+        <div class="report-hint report-status"></div>
+      </div>
+      <iframe class="report-frame" title="test report preview"></iframe>`;
+    document.getElementById("panels").appendChild(panel);
+    panel.querySelector("[data-rrefresh]").addEventListener("click", () => loadReport(key, key.slice(7)));
+    panel.querySelector("[data-rprint]").addEventListener("click", () => printReport(key));
+    panel.querySelector("[data-rdocx]").addEventListener("click", () => docxReport(key));
+  }
+  switchTab(key);
+}
+
+function reportTicks(card) {
+  camp.reports = camp.reports || {};
+  return camp.reports[card.id] = camp.reports[card.id] || {};
+}
+
+function reportPlots(card) {
+  const t = reportTicks(card);
+  return t.plot = t.plot || {};
+}
+
+function reportPayload(key, preview) {
+  const st = reportState[key];
+  return {card: st.card, campaign: camp.id || "", files: reportTicks(st.card), preview};
+}
+
+async function loadReport(key, filename) {
+  const panel = document.getElementById("panel-" + key);
+  if (!panel) return;
+  const st = reportState[key] || (reportState[key] = {active: null});
+  const status = panel.querySelector(".report-status");
+  try {
+    const res = await fetch("/load?file=" + encodeURIComponent(filename));
+    if (!res.ok) throw new Error(`${filename} not found. Save the card first.`);
+    st.card = await res.json();
+    const fr = await fetch(`/point_files?campaign=${encodeURIComponent(camp.id || "")}&card=${encodeURIComponent(st.card.id || "")}`);
+    st.files = (await fr.json()).files || {};
+    const seqs = (st.card.points || []).map(p => String(p.seq));
+    if (!seqs.includes(st.active)) st.active = seqs[0] || null;
+    status.textContent = "Shows the card as last saved.";
+  } catch (err) {
+    status.textContent = String(err.message || err);
+    return;
+  }
+  renderReportSide(key);
+  await renderReportPreview(key);
+}
+
+function renderReportSide(key) {
+  const st = reportState[key], panel = document.getElementById("panel-" + key);
+  if (!st || !st.card || !panel) return;
+  panel.querySelector(".report-for").textContent = [reportIdFor(st.card.id), st.card.title, st.card.revision ? "REV " + st.card.revision.toUpperCase() : ""].filter(Boolean).join(" ");
+  panel.querySelector(".report-files-title").textContent = "Files for point " + (st.active ?? "");
+  panel.querySelector(".report-prefix").textContent = `${camp.id || "XX-000"}-${st.card.id}-${st.active}`;
+  const files = st.files[st.active] || [];
+  const ticked = reportTicks(st.card)[st.active] || [], plotted = reportPlots(st.card)[st.active] || [];
+  const list = panel.querySelector(".report-files");
+  list.innerHTML = files.length ? files.map((f, j) => `
+    <label class="report-file"><input type="checkbox" data-rfile="${j}"${ticked.includes(f.name) ? " checked" : ""}>
+      <span><span class="report-fname">${esc(f.name)}</span><span class="report-kind kind-${esc(f.kind)}">${REPORT_KINDS[f.kind] || ""}</span></span>${f.kind === "csv" && ticked.includes(f.name) ? `<button class="btn btn-plot${plotted.includes(f.name) ? " on" : ""}" data-rplot="${j}">plot</button>` : ""}</label>`).join("")
+    : `<div class="report-hint">No files for this point yet.</div>`;
+  list.querySelectorAll("input[data-rfile]").forEach(cb => cb.addEventListener("change", () => {
+    const all = reportTicks(st.card), name = files[+cb.dataset.rfile].name;
+    all[st.active] = (all[st.active] || []).filter(n => n !== name).concat(cb.checked ? [name] : []);
+    if (!cb.checked) { const pl = reportPlots(st.card); pl[st.active] = (pl[st.active] || []).filter(n => n !== name); }
+    renderReportSide(key);
+    renderReportPreview(key);
+  }));
+  list.querySelectorAll("button[data-rplot]").forEach(b => b.addEventListener("click", e => {
+    e.preventDefault();
+    const pl = reportPlots(st.card), name = files[+b.dataset.rplot].name, cur = pl[st.active] || [];
+    pl[st.active] = cur.includes(name) ? cur.filter(n => n !== name) : cur.concat([name]);
+    renderReportSide(key);
+    renderReportPreview(key);
+  }));
+}
+
+async function renderReportPreview(key) {
+  const st = reportState[key], panel = document.getElementById("panel-" + key);
+  const frame = panel.querySelector(".report-frame");
+  const res = await fetch("/export/report/print", {method: "POST", body: JSON.stringify(reportPayload(key, true))});
+  const scroll = frame.contentWindow ? frame.contentWindow.scrollY : 0;
+  frame.onload = () => {
+    const doc = frame.contentDocument;
+    frame.contentWindow.scrollTo(0, scroll);
+    doc.querySelectorAll(".rp-point").forEach(sec => {
+      sec.classList.toggle("rp-active", sec.dataset.seq === String(st.active));
+      sec.addEventListener("click", () => {
+        st.active = sec.dataset.seq;
+        doc.querySelectorAll(".rp-point").forEach(x => x.classList.toggle("rp-active", x === sec));
+        renderReportSide(key);
+      });
+    });
+  };
+  frame.srcdoc = await res.text();
+}
+
+async function printReport(key) {
+  if (!reportState[key] || !reportState[key].card) return;
+  // Opened before the await, so a popup blocker doesn't kill it.
+  const w = window.open("", "_blank");
+  if (w) w.document.write("Generating...");
+  try {
+    const res = await fetch("/export/report/print", {method: "POST", body: JSON.stringify(reportPayload(key, false))});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const text = await res.text();
+    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
+  } catch (err) {
+    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
+  }
+}
+
+async function docxReport(key) {
+  const st = reportState[key];
+  if (!st || !st.card) return;
+  const status = document.getElementById("panel-" + key).querySelector(".report-status");
+  try {
+    const res = await fetch("/export/report/docx", {method: "POST", body: JSON.stringify(reportPayload(key, false))});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    download(reportIdFor(st.card.id) + ".docx", await res.blob());
+  } catch (err) {
+    status.textContent = `Docx export failed: ${err}`;
+  }
 }
 
 function pollForLockIcon(iframe, filename, attemptsLeft) {
@@ -2498,8 +2942,9 @@ def list_modules() -> list:
     return sorted(n for n in names if _is_module(d, n))
 
 
-def _module_env(card_id, point_seq) -> dict:
-    env = dict(os.environ, STARFIRE_CARD=str(card_id), STARFIRE_POINT=str(point_seq))
+def _module_env(card_id, point_seq, campaign_id="") -> dict:
+    env = dict(os.environ, STARFIRE_CAMPAIGN=str(campaign_id or "XX-000"),
+               STARFIRE_CARD=str(card_id), STARFIRE_POINT=str(point_seq))
     if HARDWARE_AVAILABLE:
         env["STARFIRE_HW"] = _HW_PATH
     if getattr(sys, "frozen", False):
@@ -2513,12 +2958,12 @@ def _module_env(card_id, point_seq) -> dict:
     return env
 
 
-def run_module(name: str, card_id: str = "", point_seq: str = "") -> dict:
+def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: str = "") -> dict:
     """Run one module from dist/ and wait for it. The name must be a bare
     filename that list_modules() reports -- never a path, so the browser can't
     point this at anything else. The module runs in the working directory
-    (where .test files live) with STARFIRE_CARD, STARFIRE_POINT and, if
-    found, STARFIRE_HW (path to starfire-hw) in its environment."""
+    (where .test files live) with STARFIRE_CAMPAIGN, STARFIRE_CARD, STARFIRE_POINT
+    and, if found, STARFIRE_HW (path to starfire-hw) in its environment."""
     if name not in list_modules():
         return {"status": "failed", "error": f"{name!r} is not a runnable file in dist/"}
     argv = [os.path.join(_modules_dir(), name)]
@@ -2535,7 +2980,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "") -> dict:
             return {"status": "failed", "error": "a module is already running on this point"}
         try:
             # Own session, so a timeout or BREAK can take down the module's children too.
-            proc = subprocess.Popen(argv, cwd=os.getcwd(), env=_module_env(card_id, point_seq),
+            proc = subprocess.Popen(argv, cwd=os.getcwd(), env=_module_env(card_id, point_seq, campaign_id),
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, start_new_session=True)
         except OSError as e:
@@ -2644,6 +3089,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(500, {"error": str(e)})
         elif path == "/list_modules":
             self._send_json(200, {"modules": list_modules()})
+        elif path == "/point_files":
+            qs = parse_qs(parsed.query)
+            self._send_json(200, {"files": list_point_files((qs.get("campaign") or [""])[0], (qs.get("card") or [""])[0])})
         elif path == "/list_files":
             # Lists files in the working directory by extension -- lets a
             # picker browse what's already on disk.
@@ -2804,7 +3252,8 @@ class _Handler(BaseHTTPRequestHandler):
         payload = self._local_json_payload(raw_body)
         if payload is None:
             return
-        self._send_json(200, run_module(str(payload.get("module") or ""), payload.get("card", ""), payload.get("point", "")))
+        self._send_json(200, run_module(str(payload.get("module") or ""), payload.get("card", ""),
+                                        payload.get("point", ""), payload.get("campaign", "")))
 
     def _handle_break_module(self, raw_body: bytes):
         payload = self._local_json_payload(raw_body)
@@ -2866,11 +3315,11 @@ class _Handler(BaseHTTPRequestHandler):
             if path == "/export/csv":
                 self._send(200, "text/csv", export_csv(card).encode())
             elif path == "/export/print":
-                self._send(200, "text/html", export_print_html(card, host).encode())
+                self._send(200, "text/html", export_print_html(procedure_only(card), host).encode())
             elif path == "/export/tex":
                 self._send(200, "text/x-tex", export_tex(card).encode())
             elif path == "/export/test/docx":
-                self._send(200, _DOCX_MIME, export_test_docx(card))
+                self._send(200, _DOCX_MIME, export_test_docx(procedure_only(card)))
             else:
                 self._write_file(_safe_filename(card.id, ".test"), card.to_dict())
         # Campaign routes
@@ -2884,6 +3333,15 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, _DOCX_MIME, export_campaign_docx(camp))
             else:
                 self._send_json(200, compute_vcrm(camp))
+        # Test Report routes: {"card", "campaign", "files": {seq: [names]}, "preview"}
+        elif path in ("/export/report/print", "/export/report/docx"):
+            card = TestCard.from_dict(data["card"])
+            camp_id, files = str(data.get("campaign") or ""), data.get("files") or {}
+            if path == "/export/report/print":
+                html = export_report_html(card, camp_id, files, host, preview=bool(data.get("preview")))
+                self._send(200, "text/html", html.encode())
+            else:
+                self._send(200, _DOCX_MIME, export_report_docx(card, camp_id, files))
         # VCRM routes (the VCRM is plain JSON, not a dataclass)
         elif path == "/save_vcrm":
             self._write_file(vcrm_filename(data.get("campaign_id", "VCRM")), data)
