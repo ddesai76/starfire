@@ -623,6 +623,16 @@ def _vcrm_table_html(vcrm: dict) -> str:
             '<th style="width:10%">Coverage</th><th style="width:12%">Updated</th></tr>\n' + rows + "\n</table>")
 
 
+def export_vcrm_csv(vcrm: dict) -> str:
+    """The VCRM as a Test Matrix: one row per requirement."""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Requirement", "Description", "Covering Tests", "Status", "Updated"])
+    for r in vcrm["rows"]:
+        w.writerow([r["requirement"], r["description"], _covering_str(r), r["coverage"], vcrm["generated"]])
+    return buf.getvalue()
+
+
 def export_vcrm_print_html(vcrm: dict, host: str = "localhost") -> str:
     h = _h
 
@@ -3076,6 +3086,7 @@ async function generateVcrm() {
         <button class="btn" id="saveVcrmBtn">export .vcrm file</button>
         <button class="btn" id="printVcrmBtn">generate .pdf</button>
         <button class="btn" id="docxVcrmBtn">export .docx</button>
+        <button class="btn" id="csvVcrmBtn">export .csv</button>
         <button class="btn" id="appendVcrmBtn" style="display:none">+ append</button>
       </div>
       <div id="vcrmStatus" class="hint"></div>
@@ -3124,6 +3135,15 @@ async function generateVcrm() {
     } catch (err) {
       if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
       vcrmStatus.textContent = `Print failed: ${err}`;
+    }
+  });
+  panel.querySelector("#csvVcrmBtn").addEventListener("click", async () => {
+    try {
+      const res = await fetch("/export/vcrm/csv", {method: "POST", body: JSON.stringify(currentVcrm)});
+      if (!res.ok) throw new Error(`server returned ${res.status}`);
+      download((currentVcrm.campaign_id || "vcrm") + "-test-matrix.csv", await res.text(), "text/csv");
+    } catch (err) {
+      vcrmStatus.textContent = `CSV export failed: ${err}`;
     }
   });
   panel.querySelector("#docxVcrmBtn").addEventListener("click", async () => {
@@ -3656,6 +3676,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._write_file(vcrm_filename(data.get("campaign_id", "VCRM")), data)
         elif path == "/export/vcrm/print":
             self._send(200, "text/html", export_vcrm_print_html(data, host).encode())
+        elif path == "/export/vcrm/csv":
+            self._send(200, "text/csv", export_vcrm_csv(data).encode())
         elif path == "/export/vcrm/docx":
             self._send(200, _DOCX_MIME, export_vcrm_docx(data))
         else:
@@ -3695,4 +3717,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-    
