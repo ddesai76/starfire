@@ -166,6 +166,6 @@ Exit codes: `0` success, `1` runtime failure (the JSON line has `error`), `2` us
 | `.camp` | Native JSON campaign save file. |
 | `.test` | Native JSON test card (supports locked/unlocked state). |
 | `.vcrm` | VCRM snapshot JSON. |
-| `.csv` | Flat export of card metadata and test points. |
-| `.docx` | Word document with tables and styled callouts (campaign, VCRM, Test Card, and Test Report). |
-| **Print / PDF** | Browser-rendered campaign, VCRM, Test Card, or Test Report. |
+| `.csv` | Spreadsheet |
+| `.docx` | Document |
+| **Print / PDF** | Browser-rendered printable document |
