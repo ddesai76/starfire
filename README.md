@@ -12,14 +12,11 @@ It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, 
 python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 ```
 
-* `/` is the campaign designer. Each test in a campaign opens as a tab running the test card editor.
-* `/test?load=<file>.test` is a single test card on its own.
-
 ### Build a standalone binary
 
 ```bash
-./build.sh                              # -> dist/starfire, dist/starfire-hw, dist/jira_config.json
-./build.sh --install-desktop            # also adds a menu entry (uses assets/icon.png)
+./build.sh                             # -> dist/starfire, dist/starfire-hw, dist/jira_config.json
+./build.sh --install-desktop           # also adds a menu icon (uses assets/icon.png)
 ./build.sh --run                       # build, then start dist/starfire
 ```
 
