@@ -29,7 +29,7 @@ volatile uint8_t g_sim_reg = 0;
 volatile uint8_t* const REG = &g_sim_reg;
 // volatile uint8_t* const REG = reinterpret_cast<volatile uint8_t*>(0x40000000);
 
-// Byte store to the register in assembly (x86-64 and AArch64; plain store elsewhere).
+// Byte store to the register in Assembly (x86-64 and AArch64; plain store elsewhere).
 void set_reg(uint8_t v) {
 #if defined(__x86_64__)
     asm volatile(
