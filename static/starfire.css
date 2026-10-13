@@ -7,8 +7,8 @@
   }
   .editor-doc { background: var(--bg); color: var(--nw); font-family: var(--mono);
                 height: 100%; margin: 0; display: flex; flex-direction: column; }
-  /* No standalone display font -- fakes a retro-italic 
-     look with B612 Mono instead: skew, vertical stretch, expanded tracking. */
+  /* No standalone display font -- fakes the retro-italic "Tomorrowland"
+     look on B612 Mono instead: skew, vertical stretch, expanded tracking. */
   .editor-doc h1 { font-family: 'B612 Mono', monospace; font-size: 32px; font-weight: 700;
        color: var(--ebl); letter-spacing: .12em; margin-bottom: 6px;
        transform: skewX(-12deg) scaleY(1.1); transform-origin: left bottom;
@@ -232,6 +232,19 @@
   .test-panel { display: none; padding: 0; height: calc(100vh - 46px); position: relative; }
   .test-panel.active { display: block; }
   .test-panel iframe { position: absolute; inset: 0; border: none; width: 100%; height: 100%; background: var(--bg); }
+  /* Shared sidebar + content layout: title and buttons on the left, the page on the right. */
+  .panel.split { max-width: none; margin: 0; padding: 0; height: 100vh; }
+  #tabbar ~ #panels .panel.split { height: calc(100vh - 46px); }
+  .panel.split.active { display: flex; }
+  .side-main { flex: 1; min-width: 0; overflow: auto; padding: 2rem 1rem 24px; }
+  .side-inner { max-width: 1080px; margin: 0 auto; }
+  .side-title .sub { margin-bottom: 0; }
+  .side-head { font-size: 28px; font-weight: 700; color: var(--ebl); letter-spacing: .12em; margin: 0 0 10px; }
+  .side-meta { font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  .side-meta span { margin-right: 18px; }
+  .side-meta b { font-weight: 400; font-size: 11px; }
+  .side-btns { display: flex; flex-direction: column; gap: 8px; }
+  .side-btns .btn { text-align: left; }
   /* Test Report tab: file panel on the left, the printable report on the right. */
   .test-panel.report-panel.active { display: flex; }
   .test-panel.report-panel iframe { position: static; flex: 1; width: auto; height: 100%; background: #fff; }
@@ -251,6 +264,9 @@
   .report-kind.kind-txt { color: var(--nw); }
   .report-kind.kind-other { color: var(--rd); }
   .report-hint { font-size: 11px; color: var(--dim); line-height: 1.5; overflow-wrap: anywhere; }
+  .sr-item { display: flex; gap: 6px; align-items: center; }
+  .sr-label { flex: 1; min-width: 0; }
+  .sr-item .btn:disabled { opacity: .3; cursor: default; }
   .report-btns { display: flex; flex-wrap: wrap; gap: 8px; }
   #saveStatus:not(.hint) { color: var(--dim); font-size: 11px; padding: 4px 16px; }
 
@@ -309,7 +325,7 @@
 .report-doc .rp-b-caution { border-color: #8a5a00; }
 .report-doc .rp-b-fail { border-color: #a11a1a; }
 .report-doc.preview { background: var(--bg); color: var(--nw); font-family: var(--mono); font-size: 13px; min-height: 100vh; margin: 0; padding: 24px; box-sizing: border-box; }
-.report-doc.preview h1 { font-family: var(--mono); font-size: 32px; font-weight: 700; color: var(--bl); letter-spacing: .12em; margin: 0 0 10px;
+.report-doc.preview h1 { font-family: var(--mono); font-size: 28px; font-weight: 700; color: var(--ebl); letter-spacing: .12em; margin: 0 0 10px;
                          }
 .report-doc.preview h2 { font-size: 13px; font-weight: 700; color: var(--dim); text-transform: uppercase; letter-spacing: .12em;
                          margin: 1.2rem 0 10px; }
@@ -342,4 +358,8 @@
 .report-doc.preview .rp-plot circle { fill: var(--nvg); }
 .report-doc.preview .rp-plot text { fill: var(--nw); }
 .report-doc.preview .rp-out { font-size: 11px; background: var(--panel); border-color: var(--stroke); color: var(--nw); }
+.report-doc .sr-part { margin-bottom: 16px; }
+.report-doc.preview .sr-new { border-top: 1px solid var(--stroke); padding-top: 12px; margin-top: 24px; }
+.report-doc.preview .section-text { font-size: 13px; color: var(--nw); }
+@media print { .report-doc .sr-new { break-before: page; } }
 @media print { .report-doc .rp-point { break-inside: avoid; } .report-doc .rp-point.rp-active { background: none; outline: none; } }
