@@ -37,7 +37,9 @@ python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 ### Campaign
 * Metadata, a requirements table, a **Modules** table, and a numbered **Test Series** (plus ancillary tests). Open creates or opens the `.test` file in a tab.
 * Free-form write-up sections.
-* **VCRM:** cross-references campaign requirements against each card's `Requirement(s)` field and reports `Covered`, `Partial`, `Planned`, or `Not Covered`. Exports to `.vcrm`, `.docx`, and PDF.
+* Every tab (campaign, test card, VCRM, report) has the same layout: the STARFIRE title and that tab's import, export and generate buttons in a left sidebar, and the page on the right.
+* **VCRM:** cross-references campaign requirements against each card's `Requirement(s)` field and reports `Covered`, `Partial`, `Planned`, or `Not Covered`. The VCRM tab shows the campaign header and details above the matrix and exports to `.vcrm`, `.docx`, and PDF.
+
 
 ### Test card
 * Metadata (including **Article / S/N**, editable on a locked card), nomenclature (raw LaTeX symbols), references, notes, and warnings.
@@ -61,7 +63,15 @@ Files belong to a test point by name: `<campaign>-<card>-<point>[-anything].<ext
 | `.txt` | Shown as text output (capped at 4,096 lines). |
 | anything else | Listed by name. |
 
-The ticks are saved in the campaign's `.camp` file.
+### Campaign Report
+**Build campaign report** opens an `SR-xxx` tab (`SC-001` gets `SR-001`). I
+* **Sections** stay live: any non-empty section on the campaign tab appears in the report, and later edits, additions and deletions follow. Remove one from the report with its x and it stays out.
+* **+ append** adds the VCRM or a Test Report. The button shows on the VCRM and Test Report tabs only while the SR tab is open, and each part can be added once.
+* **Order:** the VCRM and Sections always come first, then the Test Reports. The **Contents** list in the SR sidebar moves a part up or down within its group, or removes it (x).
+* A test with no saved `.test` file is skipped.
+* **print / pdf** starts the VCRM and each Test Report on a new page; **.docx** adds a "Page N of N" footer.
+* The Contents list is saved in the `.camp` file.
+
 
 ### Test point tools: Camera, Measure, Activate
 Each test point has three tools in the button row. Each opens in its own column below the point, left to right: camera, measure, module.
