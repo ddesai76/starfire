@@ -950,7 +950,9 @@ _IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"
 
 def _file_kind(name: str) -> str:
     ext = os.path.splitext(name)[1].lower()
-    return "csv" if ext == ".csv" else "image" if ext in _IMAGE_TYPES else "txt" if ext == ".txt" else "other"
+    if ext == ".txt":
+        return "csv" if _looks_csv(_cwd_file(name)) else "txt"
+    return "csv" if ext == ".csv" else "image" if ext in _IMAGE_TYPES else "other"
 
 
 def _point_prefix(campaign_id: str, card_id: str) -> str:
@@ -983,7 +985,7 @@ def csv_series(path: str, limit: int = 5000):
     """(x_label, y_label, xs, ys) from a csv: y is the "value" column if there is
     one, else the last numeric column; x is the first column if numeric, else the row number."""
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
-        rows = [r for r in csv.reader(f) if any(c.strip() for c in r)][:limit + 1]
+        rows = [r for r in csv.reader(f) if any(c.strip() for c in r) and not r[0].lstrip().startswith("#")][:limit + 1]
     if not rows:
         return None
     header = rows[0] if any(_num(c) is None for c in rows[0]) else []
@@ -1005,6 +1007,16 @@ def csv_series(path: str, limit: int = 5000):
         return None
     label = lambda i, d: header[i] if header and i < len(header) and header[i].strip() else d
     return (label(x, "x") if x is not None else "sample", label(y, "y"), [p[0] for p in pts], [p[1] for p in pts])
+
+
+def _looks_csv(path) -> bool:
+    """A .txt that is comma-separated with at least two plottable rows ("# ..." lines are ignored)."""
+    try:
+        s = csv_series(path, 50) if path else None
+        first = next(l for l in _read_text(path, 4096).splitlines() if l.strip() and not l.lstrip().startswith("#"))
+    except (OSError, StopIteration):
+        return False
+    return bool(s) and len(s[2]) >= 2 and "," in first
 
 
 def csv_plot_svg(path: str) -> str:
