@@ -442,6 +442,8 @@ class Campaign:
     jira_epic_key: str = ""
     # Files ticked into each card's Test Report: {card_id: {point_seq: [filename, ...]}}.
     reports: dict = field(default_factory=dict)
+    # The campaign report (SR-xxx), once built: {"items": [section | vcrm | report, ...]}.
+    campaign_report: dict = None
 
     @staticmethod
     def from_dict(d: dict) -> "Campaign":
@@ -604,21 +606,27 @@ def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
 </body></html>"""
 
 
+def _covering_str(row: dict) -> str:
+    if not row["covering_tests"]:
+        return "--"
+    return ", ".join(f"{c['test_id']} ({STATUS_LABELS.get(c['status'], c['status'] or '[None]')})"
+                     for c in row["covering_tests"])
+
+
+def _vcrm_table_html(vcrm: dict) -> str:
+    rows = "\n".join(
+        f"<tr><td>{_h(r['requirement'])}</td><td>{_h(r['description'])}</td>"
+        f"<td>{_h(_covering_str(r))}</td><td>{_h(r['coverage'])}</td><td>{_h(vcrm['generated'])}</td></tr>"
+        for r in vcrm["rows"]
+    )
+    return ('<table><tr><th style="width:14%">Requirement</th><th>Description</th><th style="width:24%">Covering Tests</th>'
+            '<th style="width:10%">Coverage</th><th style="width:12%">Updated</th></tr>\n' + rows + "\n</table>")
+
+
 def export_vcrm_print_html(vcrm: dict, host: str = "localhost") -> str:
     h = _h
 
-    def covering_str(row):
-        if not row["covering_tests"]:
-            return "--"
-        parts = [f"{c['test_id']} ({STATUS_LABELS.get(c['status'], c['status'] or '[None]')})"
-                  for c in row["covering_tests"]]
-        return ", ".join(parts)
-
-    rows_html = "\n".join(
-        f"<tr><td>{h(r['requirement'])}</td><td>{h(r['description'])}</td>"
-        f"<td>{h(covering_str(r))}</td><td>{h(r['coverage'])}</td><td>{h(vcrm['generated'])}</td></tr>"
-        for r in vcrm["rows"]
-    )
+    table = _vcrm_table_html(vcrm)
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{h(vcrm['campaign_id'])} VCRM -- {h(vcrm['campaign_title'])}</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -627,10 +635,7 @@ def export_vcrm_print_html(vcrm: dict, host: str = "localhost") -> str:
 <link rel="stylesheet" href="http://{host}/static/starfire.css"></head>
 <body class="print-doc">
 <h1>Verification Cross-Reference Matrix</h1>
-<table>
-<tr><th style="width:14%">Requirement</th><th>Description</th><th style="width:24%">Covering Tests</th><th style="width:10%">Coverage</th><th style="width:12%">Updated</th></tr>
-{rows_html}
-</table>
+{table}
 <script>window.onload = () => window.print();</script>
 </body></html>"""
 
@@ -733,22 +738,18 @@ def export_campaign_docx(camp: Campaign) -> bytes:
     return buf.getvalue()
 
 
+def _vcrm_docx_table(doc, vcrm: dict) -> None:
+    _add_table(
+        doc, ["Requirement", "Description", "Covering Tests", "Coverage", "Updated"],
+        [(r["requirement"], r["description"], _covering_str(r), r["coverage"], vcrm["generated"])
+         for r in vcrm["rows"]],
+    )
+
+
 def export_vcrm_docx(vcrm: dict) -> bytes:
     doc = Document()
     doc.add_heading("Verification Cross-Reference Matrix", level=0)
-
-    def covering_str(row):
-        if not row["covering_tests"]:
-            return "--"
-        parts = [f"{c['test_id']} ({STATUS_LABELS.get(c['status'], c['status'] or '[None]')})"
-                  for c in row["covering_tests"]]
-        return ", ".join(parts)
-
-    _add_table(
-        doc, ["Requirement", "Description", "Covering Tests", "Coverage", "Updated"],
-        [(r["requirement"], r["description"], covering_str(r), r["coverage"], vcrm["generated"])
-         for r in vcrm["rows"]],
-    )
+    _vcrm_docx_table(doc, vcrm)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -828,6 +829,110 @@ def report_id(card_id: str) -> str:
 def report_head(card: TestCard) -> str:
     rev = (card.revision or "").strip()
     return " ".join(x for x in (report_id(card.id), (card.title or "").strip(), f"REV {rev.upper()}" if rev else "") if x)
+
+
+def sr_id(campaign_id: str) -> str:
+    cid = (campaign_id or "").strip()
+    return "SR-" + cid[3:] if cid.upper().startswith("SC-") else "SR-" + (cid or "000")
+
+
+def sr_head(camp: Campaign) -> str:
+    rev = (camp.revision or "").strip()
+    return " ".join(x for x in (sr_id(camp.id), (camp.title or "").strip(), f"REV {rev.upper()}" if rev else "") if x)
+
+
+def _sr_items(camp: Campaign):
+    """Yield (kind, payload) for each item that has something to show; a test with no saved .test file is skipped."""
+    items = (camp.campaign_report or {}).get("items", [])
+    for it in sorted(items, key=lambda x: x.get("type") == "report"):   # Test Reports always follow the rest
+        kind = it.get("type")
+        if kind == "section":
+            idx = it.get("idx")
+            if idx is not None:   # a live reference to the campaign's Sections
+                secs = camp.sections or []
+                it = {"header": secs[idx][0], "text": secs[idx][1]} if isinstance(idx, int) and 0 <= idx < len(secs) else {}
+            if (it.get("header") or "").strip() or (it.get("text") or "").strip():
+                yield kind, it
+        elif kind == "vcrm":
+            yield kind, compute_vcrm(camp)
+        elif kind == "report":
+            path = os.path.join(os.getcwd(), test_filename(str(it.get("card") or "")))
+            try:
+                with open(path, encoding="utf-8") as f:
+                    yield kind, TestCard.from_dict(json.load(f))
+            except (OSError, ValueError):
+                continue
+
+
+def export_campaign_report_html(camp: Campaign, host: str = "localhost", preview: bool = False) -> str:
+    head = sr_head(camp)
+    parts = []
+    for kind, v in _sr_items(camp):
+        if kind == "section":
+            parts.append(f'<div class="sr-part"><h2>{_h(v.get("header"))}</h2><div class="section-text">{_h(v.get("text"))}</div></div>')
+        elif kind == "vcrm":
+            parts.append(f'<div class="sr-part sr-new"><h2>Verification Cross-Reference Matrix</h2>{_vcrm_table_html(v)}</div>')
+        else:
+            parts.append(f'<div class="sr-part sr-new">{report_body(v, camp.id, (camp.reports or {}).get(v.id, {}))}</div>')
+    body = f"""<h1>{_h(head)}</h1>
+<div class="meta">
+  <span><b>Campaign:</b> {_h(camp.id)}</span>
+  <span><b>Project:</b> {_h(camp.project)}</span>
+  <span><b>System/Subsystem:</b> {_h(camp.system)} / {_h(camp.subsystem)}</span>
+</div>
+<div class="meta">
+  <span><b>Test Lead:</b> {_h(camp.test_lead)}</span>
+  <span><b>Quality Assurance:</b> {_h(camp.quality_assurance)}</span>
+  <span><b>Date:</b> {_h(camp.date)}</span>
+</div>
+{"".join(parts)}"""
+    return _report_page(head, body, host, preview)
+
+
+def _add_field(paragraph, instr: str) -> None:
+    run = paragraph.add_run()
+    for kind, text in (("begin", None), (None, instr), ("separate", None), (None, "1"), ("end", None)):
+        if kind:
+            el = OxmlElement("w:fldChar")
+            el.set(qn("w:fldCharType"), kind)
+        elif text == instr:
+            el = OxmlElement("w:instrText")
+            el.set(qn("xml:space"), "preserve")
+            el.text = f" {instr} "
+        else:
+            el = OxmlElement("w:t")
+            el.text = text
+        run._r.append(el)
+
+
+def export_campaign_report_docx(camp: Campaign) -> bytes:
+    doc = Document()
+    foot = doc.sections[0].footer.paragraphs[0]
+    foot.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    foot.add_run("Page ")
+    _add_field(foot, "PAGE")
+    foot.add_run(" of ")
+    _add_field(foot, "NUMPAGES")
+    doc.add_heading(sr_head(camp), level=0)
+    doc.add_paragraph().add_run(
+        f"Campaign: {camp.id}    Project: {camp.project}    System/Subsystem: {camp.system} / {camp.subsystem}\n"
+        f"Test Lead: {camp.test_lead}    Quality Assurance: {camp.quality_assurance}    Date: {camp.date}"
+    ).font.size = Pt(9.5)
+    for kind, v in _sr_items(camp):
+        if kind == "section":
+            doc.add_heading(v.get("header") or "", level=1)
+            for line in (v.get("text") or "").split("\n"):
+                doc.add_paragraph(line)
+            continue
+        doc.add_page_break()
+        if kind == "vcrm":
+            doc.add_heading("Verification Cross-Reference Matrix", level=1)
+            _vcrm_docx_table(doc, v)
+        else:
+            _report_docx_body(doc, v, camp.id, (camp.reports or {}).get(v.id, {}))
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 _IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
@@ -972,9 +1077,8 @@ def _point_file_html(name: str, plot: bool = False) -> str:
     return f'<div class="rp-file rp-cap">Attached: {_h(name)}</div>'
 
 
-def export_report_html(card: TestCard, campaign_id: str = "", files: dict = None,
-                       host: str = "localhost", preview: bool = False) -> str:
-    rid = report_id(card.id)
+def report_body(card: TestCard, campaign_id: str = "", files: dict = None) -> str:
+    """One Test Report as an HTML fragment (header through test points)."""
     pts = []
     for p in card.points:
         signed = _h(p.initial)
@@ -1001,15 +1105,7 @@ def export_report_html(card: TestCard, campaign_id: str = "", files: dict = None
     refs = [(a, b) for a, b, _l in card.references if (a or "").strip() or (b or "").strip()]
     ref_html = "" if not refs else "<h2>References</h2><table><tr><th>Reference</th><th>Description</th></tr>" + "".join(
         f"<tr><td>{_h(a)}</td><td>{_h(b)}</td></tr>" for a, b in refs) + "</table>"
-    script = "" if preview else "<script>window.onload = () => window.print();</script>"
-    return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>{_h(head)}</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=B612:wght@400;700&family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="http://{host}/static/starfire.css"></head>
-<body class="print-doc report-doc{' preview' if preview else ''}">
-<h1>{_h(head)}</h1>
+    return f"""<h1>{_h(head)}</h1>
 <div class="meta">
   <span><b>Campaign:</b> {_h(campaign_id or "XX-000")}</span>
   <span><b>Article:</b> {_h(card.article) or "&mdash;"}</span>
@@ -1023,13 +1119,29 @@ def export_report_html(card: TestCard, campaign_id: str = "", files: dict = None
 <h2>Requirements covered</h2>
 <p>{_h(card.requirements) or "&mdash;"}</p>
 {nom_html}{ref_html}<h2>Test points</h2>
-{"".join(pts)}
+{"".join(pts)}"""
+
+
+def _report_page(title: str, body: str, host: str, preview: bool) -> str:
+    script = "" if preview else "<script>window.onload = () => window.print();</script>"
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>{_h(title)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612:wght@400;700&family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="http://{host}/static/starfire.css"></head>
+<body class="print-doc report-doc{' preview' if preview else ''}">
+{body}
 {script}
 </body></html>"""
 
 
-def export_report_docx(card: TestCard, campaign_id: str = "", files: dict = None) -> bytes:
-    doc = Document()
+def export_report_html(card: TestCard, campaign_id: str = "", files: dict = None,
+                       host: str = "localhost", preview: bool = False) -> str:
+    return _report_page(report_head(card), report_body(card, campaign_id, files), host, preview)
+
+
+def _report_docx_body(doc, card: TestCard, campaign_id: str = "", files: dict = None) -> None:
     doc.add_heading(report_head(card), level=0)
     doc.add_paragraph().add_run(
         f"Campaign: {campaign_id or 'XX-000'}    "
@@ -1076,6 +1188,11 @@ def export_report_docx(card: TestCard, campaign_id: str = "", files: dict = None
         sign = [x for x in (f"{p.date} {p.time}".strip(), p.initial) if x]
         if sign:
             doc.add_paragraph("    ".join(sign)).alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+
+def export_report_docx(card: TestCard, campaign_id: str = "", files: dict = None) -> bytes:
+    doc = Document()
+    _report_docx_body(doc, card, campaign_id, files)
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
@@ -1095,9 +1212,22 @@ _TEST_HTML = """<!doctype html>
 <link rel="stylesheet" href="/static/starfire.css">
 </head>
 <body class="editor-doc">
-<div id="panels"><div class="panel active">
-<h1>STARFIRE</h1>
-<div class="sub">test card / test point creator</div>
+<div id="panels"><div class="panel active split">
+<div class="report-side">
+<div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+<div class="side-btns" id="exportRow">
+  <button class="btn" id="loadJsonBtn">import test file</button>
+  <input type="file" id="loadJsonFile" accept=".test,.json,application/json" style="display:none">
+  <button class="btn" id="saveUnlockedBtn">export unlocked test file (.test)</button>
+  <button class="btn" id="saveLockedBtn">export locked test file (.test)</button>
+  <button class="btn" id="exportCsvBtn">export .csv</button>
+  <button class="btn" id="exportPrintBtn">generate card</button>
+  <button class="btn" id="exportDocxBtn">export .docx</button>
+  <button class="btn" id="buildReportBtn" style="display:none">build test report</button>
+</div>
+<div id="saveStatus" class="hint"></div>
+</div>
+<div class="side-main"><div class="side-inner">
 
 <h2>Card metadata</h2>
 <div class="meta">
@@ -1140,27 +1270,10 @@ _TEST_HTML = """<!doctype html>
 <div id="notesList"></div>
 <div class="row"><button class="btn btn-plus" id="addNoteBtn" title="add note">+</button></div>
 
-
-<h2>Save / load / export</h2>
-<div class="row" id="exportRow">
-  <button class="btn" id="loadJsonBtn">import test file</button>
-  <input type="file" id="loadJsonFile" accept=".test,.json,application/json" style="display:none">
-  <button class="btn" id="saveUnlockedBtn">export unlocked test file (.test)</button>
-  <button class="btn" id="saveLockedBtn">export locked test file (.test)</button>
-  <button class="btn" id="exportCsvBtn">export .csv</button>
-  <button class="btn" id="exportPrintBtn">generate card</button>
-  <button class="btn" id="exportDocxBtn">export .docx</button>
-</div>
-<div id="saveStatus" class="hint"></div>
+</div></div>
 </div></div>
 
 <script>
-// Hide the app-title branding when embedded (a campaign tab's iframe),
-// since the campaign page has its own header.
-if (window.self !== window.top) {
-  document.querySelectorAll("h1, .sub").forEach(el => el.style.visibility = "hidden");
-}
-
 // True only if jira_config.json was found in the working directory at
 // startup -- see jira_ticket.py's own docstring.
 const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
@@ -2012,6 +2125,16 @@ if (_loadFile) {
 // Lets an embedding page (the campaign tab bar) read the live editor
 // state, since `card` is a module-scope `let` otherwise unreachable from an iframe.
 window.getCard = () => card;
+
+// Only inside a campaign tab: ask the campaign page to open this card's Test Report tab.
+if (window.self !== window.top && window.parent.openReportTab) {
+  const buildBtn = document.getElementById("buildReportBtn");
+  buildBtn.style.display = "";
+  buildBtn.addEventListener("click", () => {
+    const file = new URLSearchParams(location.search).get("load") || "";
+    window.parent.openReportTab(file.replace(/\\.test$/, "") || card.id);
+  });
+}
 </script>
 </body>
 </html>
@@ -2032,9 +2155,21 @@ _CAMPAIGN_HTML = """<!doctype html>
 <body class="editor-doc">
 <div id="tabbar"></div>
 <div id="panels">
-  <div class="panel active" id="panel-campaign">
-    <h1>STARFIRE</h1>
-    <div class="sub">Test Campaign Designer</div>
+  <div class="panel active split" id="panel-campaign">
+    <div class="report-side">
+      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+      <div class="side-btns">
+        <button class="btn" id="loadCampBtn">import campaign file</button>
+        <input type="file" id="loadCampFile" accept=".camp,application/json" style="display:none">
+        <button class="btn" id="saveCampBtn">export campaign file (.camp)</button>
+        <button class="btn" id="printCampBtn">generate .pdf</button>
+        <button class="btn" id="docxCampBtn">export .docx</button>
+        <button class="btn" id="genVcrmBtn">generate VCRM</button>
+        <button class="btn" id="buildSrBtn">build campaign report</button>
+      </div>
+      <div id="saveStatus" class="hint"></div>
+    </div>
+    <div class="side-main"><div class="side-inner">
 
     <h2>Campaign metadata</h2>
     <div class="meta">
@@ -2098,16 +2233,7 @@ _CAMPAIGN_HTML = """<!doctype html>
     <div id="sectionsList"></div>
     <div class="row"><button class="btn btn-plus" id="addSectionBtn" title="add section">+</button></div>
 
-    <h2>Save / load / export</h2>
-    <div class="row">
-      <button class="btn" id="loadCampBtn">import campaign file</button>
-      <input type="file" id="loadCampFile" accept=".camp,application/json" style="display:none">
-      <button class="btn" id="saveCampBtn">export campaign file (.camp)</button>
-      <button class="btn" id="printCampBtn">generate .pdf</button>
-      <button class="btn" id="docxCampBtn">export .docx</button>
-      <button class="btn" id="genVcrmBtn">generate VCRM</button>
-    </div>
-    <div id="saveStatus"></div>
+    </div></div>
   </div>
 </div>
 
@@ -2228,7 +2354,8 @@ window.getCampaignId = () => camp.id;
 
 // Google Material Symbols, embedded inline (not a file/CDN) so they work
 // fully offline; fill="currentColor" picks up each button's own hover color.
-const ICON_SUMMARIZE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M320-600q17 0 28.5-11.5T360-640q0-17-11.5-28.5T320-680q-17 0-28.5 11.5T280-640q0 17 11.5 28.5T320-600Zm0 160q17 0 28.5-11.5T360-480q0-17-11.5-28.5T320-520q-17 0-28.5 11.5T280-480q0 17 11.5 28.5T320-440Zm0 160q17 0 28.5-11.5T360-320q0-17-11.5-28.5T320-360q-17 0-28.5 11.5T280-320q0 17 11.5 28.5T320-280ZM200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h440l200 200v440q0 33-23.5 56.5T760-120H200Zm0-80h560v-400H600v-160H200v560Zm0-560v160-160 560-560Z"/></svg>';
+const ICON_ARROW_UPWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-160v-487L216-423l-56-57 320-320 320 320-56 57-224-224v487h-80Z"/></svg>';
+const ICON_ARROW_DOWNWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-800v487L216-537l-56 57 320 320 320-320-56-57-224 224v-487h-80Z"/></svg>';
 const ICON_OPEN_IN_NEW = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z"/></svg>';
 const ICON_CLOSE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>';
 const ICON_BOOKMARK_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-640q0-33 23.5-56.5T280-840h240v80H280v518l200-86 200 86v-278h80v400L480-240 200-120Zm80-640h240-240Zm400 160v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80Z"/></svg>';
@@ -2273,7 +2400,6 @@ function renderTestsTable(list, tableId) {
       <td>${statusSelect(i, row.status)}</td>
       <td class="actions-cell">
         <button class="btn btn-icon" data-open="${i}" title="open">${ICON_OPEN_IN_NEW}</button>
-        <button class="btn btn-icon" data-report="${i}" title="test report">${ICON_SUMMARIZE}</button>
         <button class="btn btn-icon" data-del="${i}" title="remove">${ICON_CLOSE}</button>
         ${JIRA_AVAILABLE ? `<button class="btn btn-icon" data-jira="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
       </td>`;
@@ -2297,12 +2423,6 @@ function renderTestsTable(list, tableId) {
     btn.addEventListener("click", () => {
       const row = list[+btn.dataset.open];
       if ((row.test_id || "").trim()) openTestTab(row.test_id, row.title);
-    });
-  });
-  t.querySelectorAll("button[data-report]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const row = list[+btn.dataset.report];
-      if ((row.test_id || "").trim()) openReportTab(row.test_id);
     });
   });
   t.querySelectorAll("button[data-jira]").forEach(btn => {
@@ -2440,7 +2560,7 @@ function renderSections() {
     el.addEventListener("input", () => { camp.sections[+el.dataset.i][+el.dataset.f] = el.value; });
   });
   list.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => { camp.sections.splice(+btn.dataset.del, 1); renderSections(); });
+    btn.addEventListener("click", () => { srSectionDeleted(+btn.dataset.del); camp.sections.splice(+btn.dataset.del, 1); renderSections(); });
   });
 }
 document.getElementById("addSectionBtn").addEventListener("click", () => {
@@ -2517,6 +2637,7 @@ let activeTab = "campaign";
 function renderTabBar() {
   const bar = document.getElementById("tabbar");
   bar.innerHTML = "";
+  updateAppendButtons();
   const campBtn = document.createElement("button");
   campBtn.className = "tab-btn" + (activeTab === "campaign" ? " active" : "");
   campBtn.textContent = camp.id || "Campaign";
@@ -2534,8 +2655,14 @@ function renderTabBar() {
   });
 }
 
+function updateAppendButtons() {
+  const on = openTabs.some(t => t.key === SR_KEY);
+  document.querySelectorAll("[data-rappend], #appendVcrmBtn").forEach(b => { b.style.display = on ? "" : "none"; });
+}
+
 function switchTab(key) {
   activeTab = key;
+  if (key === SR_KEY) { srSync(); renderSrSide(); renderSrPreview(); }
   if (key.startsWith("report-")) loadReport(key, key.slice(7));
   document.getElementById("panel-campaign").classList.toggle("active", key === "campaign");
   openTabs.forEach(tab => {
@@ -2569,6 +2696,156 @@ function openTestTab(testId, title) {
   switchTab(filename);
 }
 
+// ---- Campaign report (SR) tab: header, sections, and appended VCRM / Test Reports ----
+const SR_KEY = "__sr__";
+function srIdFor(id) {
+  const s = String(id || "").trim();
+  return /^sc-/i.test(s) ? "SR-" + s.slice(3) : "SR-" + (s || "000");
+}
+function srHead() {
+  return [srIdFor(camp.id), camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" ");
+}
+function srItemLabel(it) {
+  if (it.type === "vcrm") return "VCRM";
+  if (it.type === "report") return reportIdFor(it.card);
+  const sec = it.idx !== undefined ? camp.sections[it.idx] : null;
+  return (sec ? sec[0] : it.header) || "(untitled section)";
+}
+
+// The VCRM and Sections always come first; Test Reports follow (each group keeps its own order).
+const srIsReport = it => it.type === "report";
+function srOrder() {
+  camp.campaign_report.items.sort((a, b) => srIsReport(a) - srIsReport(b));
+}
+
+// Sections stay live: every non-empty one the user hasn't removed from the report is in it.
+function srSync() {
+  const rep = camp.campaign_report;
+  if (!rep) return;
+  rep.dismissed = rep.dismissed || [];
+  rep.items = rep.items.filter(it => it.type !== "section" || it.idx === undefined || camp.sections[it.idx]);
+  camp.sections.forEach(([h, t], i) => {
+    const has = rep.items.some(it => it.type === "section" && it.idx === i);
+    if (!has && !rep.dismissed.includes(i) && ((h || "").trim() || (t || "").trim())) rep.items.push({type: "section", idx: i});
+  });
+  srOrder();
+}
+
+// A section deleted on the campaign tab shifts the ones after it.
+function srSectionDeleted(i) {
+  const rep = camp.campaign_report;
+  if (!rep) return;
+  const shift = n => n > i ? n - 1 : n;
+  rep.items = rep.items.filter(it => !(it.type === "section" && it.idx === i));
+  rep.items.forEach(it => { if (it.type === "section" && it.idx !== undefined) it.idx = shift(it.idx); });
+  rep.dismissed = (rep.dismissed || []).filter(n => n !== i).map(shift);
+}
+const SR_KINDS = {section: "section", vcrm: "matrix", report: "test report"};
+
+function srAppend(item) {
+  if (!camp.campaign_report) return "No campaign report yet.";
+  const items = camp.campaign_report.items;
+  if (items.some(x => x.type === item.type && x.card === item.card)) return "Already in " + srIdFor(camp.id);
+  items.push(item);
+  srOrder();
+  renderSrSide();
+  renderSrPreview();
+  return "Appended to " + srIdFor(camp.id);
+}
+
+function openSrTab() {
+  if (!camp.campaign_report) camp.campaign_report = {items: [], dismissed: []};
+  if (!openTabs.some(t => t.key === SR_KEY)) {
+    openTabs.push({key: SR_KEY, label: srIdFor(camp.id)});
+    const panel = document.createElement("div");
+    panel.className = "test-panel report-panel";
+    panel.id = "panel-" + SR_KEY;
+    panel.innerHTML = `
+      <div class="report-side">
+        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+        <div class="report-box"><div class="report-label">Campaign report for</div><div class="report-for sr-for"></div></div>
+        <div class="report-box">
+          <div class="report-label">Contents</div>
+          <div class="sr-items"></div>
+          <div class="report-hint">Open the VCRM or a Test Report and press + append to add it here.</div>
+        </div>
+        <div class="report-btns">
+          <button class="btn" data-srrefresh>refresh</button>
+          <button class="btn" data-srprint>print / pdf</button>
+          <button class="btn" data-srdocx>.docx</button>
+        </div>
+        <div class="report-hint sr-status"></div>
+      </div>
+      <iframe class="report-frame" title="campaign report preview"></iframe>`;
+    document.getElementById("panels").appendChild(panel);
+    panel.querySelector("[data-srrefresh]").addEventListener("click", () => { srSync(); renderSrSide(); renderSrPreview(); });
+    panel.querySelector("[data-srprint]").addEventListener("click", printSr);
+    panel.querySelector("[data-srdocx]").addEventListener("click", docxSr);
+  }
+  switchTab(SR_KEY);
+}
+
+function renderSrSide() {
+  const panel = document.getElementById("panel-" + SR_KEY);
+  if (!panel || !camp.campaign_report) return;
+  panel.querySelector(".sr-for").textContent = srHead();
+  const items = camp.campaign_report.items, list = panel.querySelector(".sr-items");
+  list.innerHTML = items.length ? items.map((it, i) => `
+    <div class="sr-item">
+      <span class="sr-label"><span class="report-fname">${esc(srItemLabel(it))}</span><span class="report-kind">${SR_KINDS[it.type] || ""}</span></span>
+      <button class="btn mini btn-icon" data-srup="${i}" title="move up"${i === 0 || srIsReport(items[i - 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_UPWARD}</button>
+      <button class="btn mini btn-icon" data-srdown="${i}" title="move down"${i === items.length - 1 || srIsReport(items[i + 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_DOWNWARD}</button>
+      <button class="btn mini btn-icon btn-x" data-srdel="${i}" title="remove">${ICON_CLOSE}</button>
+    </div>`).join("") : `<div class="report-hint">Nothing added yet.</div>`;
+  const edit = (name, fn) => list.querySelectorAll(`button[data-${name}]`).forEach(b => b.addEventListener("click", () => {
+    fn(+b.dataset[name]);
+    renderSrSide();
+    renderSrPreview();
+  }));
+  edit("srup", i => { [items[i - 1], items[i]] = [items[i], items[i - 1]]; });
+  edit("srdown", i => { [items[i + 1], items[i]] = [items[i], items[i + 1]]; });
+  edit("srdel", i => {
+    const it = items[i];
+    if (it.type === "section" && it.idx !== undefined) camp.campaign_report.dismissed.push(it.idx);
+    items.splice(i, 1);
+  });
+}
+
+async function renderSrPreview() {
+  const panel = document.getElementById("panel-" + SR_KEY);
+  if (!panel) return;
+  const frame = panel.querySelector(".report-frame");
+  const res = await fetch("/export/campaign_report/print", {method: "POST", body: JSON.stringify({campaign: camp, preview: true})});
+  const scroll = frame.contentWindow ? frame.contentWindow.scrollY : 0;
+  frame.onload = () => frame.contentWindow.scrollTo(0, scroll);
+  frame.srcdoc = await res.text();
+}
+
+async function printSr() {
+  const w = window.open("", "_blank");
+  if (w) w.document.write("Generating...");
+  try {
+    const res = await fetch("/export/campaign_report/print", {method: "POST", body: JSON.stringify({campaign: camp, preview: false})});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const text = await res.text();
+    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
+  } catch (err) {
+    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
+  }
+}
+
+async function docxSr() {
+  const status = document.querySelector("#panel-" + SR_KEY + " .sr-status");
+  try {
+    const res = await fetch("/export/campaign_report/docx", {method: "POST", body: JSON.stringify({campaign: camp})});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    download(srIdFor(camp.id) + ".docx", await res.blob());
+  } catch (err) {
+    status.textContent = `Docx export failed: ${err}`;
+  }
+}
+document.getElementById("buildSrBtn").addEventListener("click", openSrTab);
+
 // ---- Test Report (TR) tabs: one card's saved .test file, rendered by the server ----
 function reportIdFor(testId) {
   const id = String(testId || "").trim();
@@ -2586,6 +2863,7 @@ function openReportTab(testId) {
     panel.id = "panel-" + key;
     panel.innerHTML = `
       <div class="report-side">
+        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
         <div class="report-box"><div class="report-label">Report for</div><div class="report-for"></div></div>
         <div class="report-box">
           <div class="report-label report-files-title">Files for point</div>
@@ -2596,6 +2874,7 @@ function openReportTab(testId) {
           <button class="btn" data-rrefresh>refresh</button>
           <button class="btn" data-rprint>print / pdf</button>
           <button class="btn" data-rdocx>.docx</button>
+          <button class="btn" data-rappend style="display:none">+ append</button>
         </div>
         <div class="report-hint report-status"></div>
       </div>
@@ -2604,6 +2883,10 @@ function openReportTab(testId) {
     panel.querySelector("[data-rrefresh]").addEventListener("click", () => loadReport(key, key.slice(7)));
     panel.querySelector("[data-rprint]").addEventListener("click", () => printReport(key));
     panel.querySelector("[data-rdocx]").addEventListener("click", () => docxReport(key));
+    panel.querySelector("[data-rappend]").addEventListener("click", () => {
+      const st = reportState[key];
+      if (st && st.card) panel.querySelector(".report-status").textContent = srAppend({type: "report", card: st.card.id});
+    });
   }
   switchTab(key);
 }
@@ -2772,7 +3055,7 @@ async function generateVcrm() {
   let panel = document.getElementById("panel-" + VCRM_KEY);
   if (!panel) {
     panel = document.createElement("div");
-    panel.className = "panel";
+    panel.className = "panel split";
     panel.id = "panel-" + VCRM_KEY;
     document.getElementById("panels").appendChild(panel);
   }
@@ -2785,21 +3068,40 @@ async function generateVcrm() {
       <td>${esc(currentVcrm.generated)}</td>
     </tr>`).join("");
   panel.innerHTML = `
-    <h1 style="visibility:hidden">STARFIRE</h1>
-    <div class="sub" style="visibility:hidden">Test Campaign Designer</div>
+    <div class="report-side">
+      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+      <div class="report-box"><div class="report-label">Verification Cross-Reference Matrix for Test Campaign</div>
+        <div class="report-for">${esc([camp.id, camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" "))}</div></div>
+      <div class="side-btns">
+        <button class="btn" id="saveVcrmBtn">export .vcrm file</button>
+        <button class="btn" id="printVcrmBtn">generate .pdf</button>
+        <button class="btn" id="docxVcrmBtn">export .docx</button>
+        <button class="btn" id="appendVcrmBtn" style="display:none">+ append</button>
+      </div>
+      <div id="vcrmStatus" class="hint"></div>
+    </div>
+    <div class="side-main"><div class="side-inner">
+    <div class="side-head">${esc([camp.id, camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" "))}</div>
+    <div class="side-meta">
+      <span><b>Campaign:</b> ${esc(camp.id)}</span>
+      <span><b>Project:</b> ${esc(camp.project)}</span>
+      <span><b>System/Subsystem:</b> ${esc(camp.system)} / ${esc(camp.subsystem)}</span>
+    </div>
+    <div class="side-meta">
+      <span><b>Test Lead:</b> ${esc(camp.test_lead)}</span>
+      <span><b>Quality Assurance:</b> ${esc(camp.quality_assurance)}</span>
+      <span><b>Date:</b> ${esc(camp.date)}</span>
+    </div>
     <h2 class="no-rule">Verification Cross-Reference Matrix</h2>
     <table class="datatable">
       <tr><th>Requirement</th><th>Description</th><th>Covering Tests</th><th>Status</th><th>Updated</th></tr>
       ${rows || '<tr><td colspan="5">No requirements entered on this campaign yet.</td></tr>'}
     </table>
-    <div class="row">
-      <button class="btn" id="saveVcrmBtn">export .vcrm file</button>
-      <button class="btn" id="printVcrmBtn">generate .pdf</button>
-      <button class="btn" id="docxVcrmBtn">export .docx</button>
-    </div>
-    <div id="vcrmStatus" class="hint"></div>`;
+    </div></div>`;
 
   const vcrmStatus = panel.querySelector("#vcrmStatus");
+  panel.querySelector("#appendVcrmBtn").addEventListener("click", () => { vcrmStatus.textContent = srAppend({type: "vcrm"}); });
+  updateAppendButtons();
   panel.querySelector("#saveVcrmBtn").addEventListener("click", async () => {
     try {
       const res = await fetch("/save_vcrm", {method: "POST", body: JSON.stringify(currentVcrm)});
@@ -3342,6 +3644,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, "text/html", html.encode())
             else:
                 self._send(200, _DOCX_MIME, export_report_docx(card, camp_id, files))
+        # Campaign report (SR) routes: {"campaign": <the .camp dict>, "preview"}
+        elif path in ("/export/campaign_report/print", "/export/campaign_report/docx"):
+            camp = Campaign.from_dict(data["campaign"])
+            if path.endswith("/print"):
+                self._send(200, "text/html", export_campaign_report_html(camp, host, bool(data.get("preview"))).encode())
+            else:
+                self._send(200, _DOCX_MIME, export_campaign_report_docx(camp))
         # VCRM routes (the VCRM is plain JSON, not a dataclass)
         elif path == "/save_vcrm":
             self._write_file(vcrm_filename(data.get("campaign_id", "VCRM")), data)
@@ -3386,3 +3695,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+    
