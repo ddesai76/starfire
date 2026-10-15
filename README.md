@@ -105,7 +105,7 @@ The extension decides: a `.py` file runs under `python3` even if it has a differ
 
 | Column | Meaning |
 |:--|:--|
-| **Module** | Picked from a list of the runnable files in `dist/`, which refreshes when you return to the page. The name's color shows its kind: **green** a binary (no extension), **amber** `.py`, **blue** `.jl`, **white** `.sh`, **red** anything else. |
+| **Module** | Picked from a list of the runnable files in `dist/`, which refreshes when you return to the page. The name's color shows its kind: **green** no extension, **amber** `.py`, **blue** `.jl`, **white** `.sh`, **red** anything else. |
 | **Description** | Optional free text. |
 | **Scope** | Where it may be run. Blank means any test point. `TC-001` means any point on card TC-001. `TC-001-20` means only point 20 on card TC-001. Ids are compared exactly (not as prefixes), ignoring case. |
 
