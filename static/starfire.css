@@ -7,8 +7,8 @@
   }
   .editor-doc { background: var(--bg); color: var(--nw); font-family: var(--mono);
                 height: 100%; margin: 0; display: flex; flex-direction: column; }
-  /* No standalone display font -- fakes the retro-italic "Tomorrowland"
-     look on B612 Mono instead: skew, vertical stretch, expanded tracking. */
+  /* No standalone display font -- fakes a retro-italic
+     look with B612 Mono instead: skew, vertical stretch, expanded tracking. */
   .editor-doc h1 { font-family: 'B612 Mono', monospace; font-size: 32px; font-weight: 700;
        color: var(--ebl); letter-spacing: .12em; margin-bottom: 6px;
        transform: skewX(-12deg) scaleY(1.1); transform-origin: left bottom;
@@ -91,6 +91,9 @@
   /* A text input with its action button beside it: module name + run, command + send. */
   .send-row { display: flex; gap: 6px; margin-bottom: 8px; }
   .send-row input { flex: 1; min-width: 0; }
+  .mod-row { align-items: flex-end; }
+  .mod-row > div { flex: 1; min-width: 0; }
+  .mod-row input { width: 100%; box-sizing: border-box; }
   .send-row .btn.mini { padding: 3px 12px; }
   .panel-actions { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
   .panel-actions .module-status { margin: 0; }
