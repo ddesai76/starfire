@@ -1,0 +1,12 @@
+[package]
+name = "starfire-modules"
+version = "0.1.0"
+edition = "2021"
+description = "Rust modules for Starfire: each src/bin/*.rs builds to a binary to run from dist/"
+
+[dependencies]
+signal-hook = "0.4.5"
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "x11"] }
+
+[profile.release]
+opt-level = 2

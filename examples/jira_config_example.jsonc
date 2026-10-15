@@ -1,0 +1,12 @@
+// Edit base_url, email, api_token, and project key fields as appropriate
+// and save as jira_config.json
+
+{
+  "base_url": " ",
+  "email": " ",
+  "api_token": " ",
+  "project_key": " ",
+  "issue_type": "Bug",
+  "test_issue_type": "Task",
+  "epic_link_field": null
+}
