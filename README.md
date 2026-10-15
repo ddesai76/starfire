@@ -14,9 +14,6 @@ It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, 
 python3 starfire.py [--port <n>] [--no-browser]   # -> http://localhost:5791
 ```
 
-* `/` is the campaign designer. Each test in a campaign opens as a tab running the test card editor.
-* `/test?load=<file>.test` is a single test card on its own.
-
 ### Build and run with `starfi.sh`
 
 ```bash
@@ -142,7 +139,7 @@ Starfire/                    <- launch ./dist/starfire from here; modules run he
 
 ---
 
-## `starfire.cpp` (the SCPI interface)
+### `starfire.cpp` (the SCPI interface)
 
 `starfire.cpp` builds to `starfire-hw`, the only part of Starfire that touches a device node. The Python side never opens one itself. It has one mode, `send`, used by the Measure panel's SEND button and available to your modules (see `STARFIRE_HW` above).
 
@@ -169,7 +166,7 @@ Exit codes: `0` success, `1` runtime failure (the JSON line has `error`), `2` us
 
 ---
 
-## Export formats
+### Export formats
 
 | Format | Purpose |
 |:--- | :--- |
