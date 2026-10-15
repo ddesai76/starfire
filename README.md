@@ -98,9 +98,9 @@ A **module** is a script or program placed in the `/dist` folder that Starfire r
 | `*.py` | `python3 <file>` | `python3` on `PATH`. No `chmod`, no shebang. |
 | `*.sh` | `bash <file>` | `bash` on `PATH`. No `chmod`, no shebang. |
 | `*.jl` | `julia <file>` | `julia` on `PATH`. No `chmod`, no shebang. |
-| Anything else | `./<file>` directly | Execute permission (`chmod +x`). A compiled binary (`g++ -o dist/hello hello.cpp`), or a script of any other language with a shebang line such as `#!/usr/bin/env ruby`. |
+| Anything else | `./<file>` directly | Execute permission (`chmod +x`). A compiled binary (`g++ -o dist/test test.cpp`), or a script of any other language with a shebang line `#!/usr/bin/env <LANGUAGE>`. |
 
-The extension decides: a `.py` file runs under `python3` even if it has a different shebang. Source files such as `hello.cpp` aren't listed until you compile them. The same rule is what fills the Modules picker, so an unrunnable file never shows up. 
+The extension decides: a `.py` file runs under `python3` even if it has a different shebang. Source files such as `hello.cpp` aren't listed until compiled. The same rule applies to what populates the Modules picker, so an unrunnable file never shows up. 
 2. **Register it** in the campaign's **Modules** table (below Requirements):
 
 | Column | Meaning |
