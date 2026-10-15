@@ -1,28 +1,18 @@
 #!/usr/bin/env python3
 
-# starfire.py:    TEST CAMPAIGN + TEST CARD DESIGNER
+# starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
 # UPDATED:        2026-10-11
 # VERSION:        0.2.0
 #
-# Single stdlib file (plus python-docx); client-side editor state, the
-# server handles exports, saved files, and the optional `starfire-hw` binary.
 
 """
 Usage
 -----
-    python3 starfire.py                    # open GUI on http://localhost:5791
+    python3 starfire.py                    # Open GUI on http://localhost:5791
     python3 starfire.py --port 8080
     python3 starfire.py --no-browser
 
-Pages: `/` is the campaign designer; `/test?load=<file>.test` is a single
-test card (the campaign page embeds these as tabs).
-
-Tests: `pytest` from the project root.
-
-Dependencies: python-docx for the .docx exports. Optional: a compiled
-`starfire-hw` binary (Sample / Activate buttons; built from starfire.cpp) and
-jira_config.json (Jira tickets).
 """
 
 from __future__ import annotations
@@ -31,10 +21,12 @@ import argparse
 import base64
 import binascii
 import csv
+import errno
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -53,19 +45,16 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
-# Local module, bundled into the binary; what's optional is jira_config.json.
+# Local module; builds into the binary
 import jira_ticket
 
 
-# Test card: data model
-
+# Test card data model
 @dataclass
 class TestPoint:
     seq: int
     action: str = ""
     expected: str = ""
-    # What was actually observed when the point was run -- user-entered,
-    # stays editable even on a locked point since this is execution data.
     observed: str = ""
     reference: str = ""
     responsible_party: str = ""
@@ -73,32 +62,18 @@ class TestPoint:
     time: str = ""        # 24h "HH:MM" -- filled by the UI's "now" button
     initial: str = ""
     quality: str = ""
-    # True if this point existed at the moment the card was last exported
-    # locked -- see the "Locking" note on TestCard below.
     locked: bool = False
-    # Independent of locked -- always toggleable, recolors the point
-    # number and whatever fields are currently editable.
     flagged: bool = False
-    # Filenames only (see /capture_image); files live in the working
-    # directory alongside .test/.camp files, not the image data itself.
     images: list = field(default_factory=list)
-    # USB device node and SCPI command a "read" sends -- e.g.
-    # "/dev/usbtmc0" and "MEAS:VOLT:DC?". Manual, like everything else
-    # this app doesn't try to auto-discover.
     usb_port: str = ""
     measure_command: str = ""
-    # Each row: [command, value, timestamp, auto]. auto=True rows came
-    # from measure and are read-only (delete-only); auto=False
-    # rows were typed in by hand and stay fully editable.
     measurements: list = field(default_factory=list)
 
 
 def _normalize_pair_list(items: list, width: int) -> list:
-    """Backward-compat + shape normalization for nomenclature/references/
-    notes/warnings: pads each row to `width` elements (the last of which is
-    always the `locked` flag), and accepts a bare string in place of a
-    single-element row (old files stored notes/warnings as plain strings
-    before locking existed)."""
+    """Shape normalization for nomenclature/references/
+    notes/warnings: pads each row to `width` elements, and
+    accepts a bare string in place of a single-element row."""
     out = []
     for item in items:
         row = [item] if isinstance(item, str) else list(item)
@@ -123,29 +98,18 @@ class TestCard:
     system: str = ""
     subsystem: str = ""
     test_type: str = ""
-    # Serial number / article under test; run data, so editable on a locked card.
     article: str = ""
-    # Free-text requirement code(s) this test verifies. Deliberately
-    # unstructured -- tracing coverage is a manual, unenforced responsibility.
     requirements: str = ""
     points: list = field(default_factory=list)         # list[TestPoint]
-    # [symbol, definition, units, locked]. Symbol may be raw LaTeX (e.g.
-    # "\alpha") -- see GREEK_UNICODE / _latex_symbol for how it renders.
     nomenclature: list = field(default_factory=list)
-    # Reference documents cited by test points: list of [ref id, description, locked].
     references: list = field(default_factory=list)
-    # Card-level callouts, Epsilon3-style: free-text notes and warnings,
-    # each rendered as its own table on the printed card.
     notes: list = field(default_factory=list)       # list[[text, locked]]
     warnings: list = field(default_factory=list)     # list[[text, locked]]
-    # A workflow marker, not security (plain JSON, hand-editable). Exporting
-    # locked freezes every current row and restricts further edits to a few fields.
     locked: bool = False
 
     @staticmethod
     def from_dict(d: dict) -> "TestCard":
-        # Unknown keys are dropped, so files saved by an older version (e.g.
-        # with the retired activate_command) still open.
+        # Unknown keys are dropped, so files saved by an older version still open.
         known = {f.name for f in fields(TestPoint)}
         pts = [TestPoint(**{k: v for k, v in p.items() if k in known}) for p in d.get("points", [])]
         nom = [tuple(x) for x in _normalize_pair_list(d.get("nomenclature", []), 4)]
@@ -162,19 +126,14 @@ class TestCard:
         return d
 
 
-
-# Nomenclature -- manual entries only (an autoscan approach didn't scan well in practice).
-
 def sorted_nomenclature(card: TestCard) -> list:
-    """card.nomenclature as a list of (symbol, definition, units, locked),
-    alphabetized. Tolerates old rows missing units and/or the locked flag."""
+    # card.nomenclature as a list of (symbol, definition, units, locked),alphabetized.
     rows = [(r[0], r[1], r[2] if len(r) > 2 else "", r[3] if len(r) > 3 else False)
             for r in card.nomenclature]
     return sorted(rows, key=lambda row: row[0].lower())
 
 
-# LaTeX Greek-letter commands -> Unicode, for the print/HTML view (the
-# .tex export uses the LaTeX command itself, so it doesn't need this).
+# LaTeX Greek-letter commands -> Unicode, for the print/HTML view.
 GREEK_UNICODE = {
     "alpha": "\u03b1", "beta": "\u03b2", "gamma": "\u03b3", "delta": "\u03b4",
     "epsilon": "\u03b5", "zeta": "\u03b6", "eta": "\u03b7", "theta": "\u03b8",
@@ -191,13 +150,11 @@ _GREEK_CMD_RE = re.compile(r"\\([A-Za-z]+)")
 
 def symbol_display(sym: str) -> str:
     """Render a nomenclature symbol for CSV/HTML: LaTeX Greek commands
-    (\\alpha, \\Delta_max) become their Unicode letter; anything else
-    (V_max, CG) passes through unchanged."""
+    become their Unicode letter; anything else passes unchanged."""
     return _GREEK_CMD_RE.sub(lambda m: GREEK_UNICODE.get(m.group(1), m.group(0)), sym or "")
 
 
-# Export: CSV
-
+# Export as CSV
 def export_csv(card: TestCard) -> str:
     buf = io.StringIO()
     w = csv.writer(buf)
@@ -216,11 +173,9 @@ def export_csv(card: TestCard) -> str:
     return buf.getvalue()
 
 
-# Export: print-ready HTML (browser print-to-PDF, no new dependency).
-
+# Export as print-ready HTML (browser print-to-PDF, no new dependency).
 def _h(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
 
 def export_print_html(card: TestCard, host: str = "localhost") -> str:
     rows = "\n".join(
@@ -294,119 +249,20 @@ def export_print_html(card: TestCard, host: str = "localhost") -> str:
 </body></html>"""
 
 
-# Export: AIAA-format LaTeX -- suppressed from the UI for now, route left in place.
-
-_LATEX_SPECIAL = {
-    "&": r"\&", "%": r"\%", "$": r"\$", "#": r"\#", "_": r"\_",
-    "{": r"\{", "}": r"\}", "~": r"\textasciitilde{}",
-    "^": r"\textasciicircum{}", "\\": r"\textbackslash{}",
-}
-_LATEX_RE = re.compile("|".join(re.escape(k) for k in _LATEX_SPECIAL))
-
-
-def latex_escape(s: str) -> str:
-    return _LATEX_RE.sub(lambda m: _LATEX_SPECIAL[m.group(0)], s or "")
-
-
-def _latex_symbol(sym: str) -> str:
-    # Renders as real LaTeX math for a raw command (\alpha) or a plain
-    # subscripted var (V_max); anything else (CG, PID) stays literal text.
-    m = re.match(r"^(\\[A-Za-z]+)(?:_([A-Za-z0-9]+))?$", sym or "")
-    if m:
-        base, sub = m.group(1), m.group(2)
-        return f"${base}_{{{sub}}}$" if sub else f"${base}$"
-    if "_" in sym and re.match(r"^[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9]+$", sym):
-        base, sub = sym.split("_", 1)
-        return f"${base}_{{{sub}}}$"
-    return latex_escape(sym)
-
-
-def export_tex(card: TestCard) -> str:
-    nom = sorted_nomenclature(card)
-    nom_lines = "\n".join(
-        f"{_latex_symbol(sym)} \\> = \\> {latex_escape(defn) or 'TBD'}"
-        f"{' [' + latex_escape(units) + ']' if units else ''} \\\\"
-        for sym, defn, units, _locked in nom
-    )
-    row_lines = "\n".join(
-        f"{p.seq} & {latex_escape(p.action)} & {latex_escape(p.expected)} & "
-        f"{latex_escape(p.reference)} \\\\"
-        for p in card.points
-    )
-    # Plain article class + AIAA-style structure; swap in \documentclass{aiaa}
-    # below if that LaTeX class is installed.
-    return f"""% {card.id} -- {card.title}, generated by starfire.py
-% AIAA-style test plan document. Intended to be imported into
-% LibreOffice (LaTeX extension) and extended after the test is run.
-\\documentclass[11pt]{{article}}
-\\usepackage[margin=1in]{{geometry}}
-\\usepackage{{booktabs}}
-\\usepackage{{array}}
-\\usepackage{{amsmath,amssymb}}
-
-\\title{{{latex_escape(card.title)} --- Test Plan}}
-\\author{{{latex_escape(card.author)}}}
-\\date{{{latex_escape(card.date)}}}
-
-\\begin{{document}}
-\\maketitle
-
-\\noindent
-\\begin{{tabular}}{{@{{}}ll@{{}}}}
-\\textbf{{Project:}} & {latex_escape(card.project)} \\\\
-\\textbf{{Test Conductor:}} & {latex_escape(card.test_conductor)} \\\\
-\\textbf{{System / Subsystem:}} & {latex_escape(card.system)} / {latex_escape(card.subsystem)} \\\\
-\\textbf{{Test Type:}} & {latex_escape(card.test_type)} \\\\
-\\textbf{{Card ID / Rev:}} & {latex_escape(card.id)} / {latex_escape(card.revision)} \\\\
-\\end{{tabular}}
-\\vspace{{1em}}
-
-\\section*{{Nomenclature}}
-\\begin{{tabbing}}
-XXXXXXXXXXXXXXXX \\= \\kill
-{nom_lines if nom_lines else '(none) \\\\'}
-\\end{{tabbing}}
-
-\\section{{Test Points}}
-
-\\begin{{table}}[htbp]
-\\centering
-\\caption{{Test points --- {latex_escape(card.title)} (Rev {latex_escape(card.revision)})}}
-\\label{{tab:test_points}}
-\\begin{{tabular}}{{@{{}}p{{0.05\\linewidth}}p{{0.30\\linewidth}}p{{0.35\\linewidth}}p{{0.20\\linewidth}}@{{}}}}
-\\toprule
-\\# & Action & Expected Result & Reference \\\\
-\\midrule
-{row_lines if row_lines else ' & & & \\\\'}
-\\bottomrule
-\\end{{tabular}}
-\\end{{table}}
-
-\\end{{document}}
-"""
-
-
-
-# Campaign: data model
-
+# Campaign data model
 @dataclass
 class CampaignTestRow:
     seq: int
     test_id: str = ""
     title: str = ""
     status: str = ""   # "", COMPLETE, IN_PROGRESS, TO_DO, BLOCKED
-    # Pulled from the linked .test file's own Author metadata, not typed
-    # here -- kept in sync opportunistically, no error if it doesn't match yet.
     author: str = ""
-    # Same pattern as Author, but not Author itself: a Task may get
-    # reassigned in Jira, so baking in the test's original author wouldn't stay meaningful.
     requirements: str = ""
 
 
 @dataclass
 class CampaignModule:
-    # A script or binary in the program's dist/ folder that a test point's
-    # Activate (bolt) button may run. See list_modules / run_module.
+    # A script or binary in the program's dist/ folder that a test point's Activate button can run. 
     module: str = ""
     description: str = ""
     # "" = any test point; a card id (TC-001) = any point on that card;
@@ -426,21 +282,13 @@ class Campaign:
     quality_assurance: str = ""
     system: str = ""
     subsystem: str = ""
-    # Requirement code + description, same shape as a TestCard's References.
     requirements: list = field(default_factory=list)   # list[(code, description)]
-    # Modules a test point's Activate button may run.
+    # Modules a test point's Activate button can run.
     modules: list = field(default_factory=list)         # list[CampaignModule]
     tests: list = field(default_factory=list)           # list[CampaignTestRow] -- "Test Series"
-    # Same shape as tests, for tests that support the series but aren't
-    # part of its numbered sequence (one-off checkouts, vendor acceptance).
     ancillary_tests: list = field(default_factory=list)   # list[CampaignTestRow]
-    # Free-form writeup blocks: each a (header, text) pair, rendered after
-    # the Tests table; text is preserved as-is wherever it's exported.
     sections: list = field(default_factory=list)         # list[(header, text)]
-    # Optional Jira Epic every ticket from this campaign links to. Passed
-    # down into each open test tab once its iframe loads -- see openTestTab() below.
     jira_epic_key: str = ""
-    # Files ticked into each card's Test Report: {card_id: {point_seq: [filename, ...]}}.
     reports: dict = field(default_factory=dict)
     # The campaign report (SR-xxx), once built: {"items": [section | vcrm | report, ...]}.
     campaign_report: dict = None
@@ -465,9 +313,7 @@ STATUS_LABELS = {
 
 
 def test_filename(test_id: str) -> str:
-    """The .test filename a campaign's Tests-table row links to. Derived
-    from Test ID rather than stored separately -- one less field to keep
-    in sync."""
+    # The .test filename a campaign's Tests-table row links to, derived from Test ID rather than stored separately. 
     return _safe_filename(test_id, ".test")
 
 
@@ -480,13 +326,7 @@ def compute_vcrm(camp: Campaign) -> dict:
     Series tests verify it -> rolled-up coverage. Read-only and computed
     fresh each time from data that already exists elsewhere (the
     campaign's Requirements table, and each referenced test's own
-    `requirements` field) -- nothing new to keep in sync, same "manual,
-    not enforced" traceability philosophy as the rest of the app: a typo
-    in either place just means no link shows up, silently, no validation.
-
-    Ancillary Tests are deliberately excluded -- they're invoked FROM a
-    Test Series test (a performance check, etc.), not an independent
-    verification of a requirement in their own right.
+    `requirements` field). Ancillary Tests are excluded.
     """
     test_cache: dict = {}
 
@@ -529,15 +369,12 @@ def compute_vcrm(camp: Campaign) -> dict:
 
     return {
         "campaign_id": camp.id, "campaign_title": camp.title,
-        # No 'T' separator, no seconds -- this is shown to a human as
-        # "when was this generated", not parsed back programmatically.
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "rows": rows,
     }
 
 
 # Export: print-ready HTML (same visual system as the test card's).
-
 def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
     h = _h
     reqs = [(c, d) for c, d in camp.requirements if (c or "").strip() or (d or "").strip()]
@@ -624,7 +461,7 @@ def _vcrm_table_html(vcrm: dict) -> str:
 
 
 def export_vcrm_csv(vcrm: dict) -> str:
-    """The VCRM as a Test Matrix: one row per requirement."""
+    # The VCRM as a Test Matrix: one row per requirement.
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Requirement", "Description", "Covering Tests", "Status", "Updated"])
@@ -651,7 +488,6 @@ def export_vcrm_print_html(vcrm: dict, host: str = "localhost") -> str:
 
 
 # Export: .docx (python-docx).
-
 _HEADER_FILL = "E7EEF5"
 _WARN_FILL = "F8D7D7"
 _NOTE_FILL = "E7EEF5"
@@ -818,7 +654,6 @@ def export_test_docx(card: "TestCard") -> bytes:
 
 
 # Test Card (procedure only) vs Test Report (as-run record).
-
 def procedure_only(card: TestCard) -> TestCard:
     """A copy with every run result cleared, so the card prints as a blank procedure."""
     d = card.to_dict()
@@ -852,13 +687,13 @@ def sr_head(camp: Campaign) -> str:
 
 
 def _sr_items(camp: Campaign):
-    """Yield (kind, payload) for each item that has something to show; a test with no saved .test file is skipped."""
+    # Yield (kind, payload) for each item that has something to show; a test with no saved .test file is skipped.
     items = (camp.campaign_report or {}).get("items", [])
     for it in sorted(items, key=lambda x: x.get("type") == "report"):   # Test Reports always follow the rest
         kind = it.get("type")
         if kind == "section":
             idx = it.get("idx")
-            if idx is not None:   # a live reference to the campaign's Sections
+            if idx is not None:   # Live reference to the campaign's Sections
                 secs = camp.sections or []
                 it = {"header": secs[idx][0], "text": secs[idx][1]} if isinstance(idx, int) and 0 <= idx < len(secs) else {}
             if (it.get("header") or "").strip() or (it.get("text") or "").strip():
@@ -1010,7 +845,7 @@ def csv_series(path: str, limit: int = 5000):
 
 
 def _looks_csv(path) -> bool:
-    """A .txt that is comma-separated with at least two plottable rows ("# ..." lines are ignored)."""
+    # A .txt that is comma-separated with at least two plottable rows ("# ..." lines are ignored).
     try:
         s = csv_series(path, 50) if path else None
         first = next(l for l in _read_text(path, 4096).splitlines() if l.strip() and not l.lstrip().startswith("#"))
@@ -1074,13 +909,13 @@ def _read_text(path: str, limit: int = 200_000) -> str:
 
 
 def _ticked(files: dict, card: TestCard, campaign_id: str, seq) -> list:
-    """Ticked names for a point, kept only if they really belong to it."""
+    # Ticked names for a point, kept only if they really belong to it.
     pat = re.compile(r"^" + re.escape(_point_prefix(campaign_id, card.id)) + "-" + str(seq) + r"(?:-[^/]*)?\.[A-Za-z0-9]+$")
     return [n for n in (files or {}).get(str(seq), []) if isinstance(n, str) and pat.match(n) and _cwd_file(n)]
 
 
 def _plotted(files: dict, seq) -> list:
-    """Names the user chose to plot; stored under files["plot"] as {seq: [names]}."""
+    # Names the user chose to plot; stored under files["plot"] as {seq: [names]}.
     p = (files or {}).get("plot")
     return p.get(str(seq), []) if isinstance(p, dict) else []
 
@@ -1100,7 +935,7 @@ def _point_file_html(name: str, plot: bool = False) -> str:
 
 
 def report_body(card: TestCard, campaign_id: str = "", files: dict = None) -> str:
-    """One Test Report as an HTML fragment (header through test points)."""
+    # One Test Report as an HTML fragment (header through test points).
     pts = []
     for p in card.points:
         signed = _h(p.initial)
@@ -1560,10 +1395,12 @@ function modulePanelHtml(i, p) {
   const none = names.length === 0
     ? `<div class="pt-cam-msg">No modules registered for this point. Add one in the campaign's Modules table.</div>` : "";
   return `
-    <label>Module</label>
-    <div class="send-row">
-      <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(st.name || "")}" placeholder="module name">
+    <div class="send-row mod-row">
+      <div><label>Module</label>
+      <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(st.name || "")}"></div>
       <datalist id="pt-modlist-${i}">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>
+      <div><label>Arguments</label>
+      <input data-modargs="${i}" value="${esc(st.args || "")}"></div>
       <button class="btn mini" data-modrun="${i}"${st.status === "running" ? " disabled" : ""}>run</button>
       <button class="btn mini break-btn" data-modbreak="${i}"${st.status === "running" ? "" : " disabled"}>break</button>
     </div>
@@ -1584,6 +1421,12 @@ function bindModulePanel(i) {
   if (inp) inp.addEventListener("input", () => {
     const st = moduleState.get(p) || {};
     st.name = inp.value;
+    moduleState.set(p, st);
+  });
+  const argsInp = root.querySelector("input[data-modargs]");
+  if (argsInp) argsInp.addEventListener("input", () => {
+    const st = moduleState.get(p) || {};
+    st.args = argsInp.value;
     moduleState.set(p, st);
   });
   const btn = root.querySelector("button[data-modrun]");
@@ -1629,7 +1472,7 @@ async function runModule(p) {
     const res = await fetch("/run_module", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({module: name, card: card.id, point: p.seq, campaign: pointCampaign() || "XX-000"}),
+      body: JSON.stringify({module: name, card: card.id, point: p.seq, campaign: pointCampaign() || "XX-000", args: st.args || ""}),
     });
     const r = await res.json();
     const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
@@ -3200,10 +3043,8 @@ def _safe_filename(stem: str, ext: str) -> str:
 
 
 
-# Optional integrations, each checked once at startup: jira_config.json
-# turns Jira tickets on; an executable `starfire-hw` (built from starfire.cpp)
-# turns Sample / Activate on -- without it they open the panel for manual
-# entry and say nothing was sent.
+# Optional integrations, each checked once at startup: jira_config.json turns Jira tickets on;
+# an executable `starfire-hw` (built from starfire.cpp) turns Sample / Activate on.
 JIRA_AVAILABLE = jira_ticket.load_config() is not None
 
 
@@ -3212,20 +3053,18 @@ def _program_dir() -> str:
 
 
 def _modules_dir() -> str:
-    # The dist/ folder: next to the built binary, or ./dist beside this
-    # script when run from source (where build.sh puts its output).
+    # The dist/ folder: next to the built binary, or ./dist beside this script when run from source (where starfi.sh puts its output).
     here = _program_dir()
     return here if getattr(sys, "frozen", False) else os.path.join(here, "dist")
 
 
 def _find_hardware_binary() -> str:
-    # Working directory first, then beside the program itself (and dist/ when
-    # run from source), so a binary run from anywhere still finds the one built next to it.
+    # Working directory first, then beside the program itself (and dist/ when run from source).
     for d in (os.getcwd(), _program_dir(), _modules_dir()):
         path = os.path.join(d, "starfire-hw")
         if os.path.isfile(path) and os.access(path, os.X_OK):
             return path
-    return os.path.join(os.getcwd(), "starfire-hw")   # not found; HARDWARE_AVAILABLE says so
+    return os.path.join(os.getcwd(), "starfire-hw")   # Not found
 
 
 _HW_PATH = _find_hardware_binary()
@@ -3292,14 +3131,32 @@ def _module_env(card_id, point_seq, campaign_id="") -> dict:
     return env
 
 
-def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: str = "") -> dict:
+_MODULE_ARGS_MAX = 4096
+
+
+def _parse_args(text) -> list:
+    """Split a command-line string the way a POSIX shell would (quotes, backslashes),
+    without running one. Raises ValueError on bad quoting, NUL or an oversized line."""
+    text = "" if text is None else str(text)
+    if len(text) > _MODULE_ARGS_MAX or "\0" in text:
+        raise ValueError("arguments too long or contain a NUL byte")
+    return shlex.split(text)
+
+
+def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: str = "", args="") -> dict:
     """Run one module from dist/ and wait for it. The name must be a bare
     filename that list_modules() reports -- never a path, so the browser can't
     point this at anything else. The module runs in the working directory
     (where .test files live) with STARFIRE_CAMPAIGN, STARFIRE_CARD, STARFIRE_POINT
-    and, if found, STARFIRE_HW (path to starfire-hw) in its environment."""
+    and, if found, STARFIRE_HW (path to starfire-hw) in its environment.
+    args is one command-line string, split into plain argv entries (no shell),
+    so it reaches a module in any language the same way."""
     if name not in list_modules():
         return {"status": "failed", "error": f"{name!r} is not a runnable file in dist/"}
+    try:
+        extra = _parse_args(args)
+    except ValueError as e:
+        return {"status": "failed", "error": f"bad arguments: {e}"}
     argv = [os.path.join(_modules_dir(), name)]
     interpreter = _INTERPRETERS.get(os.path.splitext(name)[1])
     if interpreter:
@@ -3307,6 +3164,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         if not found:
             return {"status": "failed", "error": f"{interpreter} not found on PATH (needed to run {name})"}
         argv.insert(0, found)
+    argv += extra
     key = (str(card_id), str(point_seq))
     started = time.monotonic()
     with _RUNS_LOCK:
@@ -3347,7 +3205,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     return result
 
 def break_module(card_id, point_seq, grace: float = 3.0) -> dict:
-    """SIGTERM the module running on this point (and its children); SIGKILL if it is still alive after `grace` s."""
+    # SIGTERM the module running on this point; SIGKILL if it is still alive after `grace` s.
     key = (str(card_id), str(point_seq))
     with _RUNS_LOCK:
         proc = _RUNS.get(key)
@@ -3427,8 +3285,7 @@ class _Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             self._send_json(200, {"files": list_point_files((qs.get("campaign") or [""])[0], (qs.get("card") or [""])[0])})
         elif path == "/list_files":
-            # Lists files in the working directory by extension -- lets a
-            # picker browse what's already on disk.
+            # Lists files in the working directory by extension.
             qs = parse_qs(parsed.query)
             ext = (qs.get("ext") or [""])[0]
             if not re.match(r"^\.[A-Za-z0-9]+$", ext or ""):
@@ -3480,7 +3337,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, {"saved": True, "filename": filename, "path": out_path})
 
     def _handle_capture_image(self, raw_body: bytes):
-        # Payload is just {"data": "data:image/jpeg;base64,..."}, not a card.
+        # Payload is {"data": "data:image/jpeg;base64,..."}, not a card.
         try:
             data_url = json.loads(raw_body)["data"]
         except (json.JSONDecodeError, KeyError, TypeError) as e:
@@ -3492,7 +3349,7 @@ class _Handler(BaseHTTPRequestHandler):
         except (ValueError, binascii.Error) as e:
             self._send_json(400, {"error": f"bad image data: {e}"})
             return
-        # Millisecond resolution so a quick burst of captures doesn't collide.
+        # Millisecond resolution to deconflict a quick burst of captures.
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         filename = f"{ts}.jpg"
         out_path = os.path.join(os.getcwd(), filename)
@@ -3521,13 +3378,12 @@ class _Handler(BaseHTTPRequestHandler):
                 payload.get("epic_key", ""), payload.get("issue_type") or None,
             )
         except Exception as e:
-            # A Jira-side failure shouldn't take the whole server down.
             result = {"success": False, "error": f"jira_ticket.py raised: {e}"}
         self._send_json(200, result)
 
     def _handle_hardware(self, raw_body: bytes):
         # {"port": "/dev/usbtmc0", "command": "MEAS:VOLT:DC?"}. starfire-hw
-        # answers with one JSON line. A missing binary is a clean "not available".
+        # answers with one JSON line. A missing binary is a "not available".
         if not HARDWARE_AVAILABLE:
             self._send_json(404, {"success": False, "error": "starfire-hw not available"})
             return
@@ -3542,7 +3398,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"success": False, "error": "port and command are both required"})
             return
         try:
-            # The binary enforces its own 5 s limit; this is the outer ceiling.
+            # The binary enforces its own 5 s limit; this is an outer ceiling.
             proc = subprocess.run([_HW_PATH, "send", port, command],
                                    capture_output=True, text=True, timeout=10)
         except subprocess.TimeoutExpired:
@@ -3563,7 +3419,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"success": False, "error": line.get("error", "unknown error")})
 
     def _local_json_payload(self, raw_body: bytes):
-        """For routes that run or write things: only accept a request a web page on
+        """For routes that run or write: only accept a request a web page on
         another site couldn't have sent, a JSON content type (which forces a CORS
         preflight this server never answers) and our own Host header (which stops
         DNS rebinding). Returns the payload dict, or None after sending the error."""
@@ -3587,7 +3443,8 @@ class _Handler(BaseHTTPRequestHandler):
         if payload is None:
             return
         self._send_json(200, run_module(str(payload.get("module") or ""), payload.get("card", ""),
-                                        payload.get("point", ""), payload.get("campaign", "")))
+                                        payload.get("point", ""), payload.get("campaign", ""),
+                                        payload.get("args", "")))
 
     def _handle_break_module(self, raw_body: bytes):
         payload = self._local_json_payload(raw_body)
@@ -3644,14 +3501,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _route_json(self, path: str, data) -> None:
         host = self.headers.get("Host", "localhost")
         # Test-card routes
-        if path in ("/export/csv", "/export/print", "/export/tex", "/export/test/docx", "/save"):
+        if path in ("/export/csv", "/export/print", "/export/test/docx", "/save"):
             card = TestCard.from_dict(data)
             if path == "/export/csv":
                 self._send(200, "text/csv", export_csv(card).encode())
             elif path == "/export/print":
                 self._send(200, "text/html", export_print_html(procedure_only(card), host).encode())
-            elif path == "/export/tex":
-                self._send(200, "text/x-tex", export_tex(card).encode())
             elif path == "/export/test/docx":
                 self._send(200, _DOCX_MIME, export_test_docx(procedure_only(card)))
             else:
@@ -3704,18 +3559,24 @@ def main() -> int:
     args = p.parse_args()
 
     if hasattr(os, "geteuid") and os.geteuid() == 0:
-        print("WARNING: running as root. sudo is never needed to run this --")
+        print("WARNING: Running as root. sudo is not needed to run this --")
         print("         only to clear out a root-owned dist/ from an earlier")
         print("         build, if that ever comes up. Run it as your normal")
         print("         user instead: root has no desktop session of its own,")
-        print("         so the browser almost certainly won't open correctly,")
-        print("         and any files this writes would end up root-owned too.\n")
+        print("         so the browser likely will fail to open correctly,")
+        print("         and any files this writes would end up root-owned as well.\n")
 
     url = f"http://localhost:{args.port}"
+    try:
+        server = ThreadingHTTPServer(("localhost", args.port), _Handler)
+    except OSError as e:
+        print(f"ERROR: can't listen on port {args.port}: {e.strerror}.")
+        if e.errno == errno.EADDRINUSE:
+            print(f"       Starfire (or something else) is already running there: open {url},")
+            print("       stop it first, or use --port to pick another.")
+        return 1
     print(f"Serving GUI at {url}")
     print("Press Ctrl+C to stop\n")
-
-    server = ThreadingHTTPServer(("localhost", args.port), _Handler)
     if not args.no_browser:
         threading.Timer(0.4, lambda: webbrowser.open(url)).start()
 
