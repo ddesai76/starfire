@@ -2,7 +2,7 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-11
+# UPDATED:        2026-10-16
 # VERSION:        0.2.0
 #
 
@@ -33,6 +33,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from dataclasses import dataclass, field, fields, asdict
 from datetime import date, datetime
@@ -44,9 +46,6 @@ from docx.shared import Inches, Pt, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-
-# Local module; builds into the binary
-import jira_ticket
 
 
 # Test card data model
@@ -65,6 +64,7 @@ class TestPoint:
     locked: bool = False
     flagged: bool = False
     images: list = field(default_factory=list)
+    files: list = field(default_factory=list)      # uploaded with the + button
     usb_port: str = ""
     measure_command: str = ""
     measurements: list = field(default_factory=list)
@@ -106,6 +106,7 @@ class TestCard:
     notes: list = field(default_factory=list)       # list[[text, locked]]
     warnings: list = field(default_factory=list)     # list[[text, locked]]
     locked: bool = False
+    files_migrated: bool = False   # set once files already named for a point were attached
 
     @staticmethod
     def from_dict(d: dict) -> "TestCard":
@@ -255,7 +256,6 @@ class CampaignTestRow:
     seq: int
     test_id: str = ""
     title: str = ""
-    status: str = ""   # "", COMPLETE, IN_PROGRESS, TO_DO, BLOCKED
     author: str = ""
     requirements: str = ""
 
@@ -280,9 +280,7 @@ class Campaign:
     project: str = ""
     test_lead: str = ""
     quality_assurance: str = ""
-    system: str = ""
-    subsystem: str = ""
-    requirements: list = field(default_factory=list)   # list[(code, description)]
+    requirements: list = field(default_factory=list)   # [code, description, source, method]
     # Modules a test point's Activate button can run.
     modules: list = field(default_factory=list)         # list[CampaignModule]
     tests: list = field(default_factory=list)           # list[CampaignTestRow] -- "Test Series"
@@ -295,21 +293,111 @@ class Campaign:
 
     @staticmethod
     def from_dict(d: dict) -> "Campaign":
-        tests = [CampaignTestRow(**t) for t in d.get("tests", [])]
-        ancillary_tests = [CampaignTestRow(**t) for t in d.get("ancillary_tests", [])]
+        row_known = {f.name for f in fields(CampaignTestRow)}   # drops the retired "status" key
+        tests = [CampaignTestRow(**{k: v for k, v in t.items() if k in row_known}) for t in d.get("tests", [])]
+        ancillary_tests = [CampaignTestRow(**{k: v for k, v in t.items() if k in row_known})
+                           for t in d.get("ancillary_tests", [])]
         known = {f.name for f in fields(CampaignModule)}
         modules = [CampaignModule(**{k: v for k, v in m.items() if k in known}) for m in d.get("modules", [])]
-        base = {k: v for k, v in d.items() if k not in ("tests", "ancillary_tests", "modules")}
+        base = {k: v for k, v in d.items() if k not in ("tests", "ancillary_tests", "modules", "system", "subsystem")}
         return Campaign(tests=tests, ancillary_tests=ancillary_tests, modules=modules, **base)
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-STATUS_LABELS = {
-    "COMPLETE": "COMPLETE", "IN_PROGRESS": "IN PROGRESS",
-    "TO_DO": "TO DO", "BLOCKED": "BLOCKED",
-}
+STATUS_LABELS = {"TO_DO": "TO DO", "IN_PROGRESS": "IN PROGRESS", "COMPLETE": "COMPLETE"}
+
+# A point's sign-off quality, worst to best. RFI (ready for issue) is above PASS.
+RESULTS = ["FAIL", "CAUTION", "PASS", "RFI"]
+
+
+def _quality(p) -> str:
+    return (p.quality or "").upper()
+
+
+def _is_run(p) -> bool:
+    return bool((p.initial or "").strip()) and _quality(p) in RESULTS
+
+
+def card_state(card: TestCard) -> dict:
+    """Progress and worst result of a card, from its points' initials and quality.
+    COMPLETE needs every point run and the last point RFI."""
+    pts = sorted(card.points, key=lambda p: p.seq)
+    run = [p for p in pts if _is_run(p)]
+    if not run:
+        progress = "TO_DO"
+    elif len(run) == len(pts) and _quality(pts[-1]) == "RFI":
+        progress = "COMPLETE"
+    else:
+        progress = "IN_PROGRESS"
+    return {"progress": progress, "result": min((_quality(p) for p in run), key=RESULTS.index, default="")}
+
+
+def status_label(state: dict) -> str:
+    label = STATUS_LABELS[state["progress"]]
+    return f"{label} ({state['result']})" if state["result"] else label
+
+
+def card_warnings(card: TestCard) -> list:
+    """Sign-off problems on one card, as short phrases."""
+    pts = sorted(card.points, key=lambda p: p.seq)
+    out = []
+    for p in pts:
+        initialed, q = bool((p.initial or "").strip()), _quality(p)
+        if q in RESULTS and not initialed:
+            out.append(f"point {p.seq} is {q} but has no initials")
+        elif initialed and q not in RESULTS:
+            out.append(f"point {p.seq} is initialed but has no PASS, CAUTION, FAIL or RFI")
+        elif q in ("CAUTION", "FAIL"):
+            out.append(f"point {p.seq} is {q}")
+    if pts and all(_is_run(p) for p in pts) and _quality(pts[-1]) != "RFI":
+        out.append("all points are run but the last is not RFI")
+    elif pts and _is_run(pts[-1]) and _quality(pts[-1]) == "RFI" and not all(_is_run(p) for p in pts):
+        out.append("the last point is RFI but earlier points are not run")
+    return out
+
+
+def _read_card(test_id: str):
+    """The TestCard in the working directory for a Test ID, or None if missing or unreadable."""
+    try:
+        with open(os.path.join(os.getcwd(), test_filename(test_id)), "r", encoding="utf-8") as f:
+            return TestCard.from_dict(json.loads(f.read()))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def campaign_statuses(camp: Campaign) -> dict:
+    """Test ID -> computed status label for every row of both tests tables ("" if no .test file)."""
+    out = {}
+    for t in list(camp.tests) + list(camp.ancillary_tests):
+        tid = (t.test_id or "").strip()
+        if tid and tid not in out:
+            card = _read_card(tid)
+            out[tid] = status_label(card_state(card)) if card else ""
+    return out
+
+
+def next_test_id(camp: Campaign) -> str:
+    """The next TC-nnn not used by a test row of the campaign or by a .test file here."""
+    used = {(t.test_id or "").strip() for t in list(camp.tests) + list(camp.ancillary_tests)}
+    n = 1
+    while f"TC-{n:03d}" in used or os.path.exists(os.path.join(os.getcwd(), test_filename(f"TC-{n:03d}"))):
+        n += 1
+    return f"TC-{n:03d}"
+
+
+def create_test(camp: Campaign, codes: list) -> dict:
+    """Write an empty, untitled card that verifies the given requirements; returns its row fields."""
+    known = {c for c, _, _, _ in requirement_rows(camp)}
+    codes = [c for c in dict.fromkeys(str(c).strip() for c in codes) if c in known]
+    if not codes:
+        raise ValueError("no known requirement codes given")
+    card = TestCard(id=next_test_id(camp), title="", author=camp.test_lead or camp.author, project=camp.project,
+                    quality_assurance=camp.quality_assurance, requirements=", ".join(codes))
+    with open(os.path.join(os.getcwd(), test_filename(card.id)), "w", encoding="utf-8") as f:
+        json.dump(card.to_dict(), f, indent=2)
+    return {"id": card.id, "title": "", "author": card.author, "requirements": card.requirements}
 
 
 def test_filename(test_id: str) -> str:
@@ -321,66 +409,82 @@ def vcrm_filename(campaign_id: str) -> str:
     return _safe_filename(campaign_id, ".vcrm")
 
 
+METHODS = ["T", "A", "D", "I"]   # Test, Analysis, Demonstration, Inspection
+
+
+def requirement_rows(camp: Campaign) -> list:
+    """(code, source, description, method) per requirement. Rows are stored as
+    [code, description, source, method]; older files have only the first two."""
+    out = []
+    for r in camp.requirements:
+        r = list(r) + [""] * (4 - len(r))
+        out.append(((r[0] or "").strip(), r[2] or "", r[1] or "", r[3] or "T"))
+    return out
+
+
 def compute_vcrm(camp: Campaign) -> dict:
     """Verification Cross-Reference Matrix: requirement -> which Test
-    Series tests verify it -> rolled-up coverage. Read-only and computed
-    fresh each time from data that already exists elsewhere (the
-    campaign's Requirements table, and each referenced test's own
-    `requirements` field). Ancillary Tests are excluded.
+    Series tests verify it, with each test's computed status. One row per
+    requirement and verifying test. Read-only and computed fresh each time
+    from the campaign's Requirements table and each referenced test's own
+    `requirements` field and point sign-offs. Ancillary Tests are excluded.
     """
-    test_cache: dict = {}
+    reqs = requirement_rows(camp)
+    codes = [code for code, _, _, _ in reqs]
+    cards: dict = {}        # test_id -> (card, state), or None if there is no readable .test file
+    warnings = []
+    for t in camp.tests:
+        tid = (t.test_id or "").strip()
+        if not tid or tid in cards:
+            continue
+        card = _read_card(tid)
+        cards[tid] = (card, card_state(card)) if card else None
+        if not card:
+            warnings.append(f"{tid}: no {test_filename(tid)} file")
+            continue
+        tokens = [tok.strip() for tok in (card.requirements or "").split(",") if tok.strip()]
+        if not tokens:
+            warnings.append(f"{tid}: lists no requirements")
+        warnings += [f"{tid}: {tok} is not in the Requirements table" for tok in tokens if tok not in codes]
+        warnings += [f"{tid}: {g}" for g in card_warnings(card)]
 
-    def get_test(test_id: str):
-        if test_id not in test_cache:
-            path = os.path.join(os.getcwd(), test_filename(test_id))
-            card = None
-            if os.path.isfile(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        card = TestCard.from_dict(json.loads(f.read()))
-                except (OSError, json.JSONDecodeError, TypeError):
-                    card = None
-            test_cache[test_id] = card
-        return test_cache[test_id]
-
+    updated = datetime.now().strftime("%Y-%m-%d %H:%M")
     rows = []
-    for req_code, req_desc in camp.requirements:
-        req_code = (req_code or "").strip()
+    for req_code, source, req_desc, method in reqs:
         if not req_code:
             continue
-        covering = []
+        head = {"requirement": req_code, "source": source, "description": req_desc, "method": method}
+        found = False
         for t in camp.tests:
-            card = get_test(t.test_id)
-            if not card:
+            entry = cards.get((t.test_id or "").strip())
+            if not entry:
                 continue
-            tokens = [tok.strip() for tok in (card.requirements or "").split(",")]
-            if req_code in tokens:
-                covering.append({"test_id": t.test_id, "title": t.title, "status": t.status})
-        if not covering:
-            coverage = "Not Covered"
-        elif all(c["status"] == "COMPLETE" for c in covering):
-            coverage = "Covered"
-        elif any(c["status"] == "COMPLETE" for c in covering):
-            coverage = "Partial"
-        else:
-            coverage = "Planned"
-        rows.append({"requirement": req_code, "description": req_desc,
-                      "covering_tests": covering, "coverage": coverage})
+            card, state = entry
+            if req_code in [tok.strip() for tok in (card.requirements or "").split(",")]:
+                found = True
+                run = any(_is_run(p) for p in card.points)
+                rows.append({**head, "event": f"{t.test_id} {card.title or t.title}".strip(),
+                             "report": report_id(card.id) if run else "NONE", "status": status_label(state),
+                             "updated": updated})
+        if not found:
+            rows.append({**head, "event": "NONE", "report": "NONE", "status": "--", "updated": updated})
+            warnings.append(f"{req_code}: no test covers it")
 
     return {
         "campaign_id": camp.id, "campaign_title": camp.title,
-        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "rows": rows,
+        "generated": updated,
+        "rows": rows, "warnings": warnings,
     }
 
 
 # Export: print-ready HTML (same visual system as the test card's).
 def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
     h = _h
-    reqs = [(c, d) for c, d in camp.requirements if (c or "").strip() or (d or "").strip()]
-    req_rows = "\n".join(f"<tr><td>{h(c)}</td><td>{h(d)}</td></tr>" for c, d in reqs)
+    reqs = [r for r in requirement_rows(camp) if r[0] or r[2]]
+    req_rows = "\n".join(f"<tr><td>{h(c)}</td><td>{h(src)}</td><td>{h(d)}</td><td>{h(m)}</td></tr>"
+                         for c, src, d, m in reqs)
     req_section = "" if not reqs else f"""<h2>Requirements</h2>
-<table><tr><th style="width:20%">Requirement</th><th>Description</th></tr>
+<table><tr><th style="width:20%">Requirement</th><th style="width:16%">Source</th><th>Description</th><th style="width:8%">Method</th></tr>
 {req_rows}
 </table>
 """
@@ -392,14 +496,15 @@ def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
 {mod_rows}
 </table>
 """
+    statuses = campaign_statuses(camp)
     test_rows = "\n".join(
         f"<tr><td>{t.seq}</td><td>{h(t.test_id)}</td><td>{h(t.title)}</td><td>{h(t.author)}</td>"
-        f"<td>{h(t.requirements)}</td><td>{h(STATUS_LABELS.get(t.status, t.status))}</td></tr>"
+        f"<td>{h(t.requirements)}</td><td>{h(statuses.get((t.test_id or '').strip(), ''))}</td></tr>"
         for t in camp.tests
     )
     anc_rows = "\n".join(
         f"<tr><td>{t.seq}</td><td>{h(t.test_id)}</td><td>{h(t.title)}</td><td>{h(t.author)}</td>"
-        f"<td>{h(t.requirements)}</td><td>{h(STATUS_LABELS.get(t.status, t.status))}</td></tr>"
+        f"<td>{h(t.requirements)}</td><td>{h(statuses.get((t.test_id or '').strip(), ''))}</td></tr>"
         for t in camp.ancillary_tests
     )
     anc_section = "" if not camp.ancillary_tests else f"""<h2>Ancillary Tests</h2>
@@ -425,7 +530,6 @@ def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
   <span><b>ID:</b> {h(camp.id)}</span>
   <span><b>Rev:</b> {h(camp.revision)}</span>
   <span><b>Project:</b> {h(camp.project)}</span>
-  <span><b>System/Subsystem:</b> {h(camp.system)} / {h(camp.subsystem)}</span>
   <span><b>Author:</b> {h(camp.author)}</span>
 </div>
 <div class="meta">
@@ -443,30 +547,25 @@ def export_campaign_print_html(camp: Campaign, host: str = "localhost") -> str:
 </body></html>"""
 
 
-def _covering_str(row: dict) -> str:
-    if not row["covering_tests"]:
-        return "--"
-    return ", ".join(f"{c['test_id']} ({STATUS_LABELS.get(c['status'], c['status'] or '[None]')})"
-                     for c in row["covering_tests"])
+VCRM_COLUMNS = [("Requirement", "requirement"), ("Source", "source"), ("Description", "description"),
+                ("Method", "method"), ("Verification Event", "event"), ("Report", "report"), ("Status", "status"),
+                ("Updated", "updated")]
 
 
 def _vcrm_table_html(vcrm: dict) -> str:
-    rows = "\n".join(
-        f"<tr><td>{_h(r['requirement'])}</td><td>{_h(r['description'])}</td>"
-        f"<td>{_h(_covering_str(r))}</td><td>{_h(r['coverage'])}</td><td>{_h(vcrm['generated'])}</td></tr>"
-        for r in vcrm["rows"]
-    )
-    return ('<table><tr><th style="width:14%">Requirement</th><th>Description</th><th style="width:24%">Covering Tests</th>'
-            '<th style="width:10%">Coverage</th><th style="width:12%">Updated</th></tr>\n' + rows + "\n</table>")
+    head = "".join(f"<th>{title}</th>" for title, _ in VCRM_COLUMNS)
+    rows = "\n".join("<tr>" + "".join(f"<td>{_h(r.get(key, ''))}</td>" for _, key in VCRM_COLUMNS) + "</tr>"
+                     for r in vcrm["rows"])
+    return f"<table><tr>{head}</tr>\n{rows}\n</table>"
 
 
 def export_vcrm_csv(vcrm: dict) -> str:
-    # The VCRM as a Test Matrix: one row per requirement.
+    # The VCRM as a Test Matrix: one row per requirement and verification event.
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Requirement", "Description", "Covering Tests", "Status", "Updated"])
+    w.writerow([title for title, _ in VCRM_COLUMNS])
     for r in vcrm["rows"]:
-        w.writerow([r["requirement"], r["description"], _covering_str(r), r["coverage"], vcrm["generated"]])
+        w.writerow([r.get(key, "") for _, key in VCRM_COLUMNS])
     return buf.getvalue()
 
 
@@ -540,16 +639,15 @@ def export_campaign_docx(camp: Campaign) -> bytes:
     doc.add_heading(camp.title, level=0)
     meta = doc.add_paragraph()
     meta.add_run(
-        f"ID: {camp.id}    Rev: {camp.revision}    Project: {camp.project}    "
-        f"System/Subsystem: {camp.system} / {camp.subsystem}    Author: {camp.author}\n"
+        f"ID: {camp.id}    Rev: {camp.revision}    Project: {camp.project}    Author: {camp.author}\n"
         f"Test Lead: {camp.test_lead}    Quality Assurance: {camp.quality_assurance}    "
         f"Date: {camp.date}"
     ).font.size = Pt(9.5)
 
-    reqs = [(c, d) for c, d in camp.requirements if (c or "").strip() or (d or "").strip()]
+    reqs = [r for r in requirement_rows(camp) if r[0] or r[2]]
     if reqs:
         doc.add_heading("Requirements", level=1)
-        _add_table(doc, ["Requirement", "Description"], reqs)
+        _add_table(doc, ["Requirement", "Source", "Description", "Method"], reqs)
 
     mods = [m for m in camp.modules if (m.module or "").strip()]
     if mods:
@@ -557,10 +655,11 @@ def export_campaign_docx(camp: Campaign) -> bytes:
         _add_table(doc, ["Module", "Description", "Scope"],
                    [(m.module, m.description, m.scope or "any") for m in mods])
 
+    statuses = campaign_statuses(camp)
     doc.add_heading("Test Series", level=1)
     _add_table(
         doc, ["#", "Test ID", "Title", "Author", "Requirements", "Status"],
-        [(t.seq, t.test_id, t.title, t.author, t.requirements, STATUS_LABELS.get(t.status, t.status))
+        [(t.seq, t.test_id, t.title, t.author, t.requirements, statuses.get((t.test_id or "").strip(), ""))
          for t in camp.tests],
     )
 
@@ -568,7 +667,7 @@ def export_campaign_docx(camp: Campaign) -> bytes:
         doc.add_heading("Ancillary Tests", level=1)
         _add_table(
             doc, ["#", "Test ID", "Title", "Author", "Requirements", "Status"],
-            [(t.seq, t.test_id, t.title, t.author, t.requirements, STATUS_LABELS.get(t.status, t.status))
+            [(t.seq, t.test_id, t.title, t.author, t.requirements, statuses.get((t.test_id or "").strip(), ""))
              for t in camp.ancillary_tests],
         )
 
@@ -585,11 +684,8 @@ def export_campaign_docx(camp: Campaign) -> bytes:
 
 
 def _vcrm_docx_table(doc, vcrm: dict) -> None:
-    _add_table(
-        doc, ["Requirement", "Description", "Covering Tests", "Coverage", "Updated"],
-        [(r["requirement"], r["description"], _covering_str(r), r["coverage"], vcrm["generated"])
-         for r in vcrm["rows"]],
-    )
+    _add_table(doc, [title for title, _ in VCRM_COLUMNS],
+               [[r.get(key, "") for _, key in VCRM_COLUMNS] for r in vcrm["rows"]])
 
 
 def export_vcrm_docx(vcrm: dict) -> bytes:
@@ -661,7 +757,7 @@ def procedure_only(card: TestCard) -> TestCard:
     for p in d["points"]:
         for k in ("observed", "responsible_party", "date", "time", "initial", "quality"):
             p[k] = ""
-        p["measurements"], p["images"] = [], []
+        p["measurements"], p["images"], p["files"] = [], [], []
     return TestCard.from_dict(d)
 
 
@@ -723,7 +819,6 @@ def export_campaign_report_html(camp: Campaign, host: str = "localhost", preview
 <div class="meta">
   <span><b>Campaign:</b> {_h(camp.id)}</span>
   <span><b>Project:</b> {_h(camp.project)}</span>
-  <span><b>System/Subsystem:</b> {_h(camp.system)} / {_h(camp.subsystem)}</span>
 </div>
 <div class="meta">
   <span><b>Test Lead:</b> {_h(camp.test_lead)}</span>
@@ -760,7 +855,7 @@ def export_campaign_report_docx(camp: Campaign) -> bytes:
     _add_field(foot, "NUMPAGES")
     doc.add_heading(sr_head(camp), level=0)
     doc.add_paragraph().add_run(
-        f"Campaign: {camp.id}    Project: {camp.project}    System/Subsystem: {camp.system} / {camp.subsystem}\n"
+        f"Campaign: {camp.id}    Project: {camp.project}\n"
         f"Test Lead: {camp.test_lead}    Quality Assurance: {camp.quality_assurance}    Date: {camp.date}"
     ).font.size = Pt(9.5)
     for kind, v in _sr_items(camp):
@@ -795,11 +890,28 @@ def _point_prefix(campaign_id: str, card_id: str) -> str:
     return part(campaign_id, "XX-000") + "-" + part(card_id, "TC")
 
 
-def list_point_files(campaign_id: str, card_id: str) -> dict:
-    """{seq: [{"name", "kind"}]} for files in the working folder named
-    <campaign>-<card>-<point>[-anything].<ext>."""
-    pat = re.compile(r"^" + re.escape(_point_prefix(campaign_id, card_id)) + r"-(\d+)(?:-[^/]*)?\.[A-Za-z0-9]+$")
+def _own_file(campaign_id: str, card_id: str, name) -> bool:
+    # A bare name of an existing file starting <campaign>-<card>-.
+    return (isinstance(name, str) and name == os.path.basename(name)
+            and name.startswith(_point_prefix(campaign_id, card_id) + "-") and os.path.isfile(os.path.join(os.getcwd(), name)))
+
+
+def _point_file_pattern(campaign_id: str, card_id: str):
+    return re.compile(r"^" + re.escape(_point_prefix(campaign_id, card_id)) + r"-(\d+)(?:-[^/]*)?\.[A-Za-z0-9]+$")
+
+
+def list_point_files(campaign_id: str, card_id: str, attached: dict = None) -> dict:
+    """{seq: [{"name", "kind"}]}. With `attached` ({seq: [names]}, a point's own list) it
+    returns those that are files of this card. Without it, every file in the working folder
+    named <campaign>-<card>-<point>[-anything].<ext>, to attach files that predate the list."""
     out = {}
+    if attached is not None:
+        for seq, names in attached.items():
+            for n in names if isinstance(names, list) else []:
+                if _own_file(campaign_id, card_id, n):
+                    out.setdefault(str(seq), []).append({"name": n, "kind": _file_kind(n)})
+        return out
+    pat = _point_file_pattern(campaign_id, card_id)
     try:
         names = sorted(os.listdir(os.getcwd()))
     except OSError:
@@ -809,6 +921,35 @@ def list_point_files(campaign_id: str, card_id: str) -> dict:
         if m and os.path.isfile(n):
             out.setdefault(m.group(1), []).append({"name": n, "kind": _file_kind(n)})
     return out
+
+
+_CARD_FILE_MAX = 25_000_000   # bytes
+
+
+def add_card_file(campaign_id: str, card_id: str, point, name: str, data: bytes) -> dict:
+    """Save an uploaded file as <campaign>-<card>-<point>-<name> (a name already starting
+    <campaign>-<card>- is kept); never replaces an existing file with different contents."""
+    prefix = _point_prefix(campaign_id, card_id) + "-"
+    seq = str(point)
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(str(name or "")).strip()).lstrip(".")
+    target = base if base.startswith(prefix) else f"{prefix}{seq}-{base}"
+    if not seq.isdigit() or not base or len(target) > 200:
+        return {"saved": False, "error": "bad file name"}
+    if len(data) > _CARD_FILE_MAX:
+        return {"saved": False, "error": f"file is over {_CARD_FILE_MAX // 1_000_000} MB"}
+    path = os.path.join(os.getcwd(), target)
+    try:
+        with open(path, "xb") as f:
+            f.write(data)
+    except FileExistsError:
+        # Picking a file already in the folder (same name, same bytes) just attaches it.
+        with open(path, "rb") as f:
+            if f.read(_CARD_FILE_MAX + 1) == data:
+                return {"saved": True, "filename": target}
+        return {"saved": False, "error": f"{target} already exists with different contents"}
+    except OSError as e:
+        return {"saved": False, "error": str(e)}
+    return {"saved": True, "filename": target}
 
 
 def _num(s):
@@ -909,9 +1050,9 @@ def _read_text(path: str, limit: int = 200_000) -> str:
 
 
 def _ticked(files: dict, card: TestCard, campaign_id: str, seq) -> list:
-    # Ticked names for a point, kept only if they really belong to it.
-    pat = re.compile(r"^" + re.escape(_point_prefix(campaign_id, card.id)) + "-" + str(seq) + r"(?:-[^/]*)?\.[A-Za-z0-9]+$")
-    return [n for n in (files or {}).get(str(seq), []) if isinstance(n, str) and pat.match(n) and _cwd_file(n)]
+    # Ticked names for a point, kept only if the point still has them attached.
+    own = next((p.files for p in card.points if str(p.seq) == str(seq)), [])
+    return [n for n in (files or {}).get(str(seq), []) if n in own and _own_file(campaign_id, card.id, n)]
 
 
 def _plotted(files: dict, seq) -> list:
@@ -1058,1977 +1199,9 @@ def export_report_docx(card: TestCard, campaign_id: str = "", files: dict = None
 
 # Browser UI
 
-_TEST_HTML = """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>Starfire -- test card</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/starfire.css">
-</head>
-<body class="editor-doc">
-<div id="panels"><div class="panel active split">
-<div class="report-side">
-<div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
-<div class="side-btns" id="exportRow">
-  <button class="btn" id="loadJsonBtn">import test file</button>
-  <input type="file" id="loadJsonFile" accept=".test,.json,application/json" style="display:none">
-  <button class="btn" id="saveUnlockedBtn">export unlocked test file (.test)</button>
-  <button class="btn" id="saveLockedBtn">export locked test file (.test)</button>
-  <button class="btn" id="exportCsvBtn">export .csv</button>
-  <button class="btn" id="exportPrintBtn">generate card</button>
-  <button class="btn" id="exportDocxBtn">export .docx</button>
-  <button class="btn" id="buildReportBtn" style="display:none">build test report</button>
-</div>
-<div id="saveStatus" class="hint"></div>
-</div>
-<div class="side-main"><div class="side-inner">
 
-<h2>Card metadata</h2>
-<div class="meta">
-  <div class="field"><label>ID</label><input id="m-id"></div>
-  <div class="field"><label>Title</label><input id="m-title"></div>
-  <div class="field"><label>Revision</label><input id="m-revision"></div>
-  <div class="field"><label>Project</label><input id="m-project"></div>
-  <div class="field"><label>Author</label><input id="m-author"></div>
-  <div class="field"><label>Test Conductor</label><input id="m-test_conductor"></div>
-  <div class="field"><label>Quality Assurance</label><input id="m-quality_assurance"></div>
-  <div class="field"><label>Date</label><input id="m-date"></div>
-  <div class="field"><label>System / Subsystem</label><input id="m-system"></div>
-  <div class="field"><label>Test type</label><input id="m-test_type"></div>
-  <div class="field"><label>Article / S/N</label><input id="m-article"></div>
-  <div class="field"><label>Requirement(s)</label><input id="m-requirements"></div>
-</div>
 
-<h2 class="no-rule">Test points</h2>
-<div id="pointsList"></div>
-<div class="row"><button class="btn btn-plus" id="addPointBtn" title="add point">+</button></div>
 
-<h2 class="no-rule">Nomenclature</h2>
-<table class="nomtable" id="nomTable">
-  <tr><th>Symbol</th><th>Definition</th><th>Units</th><th class="blank-th" style="width:60px"></th></tr>
-</table>
-<div class="row"><button class="btn btn-plus" id="addNomBtn" title="add symbol">+</button></div>
-
-<h2 class="no-rule">References</h2>
-<table class="nomtable" id="refTable">
-  <tr><th>Reference</th><th>Description</th><th class="blank-th" style="width:60px"></th></tr>
-</table>
-<div class="row"><button class="btn btn-plus" id="addRefBtn" title="add reference">+</button></div>
-
-
-<h2 class="no-rule">Warnings</h2>
-<div id="warningsList"></div>
-<div class="row"><button class="btn btn-plus" id="addWarningBtn" title="add warning">+</button></div>
-
-<h2 class="no-rule">Notes</h2>
-<div id="notesList"></div>
-<div class="row"><button class="btn btn-plus" id="addNoteBtn" title="add note">+</button></div>
-
-</div></div>
-</div></div>
-
-<script>
-// True only if jira_config.json was found in the working directory at
-// startup -- see jira_ticket.py's own docstring.
-const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
-
-// True only if the starfire-hw binary was found -- the Measure
-// panel opens either way, this just controls whether Sample/Activate send anything.
-const HARDWARE_AVAILABLE = __HARDWARE_AVAILABLE__;
-
-// Set by the campaign page right after this iframe loads (openTestTab());
-// `var` (not `let`) so that external write reaches this binding.
-var starfireJiraEpicKey = "";
-
-let card = {
-  id: "TC-001", title: "Untitled Test Card", revision: "A", author: "",
-  date: new Date().toISOString().slice(0,10), project: "", test_conductor: "",
-  quality_assurance: "", system: "", subsystem: "", test_type: "", article: "", requirements: "",
-  points: [], nomenclature: [], references: [], notes: [], warnings: [], locked: false
-};
-
-const metaFields = ["id","title","revision","author","date","project","test_conductor","quality_assurance","test_type","article","requirements"];
-const ALWAYS_EDITABLE_META = new Set(["test_conductor", "quality_assurance", "date", "article"]);
-function bindMeta() {
-  metaFields.forEach(f => {
-    const el = document.getElementById("m-" + f);
-    el.value = card[f] ?? "";
-    el.disabled = !!card.locked && !ALWAYS_EDITABLE_META.has(f);
-    el.addEventListener("input", () => { card[f] = el.value; });
-  });
-  const sysEl = document.getElementById("m-system");
-  sysEl.value = [card.system, card.subsystem].filter(Boolean).join(" / ");
-  sysEl.disabled = !!card.locked;
-  sysEl.addEventListener("input", () => {
-    const parts = sysEl.value.split("/").map(s => s.trim());
-    card.system = parts[0] || ""; card.subsystem = parts[1] || "";
-  });
-}
-
-function nextSeq() {
-  const max = card.points.reduce((m, p) => Math.max(m, +p.seq || 0), 0);
-  return Math.floor(max / 10) * 10 + 10;
-}
-
-// Google Material Symbols, embedded inline (not a file/CDN) so they work
-// fully offline; fill="currentColor" picks up each button's own hover color.
-const ICON_FLAG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-680h360l16 80h224v400H520l-16-80H280v280h-80Zm300-440Zm86 160h134v-240H510l-16-80H280v240h290l16 80Z"/></svg>';
-const ICON_PHOTO_CAMERA = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-260q75 0 127.5-52.5T660-440q0-75-52.5-127.5T480-620q-75 0-127.5 52.5T300-440q0 75 52.5 127.5T480-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29ZM160-120q-33 0-56.5-23.5T80-200v-480q0-33 23.5-56.5T160-760h126l74-80h240l74 80h126q33 0 56.5 23.5T880-680v480q0 33-23.5 56.5T800-120H160Zm0-80h640v-480H638l-73-80H395l-73 80H160v480Zm320-240Z"/></svg>';
-const ICON_ADD_A_PHOTO = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-440ZM120-120q-33 0-56.5-23.5T40-200v-480q0-33 23.5-56.5T120-760h126l74-80h240v80H355l-73 80H120v480h640v-360h80v360q0 33-23.5 56.5T760-120H120Zm640-560v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80ZM440-260q75 0 127.5-52.5T620-440q0-75-52.5-127.5T440-620q-75 0-127.5 52.5T260-440q0 75 52.5 127.5T440-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29Z"/></svg>';
-const ICON_SPEED = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-316.5q38-.5 56-27.5l224-336-336 224q-27 18-28.5 55t22.5 61q24 24 62 23.5Zm0-483.5q59 0 113.5 16.5T696-734l-76 48q-33-17-68.5-25.5T480-720q-133 0-226.5 93.5T160-400q0 42 11.5 83t32.5 77h552q23-38 33.5-79t10.5-85q0-36-8.5-70T766-540l48-76q30 47 47.5 100T880-406q1 57-13 109t-41 99q-11 18-30 28t-40 10H204q-21 0-40-10t-30-28q-26-45-40-95.5T80-400q0-83 31.5-155.5t86-127Q252-737 325-768.5T480-800Zm7 313Z"/></svg>';
-const ICON_DOWNLOAD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-320 280-520l56-58 104 104v-326h80v326l104-104 56 58-200 200ZM240-160q-33 0-56.5-23.5T160-240v-120h80v120h480v-120h80v120q0 33-23.5 56.5T720-160H240Z"/></svg>';
-const ICON_BOLT = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m422-232 207-248H469l29-227-185 267h139l-30 208ZM320-80l40-280H160l360-520h80l-40 320h240L400-80h-80Zm151-390Z"/></svg>';
-// Crosshair: "sample this reading". Children set fill="none" explicitly, since
-// .btn-icon svg's CSS fill would otherwise paint them solid.
-const ICON_BOOKMARK_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-640q0-33 23.5-56.5T280-840h240v80H280v518l200-86 200 86v-278h80v400L480-240 200-120Zm80-640h240-240Zm400 160v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80Z"/></svg>';
-const ICON_ARROW_UPWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-160v-487L216-423l-56-57 320-320 320 320-56 57-224-224v487h-80Z"/></svg>';
-const ICON_ARROW_DOWNWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-800v487L216-537l-56 57 320 320 320-320-56-57-224 224v-487h-80Z"/></svg>';
-const ICON_CLOSE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>';
-// A thumbnail chip's own label icon, distinct from the point-button-cluster icons above.
-const ICON_IMAGE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm0-80h560v-560H200v560Zm40-80h480L570-480 450-320l-90-120-120 160Zm-40 80v-560 560Z"/></svg>';
-
-const QUALITY_OPTIONS = [
-  ["", "[None]"],
-  ["RFI", "\U0001F535 RFI"],
-  ["PASS", "\U0001F7E2 PASS"],
-  ["CAUTION", "\U0001F7E0 CAUTION"],
-  ["FAIL", "\U0001F534 FAIL"],
-];
-function qualitySelect(i, current) {
-  const opts = QUALITY_OPTIONS.map(([v, label]) =>
-    `<option value="${v}"${v === current ? " selected" : ""}>${label}</option>`).join("");
-  return `<select data-i="${i}" data-f="quality">${opts}</select>`;
-}
-
-// One camera stream shared across all points, acquired once via
-// getUserMedia() -- reaches any UVC-class video device the OS exposes.
-let cameraStream = null;
-let cameraVideo = null;
-let cameraCanvas = null;
-let previewOpenIndex = null;
-
-function ensureCameraElements() {
-  if (!cameraVideo) {
-    cameraVideo = document.createElement("video");
-    cameraVideo.autoplay = true;
-    cameraVideo.muted = true;
-    cameraVideo.playsInline = true;
-    cameraVideo.className = "cam-preview";
-  }
-  if (!cameraCanvas) cameraCanvas = document.createElement("canvas");
-}
-
-async function ensureCameraStream() {
-  if (cameraStream) return cameraStream;
-  ensureCameraElements();
-  cameraStream = await navigator.mediaDevices.getUserMedia({video: true});
-  cameraVideo.srcObject = cameraStream;
-  return cameraStream;
-}
-
-function reattachPreviewIfOpen() {
-  if (previewOpenIndex === null) return;
-  const slot = document.getElementById("pt-camera-" + previewOpenIndex);
-  if (slot && cameraVideo) slot.appendChild(cameraVideo);
-}
-
-function showCamMessage(i, text) {
-  const el = document.getElementById("pt-cam-msg-" + i);
-  if (!el) return;
-  el.textContent = text;
-  setTimeout(() => { if (el.textContent === text) el.textContent = ""; }, 4000);
-}
-
-async function capturePointImage(i) {
-  try {
-    await ensureCameraStream();
-  } catch (err) {
-    showCamMessage(i, "No camera available");
-    return;
-  }
-  const w = cameraVideo.videoWidth, h = cameraVideo.videoHeight;
-  if (!w || !h) { showCamMessage(i, "Camera not ready yet -- try again"); return; }
-  cameraCanvas.width = w; cameraCanvas.height = h;
-  cameraCanvas.getContext("2d").drawImage(cameraVideo, 0, 0, w, h);
-  const dataUrl = cameraCanvas.toDataURL("image/jpeg", 0.9);
-  try {
-    const res = await fetch("/capture_image", {method: "POST", body: JSON.stringify({data: dataUrl})});
-    const result = await res.json();
-    if (!result.saved) throw new Error(result.error || "unknown error");
-    card.points[i].images = card.points[i].images || [];
-    card.points[i].images.push(result.filename);
-    renderPoints();
-    showCamMessage(i, "Captured " + result.filename);
-  } catch (err) {
-    showCamMessage(i, "Capture failed: " + err);
-  }
-}
-
-async function createJiraTicket(i) {
-  const p = card.points[i];
-  const msgEl = document.getElementById("pt-jira-msg-" + i);
-  if (msgEl) msgEl.innerHTML = "Creating ticket...";
-  const summary = `${card.id} pt ${p.seq}: ${(p.action || "(no action text)").slice(0, 120)}`;
-  const description = [
-    `Test: ${card.id} -- ${card.title}`,
-    `Point ${p.seq}`,
-    `Action: ${p.action || ""}`,
-    `Expected: ${p.expected || ""}`,
-    `Observed: ${p.observed || ""}`,
-    `Reference: ${p.reference || ""}`,
-    `Quality: ${p.quality || ""}`,
-  ].join("\\n");
-  try {
-    const res = await fetch("/create_jira_ticket", {
-      method: "POST",
-      body: JSON.stringify({summary, description, epic_key: starfireJiraEpicKey || ""}),
-    });
-    const result = await res.json();
-    if (!msgEl) return;
-    if (result.success) {
-      msgEl.innerHTML = `Created <a href="${esc(result.url)}" target="_blank" rel="noopener">${esc(result.key)}</a>`;
-    } else {
-      msgEl.textContent = `Ticket creation failed: ${result.error || "unknown error"}`;
-    }
-  } catch (err) {
-    if (msgEl) msgEl.textContent = `Ticket creation failed: ${err}`;
-  }
-}
-
-function togglePreview(i) {
-  if (previewOpenIndex === i) {
-    if (cameraVideo && cameraVideo.parentElement) cameraVideo.parentElement.removeChild(cameraVideo);
-    previewOpenIndex = null;
-    return;
-  }
-  ensureCameraStream().then(() => {
-    const slot = document.getElementById("pt-camera-" + i);
-    if (cameraVideo.parentElement) cameraVideo.parentElement.removeChild(cameraVideo);
-    slot.appendChild(cameraVideo);
-    previewOpenIndex = i;
-  }).catch(() => {
-    showCamMessage(i, "No camera available");
-  });
-}
-
-// Unlike the camera (one shared hardware stream, so only one point's
-// preview can be open at a time), Measure is just form fields -- any
-// number of points can have it open simultaneously.
-let measureOpenIndices = new Set();
-
-// The gauge button opens/closes the panel (a point that already has readings keeps
-// its panel showing, so closing only hides an empty one).
-function toggleMeasure(i) {
-  if (!measureOpenIndices.delete(i)) {
-    measureOpenIndices.add(i);
-    // First open of a point with no readings -- seed one blank row so
-    // there's something to type into right away.
-    if (card.points[i].measurements.length === 0) {
-      card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
-    }
-  }
-  renderPoints();
-}
-
-// SEND: the line in the Command box goes to the instrument. starfire-hw says
-// whether it was a query or a command: a query's reply is logged as a reading,
-// a command is just confirmed here.
-async function sendMeasurement(i) {
-  const p = card.points[i];
-  const msgEl = document.getElementById("pt-measure-msg-" + i);
-  const say = (cls, text) => { if (msgEl) { msgEl.className = "module-status " + cls; msgEl.textContent = text; } };
-  if (!HARDWARE_AVAILABLE) return say("failed", "starfire-hw not found -- nothing was sent.");
-  if (!p.usb_port || !p.measure_command) return say("failed", "Enter a USB port and a command first.");
-  say("running", "Sending...");
-  try {
-    const res = await fetch("/measure", {
-      method: "POST",
-      body: JSON.stringify({port: p.usb_port, command: p.measure_command}),
-    });
-    const result = await res.json();
-    if (!result.success) return say("failed", result.error || "Send failed");
-    if (result.kind !== "query") {
-      return say("complete", `Sent ${p.measure_command} at ${new Date().toLocaleTimeString("en-GB")}`);
-    }
-    if (p.measurements.length >= 8) {
-      return say("failed", `Reply: ${result.value} (not logged: maximum 8 readings, delete a row first)`);
-    }
-    const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
-    p.measurements.push({command: p.measure_command, value: result.value, timestamp: ts, auto: true});
-    renderPoints();
-  } catch (err) {
-    say("failed", `Send failed: ${err}`);
-  }
-}
-
-// Modules (Activate / bolt): scripts or binaries in dist/ that the campaign's
-// Modules table registers. The registry is read live from the campaign page
-// we're embedded in; a standalone card has none, so nothing can be run.
-// Panel-open and run state are transient (never saved) and keyed by the point
-// object, so they follow a point when it's moved up or down.
-const moduleState = new WeakMap();
-
-function campaignModules() {
-  try {
-    return (window.parent !== window && window.parent.getCampaignModules) ? window.parent.getCampaignModules() : [];
-  } catch (e) { return []; }
-}
-
-// Scope "" = any point; "TC-001" = any point on that card; "TC-001-20" = that point only.
-function moduleInScope(m, cardId, seq) {
-  const s = (m.scope || "").trim().toLowerCase();
-  if (!s) return true;
-  const id = (cardId || "").trim().toLowerCase();
-  return s === id || s === id + "-" + seq;
-}
-
-function modulesFor(p) {
-  return campaignModules().filter(m => (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module);
-}
-
-function modulePanelHtml(i, p) {
-  const st = moduleState.get(p) || {};
-  const names = modulesFor(p);
-  const none = names.length === 0
-    ? `<div class="pt-cam-msg">No modules registered for this point. Add one in the campaign's Modules table.</div>` : "";
-  return `
-    <div class="send-row mod-row">
-      <div><label>Module</label>
-      <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(st.name || "")}"></div>
-      <datalist id="pt-modlist-${i}">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>
-      <div><label>Arguments</label>
-      <input data-modargs="${i}" value="${esc(st.args || "")}"></div>
-      <button class="btn mini" data-modrun="${i}"${st.status === "running" ? " disabled" : ""}>run</button>
-      <button class="btn mini break-btn" data-modbreak="${i}"${st.status === "running" ? "" : " disabled"}>break</button>
-    </div>
-    ${none}
-    <div class="module-status ${esc(st.status || "")}">${esc(st.text || "")}</div>
-    ${st.output ? `<pre class="module-output">${esc(st.output)}</pre>
-    <div class="panel-actions">
-      <button class="btn mini btn-icon btn-download" data-modsave="${i}" title="save output as ${esc(pointFileName(p, "txt"))}" aria-label="save module output">${ICON_DOWNLOAD}</button>
-      <span class="module-status complete">${esc(st.saved || "")}</span>
-    </div>` : ""}`;
-}
-
-function bindModulePanel(i) {
-  const root = document.getElementById("pt-module-" + i);
-  if (!root) return;
-  const p = card.points[i];
-  const inp = root.querySelector("input[data-modname]");
-  if (inp) inp.addEventListener("input", () => {
-    const st = moduleState.get(p) || {};
-    st.name = inp.value;
-    moduleState.set(p, st);
-  });
-  const argsInp = root.querySelector("input[data-modargs]");
-  if (argsInp) argsInp.addEventListener("input", () => {
-    const st = moduleState.get(p) || {};
-    st.args = argsInp.value;
-    moduleState.set(p, st);
-  });
-  const btn = root.querySelector("button[data-modrun]");
-  if (btn) btn.addEventListener("click", () => runModule(p));
-  const brk = root.querySelector("button[data-modbreak]");
-  if (brk) brk.addEventListener("click", () => breakModule(p));
-  const sv = root.querySelector("button[data-modsave]");
-  if (sv) sv.addEventListener("click", async () => {
-    const st = moduleState.get(p);
-    st.saved = await savePointFile(p, "txt", st.output);
-    refreshModulePanel(p);
-  });
-}
-
-// Redraws just this point's module panel (not the whole list) so a run
-// finishing doesn't steal focus from whatever the person is typing elsewhere.
-function moduleIsOpen(p) { return !!(moduleState.get(p) || {}).open; }
-
-function refreshModulePanel(p) {
-  const i = card.points.indexOf(p);
-  const root = document.getElementById("pt-module-" + i);
-  if (!root || !moduleIsOpen(p)) return;
-  root.innerHTML = modulePanelHtml(i, p);
-  bindModulePanel(i);
-}
-
-async function runModule(p) {
-  const st = moduleState.get(p) || {};
-  moduleState.set(p, st);
-  const name = (st.name || "").trim();
-  if (!name) {
-    Object.assign(st, {status: "failed", text: "Enter a module name.", output: ""});
-    return refreshModulePanel(p);
-  }
-  if (!modulesFor(p).includes(name)) {
-    Object.assign(st, {status: "failed", output: "",
-      text: `${name} isn't registered for this point. Add it to the campaign's Modules table, with a scope that includes it.`});
-    return refreshModulePanel(p);
-  }
-  Object.assign(st, {status: "running", text: "Running...", output: "", saved: ""});
-  refreshModulePanel(p);
-  try {
-    const res = await fetch("/run_module", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({module: name, card: card.id, point: p.seq, campaign: pointCampaign() || "XX-000", args: st.args || ""}),
-    });
-    const r = await res.json();
-    const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
-    st.status = ["complete", "broken"].includes(r.status) ? r.status : "failed";
-    st.text = `${st.status.toUpperCase()}${detail ? " (" + detail + ")" : ""}${r.error ? ": " + r.error : ""}`;
-    st.output = r.output || "";
-  } catch (err) {
-    Object.assign(st, {status: "failed", text: `FAILED: ${err}`, output: ""});
-  }
-  refreshModulePanel(p);
-}
-
-async function breakModule(p) {
-  const st = moduleState.get(p) || {};
-  try {
-    const res = await fetch("/break_module", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({card: card.id, point: p.seq}),
-    });
-    const r = await res.json();
-    if (!r.success) { st.text = r.error || "Break failed"; refreshModulePanel(p); }
-  } catch (err) {
-    st.text = `Break failed: ${err}`;
-    refreshModulePanel(p);
-  }
-}
-
-function pointCampaign() {
-  try { return (window.parent !== window && window.parent.getCampaignId) ? window.parent.getCampaignId() : ""; } catch (e) { return ""; }
-}
-
-// <campaign>-<card>-<point>.<ext>, as the server will name it.
-function pointFileName(p, ext) {
-  const part = s => String(s || "").trim().replace(/[^A-Za-z0-9._-]/g, "_");
-  return `${part(pointCampaign()) || "XX-000"}-${part(card.id) || "TC"}-${p.seq}.${ext}`;
-}
-
-// Saves text next to the .test files; returns the line to show.
-async function savePointFile(p, ext, content) {
-  try {
-    const res = await fetch("/save_point_file", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({campaign: pointCampaign() || "XX-000", card: card.id, point: p.seq, ext, content}),
-    });
-    const r = await res.json();
-    return r.saved ? `Saved ${r.filename}` : `Save failed: ${r.error || "unknown error"}`;
-  } catch (err) {
-    return `Save failed: ${err}`;
-  }
-}
-
-function measureCsv(p) {
-  const q = v => /[",\\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
-  const rows = p.measurements.filter(m => m.value).map(m => [m.auto ? m.command : "", m.value, m.timestamp].map(q).join(","));
-  return ["command,value,timestamp", ...rows].join("\\n") + "\\n";
-}
-
-function measurePanelHtml(i, p) {
-  const open = measureOpenIndices.has(i);
-  const rows = p.measurements.map((m, j) => {
-    if (m.auto) {
-      return `<tr>
-        <td>${esc(m.command)}</td><td>${esc(m.value)}</td><td>${esc(m.timestamp)}</td>
-        <td class="actions-cell"><button class="btn mini btn-icon btn-x" data-mdel="${j}" data-i="${i}" title="delete row">${ICON_CLOSE}</button></td>
-      </tr>`;
-    }
-    // Manual row: Command never applies (no instrument query was sent for
-    // a by-eye reading), Value is the one genuinely manual field,
-    // Timestamp is set via "now", never typed.
-    return `<tr>
-      <td>--</td>
-      <td><input data-mi="${i}" data-mj="${j}" data-mf="value" value="${esc(m.value)}"></td>
-      <td class="measure-ts-cell">
-        <span>${esc(m.timestamp)}</span>
-        <button class="btn mini" data-mnow="${j}" data-i="${i}" title="now">now</button>
-      </td>
-      <td class="actions-cell"><button class="btn mini btn-icon btn-x" data-mdel="${j}" data-i="${i}" title="delete row">${ICON_CLOSE}</button></td>
-    </tr>`;
-  }).join("");
-  const canAddRow = p.measurements.length < 8;
-  const fields = open ? `
-    <div class="measure-fields">
-      <div><label>USB Port</label><input data-i="${i}" data-f="usb_port" value="${esc(p.usb_port)}" placeholder="/dev/usbtmc0"></div>
-    </div>
-    <label>Command</label>
-    <div class="send-row">
-      <input data-i="${i}" data-f="measure_command" value="${esc(p.measure_command)}" placeholder="MEAS:VOLT:DC?  or  OUTP ON">
-      <button class="btn mini" data-msend="${i}">send</button>
-    </div>
-    <div class="module-status" id="pt-measure-msg-${i}"></div>` : "";
-  return `
-    ${fields}
-    <table class="measure-table">
-      <colgroup><col class="mt-cmd"><col class="mt-val"><col class="mt-ts"><col class="mt-del"></colgroup>
-      <tr><th>Command</th><th>Value</th><th>Timestamp</th><th class="blank-th"></th></tr>
-      ${rows}
-    </table>
-    <div class="panel-actions">
-      ${open && canAddRow ? `<button class="btn mini btn-plus" data-madd="${i}" title="add row">+</button>` : ""}
-      ${p.measurements.some(m => m.value) ? `<button class="btn mini btn-icon btn-download" data-msave="${i}" title="save readings as ${esc(pointFileName(p, "csv"))}" aria-label="save readings">${ICON_DOWNLOAD}</button>` : ""}
-      <span class="module-status complete" id="pt-measure-save-${i}"></span>
-    </div>`;
-}
-
-function renderPoints() {
-  const list = document.getElementById("pointsList");
-  list.innerHTML = "";
-  card.points.forEach((p, i) => {
-    const locked = !!p.locked;
-    const flagged = !!p.flagged;
-    const dis = locked ? "disabled" : "";
-    const div = document.createElement("div");
-    div.className = "pt-card" + (locked ? " locked" : "") + (flagged ? " flagged" : "");
-    const imgChips = (p.images || []).map(fn =>
-      `<span class="thumb-chip">${ICON_IMAGE} ${esc(fn)} <button class="btn mini btn-x" data-rm-img="${esc(fn)}" data-i="${i}">x</button></span>`
-    ).join("");
-    // Ticket is offered on CAUTION/FAIL (a verdict), not on flagged,
-    // which is just a "pay attention here" highlight independent of pass/fail.
-    const showJiraBtn = JIRA_AVAILABLE && (p.quality === "CAUTION" || p.quality === "FAIL");
-    div.innerHTML = `
-      <div class="pt-head">
-        <input class="seq" data-i="${i}" data-f="seq" value="${esc(p.seq)}">
-        ${locked ? '<span class="lock-tag">\U0001F512 locked</span>' : ""}
-        <div class="pt-btns">
-          <button class="btn mini btn-icon flag-btn${flagged ? " flagged" : ""}" data-act="flag" data-i="${i}" title="flag">${ICON_FLAG}</button>
-          <button class="btn mini btn-icon" data-act="preview" data-i="${i}" title="camera preview">${ICON_PHOTO_CAMERA}</button>
-          <button class="btn mini btn-icon" data-act="capture" data-i="${i}" title="capture image">${ICON_ADD_A_PHOTO}</button>
-          <button class="btn mini btn-icon measure-toggle" data-act="measure" data-i="${i}" title="measure">${ICON_SPEED}</button>
-          <button class="btn mini btn-icon module-toggle" data-act="module" data-i="${i}" title="activate (run a module)">${ICON_BOLT}</button>
-          ${showJiraBtn ? `<button class="btn mini btn-icon" data-act="jira" data-i="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
-          <span class="pt-btn-gap"></span>
-          <button class="btn mini btn-icon" data-act="up" data-i="${i}" title="move up">${ICON_ARROW_UPWARD}</button>
-          <button class="btn mini btn-icon" data-act="down" data-i="${i}" title="move down">${ICON_ARROW_DOWNWARD}</button>
-          <button class="btn mini btn-icon btn-x" data-act="del" data-i="${i}" ${dis} title="delete point">${ICON_CLOSE}</button>
-        </div>
-      </div>
-      <div class="pt-main">
-        <div><label>Action</label><textarea data-i="${i}" data-f="action" ${dis}>${esc(p.action)}</textarea></div>
-        <div><label>Expected Result</label><textarea data-i="${i}" data-f="expected" ${dis}>${esc(p.expected)}</textarea></div>
-        <div><label>Observed Result</label><textarea data-i="${i}" data-f="observed">${esc(p.observed)}</textarea></div>
-        <div><label>Reference</label><textarea data-i="${i}" data-f="reference" ${dis}>${esc(p.reference)}</textarea></div>
-      </div>
-      <div class="pt-sign">
-        <div><label>Responsible Party</label><input data-i="${i}" data-f="responsible_party" value="${esc(p.responsible_party)}" ${dis}></div>
-        <div><label>Date</label><input data-i="${i}" data-f="date" value="${esc(p.date)}"></div>
-        <div><label>Time (24h)</label>
-          <div class="time-row">
-            <input data-i="${i}" data-f="time" value="${esc(p.time)}">
-            <button class="btn mini" data-now="${i}">now</button>
-          </div>
-        </div>
-        <div><label>Initial</label><input data-i="${i}" data-f="initial" value="${esc(p.initial)}"></div>
-        <div><label>Quality</label>${qualitySelect(i, p.quality)}</div>
-      </div>
-      <div class="pt-expand-row">
-        <div class="pt-camera" id="pt-camera-${i}"></div>
-        <div class="pt-measure" id="pt-measure-${i}">${(measureOpenIndices.has(i) || p.measurements.length > 0) ? measurePanelHtml(i, p) : ""}</div>
-        <div class="pt-module" id="pt-module-${i}">${moduleIsOpen(p) ? modulePanelHtml(i, p) : ""}</div>
-      </div>
-      <div class="pt-images" id="pt-images-${i}">${imgChips}</div>
-      <div class="pt-cam-msg" id="pt-cam-msg-${i}"></div>
-      <div class="pt-cam-msg" id="pt-jira-msg-${i}"></div>`;
-    list.appendChild(div);
-  });
-  reattachPreviewIfOpen();
-  list.querySelectorAll("input[data-f], textarea[data-f], select[data-f]").forEach(el => {
-    el.addEventListener("input", () => {
-      card.points[+el.dataset.i][el.dataset.f] = el.value;
-    });
-  });
-  list.querySelectorAll("select[data-f]").forEach(el => {
-    el.addEventListener("change", () => {
-      card.points[+el.dataset.i][el.dataset.f] = el.value;
-      // Quality change needs a re-render: the Jira ticket button's
-      // visibility is derived from it, not just displayed.
-      if (el.dataset.f === "quality") renderPoints();
-    });
-  });
-  list.querySelectorAll("button[data-act]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.i, act = btn.dataset.act;
-      if (act === "del") {
-        if (card.points[i].locked) return;   // locked points can't be removed
-        card.points.splice(i, 1);
-      }
-      if (act === "up" && i > 0) [card.points[i-1], card.points[i]] = [card.points[i], card.points[i-1]];
-      if (act === "down" && i < card.points.length - 1) [card.points[i+1], card.points[i]] = [card.points[i], card.points[i+1]];
-      if (act === "flag") {
-        card.points[i].flagged = !card.points[i].flagged;   // works regardless of locked
-      }
-      if (act === "capture") { capturePointImage(i); return; }
-      if (act === "preview") { togglePreview(i); return; }
-      if (act === "jira") { createJiraTicket(i); return; }
-      if (act === "measure") { toggleMeasure(i); return; }
-      if (act === "module") {
-        const st = moduleState.get(card.points[i]) || {};
-        st.open = !st.open;
-        moduleState.set(card.points[i], st);
-      }
-      renderPoints();
-    });
-  });
-  list.querySelectorAll("button[data-msave]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const i = +btn.dataset.msave;
-      const msg = await savePointFile(card.points[i], "csv", measureCsv(card.points[i]));
-      const el = document.getElementById("pt-measure-save-" + i);
-      if (el) el.textContent = msg;
-    });
-  });
-  list.querySelectorAll("button[data-msend]").forEach(btn => {
-    btn.addEventListener("click", () => sendMeasurement(+btn.dataset.msend));
-  });
-  card.points.forEach((_, i) => bindModulePanel(i));
-  list.querySelectorAll("button[data-madd]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.madd;
-      if (card.points[i].measurements.length < 8) {
-        card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
-        renderPoints();
-      }
-    });
-  });
-  list.querySelectorAll("button[data-mdel]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.i;
-      card.points[i].measurements.splice(+btn.dataset.mdel, 1);
-      renderPoints();
-    });
-  });
-  list.querySelectorAll("input[data-mi]").forEach(el => {
-    el.addEventListener("input", () => {
-      card.points[+el.dataset.mi].measurements[+el.dataset.mj][el.dataset.mf] = el.value;
-    });
-  });
-  list.querySelectorAll("button[data-mnow]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.i, j = +btn.dataset.mnow;
-      const now = new Date();
-      card.points[i].measurements[j].timestamp = now.toISOString().slice(0, 16).replace("T", " ");
-      renderPoints();
-    });
-  });
-  list.querySelectorAll("button[data-rm-img]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.i, fn = btn.dataset.rmImg;
-      // Detaches the filename from this point only -- the .jpg file
-      // itself is left on disk, not deleted.
-      card.points[i].images = (card.points[i].images || []).filter(x => x !== fn);
-      renderPoints();
-    });
-  });
-  list.querySelectorAll("button[data-now]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.now, d = new Date(), pad = n => String(n).padStart(2, "0");
-      card.points[i].date = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
-      card.points[i].time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;   // 24h
-      renderPoints();
-    });
-  });
-}
-
-function esc(s) { return (s??"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-
-document.getElementById("addPointBtn").addEventListener("click", () => {
-  card.points.push({seq: nextSeq(), action:"", expected:"", observed:"", reference:"",
-                     responsible_party:"", date:"", time:"", initial:"", quality:"",
-                     locked: false, flagged: false, images: [],
-                     usb_port: "", measure_command: "", measurements: []});
-  renderPoints();
-});
-
-function renderNomenclature() {
-  const t = document.getElementById("nomTable");
-  t.querySelectorAll("tr.nomrow").forEach(r => r.remove());
-  card.nomenclature.forEach(([sym, defn, units, locked], i) => {
-    const dis = locked ? "disabled" : "";
-    const tr = document.createElement("tr");
-    tr.className = "nomrow";
-    tr.innerHTML = `
-      <td><input value="${esc(sym)}" data-i="${i}" data-f="0" placeholder="\\\\alpha" ${dis}></td>
-      <td><input value="${esc(defn)}" data-i="${i}" data-f="1" placeholder="definition" ${dis}></td>
-      <td><input value="${esc(units||"")}" data-i="${i}" data-f="2" placeholder="units" ${dis}></td>
-      <td><button class="btn mini btn-x" data-del="${i}" ${dis}>x</button></td>`;
-    t.appendChild(tr);
-  });
-  t.querySelectorAll("input[data-i]").forEach(inp => {
-    inp.addEventListener("input", () => {
-      card.nomenclature[+inp.dataset.i][+inp.dataset.f] = inp.value;
-    });
-  });
-  t.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      if (card.nomenclature[+btn.dataset.del][3]) return;   // locked row
-      card.nomenclature.splice(+btn.dataset.del, 1);
-      renderNomenclature();
-    });
-  });
-}
-document.getElementById("addNomBtn").addEventListener("click", () => {
-  card.nomenclature.push(["", "", "", false]);
-  renderNomenclature();
-});
-
-function renderReferences() {
-  const t = document.getElementById("refTable");
-  t.querySelectorAll("tr.refrow").forEach(r => r.remove());
-  card.references.forEach(([ref, desc, locked], i) => {
-    const dis = locked ? "disabled" : "";
-    const tr = document.createElement("tr");
-    tr.className = "refrow";
-    tr.innerHTML = `
-      <td><input value="${esc(ref)}" data-i="${i}" data-f="0" placeholder="REQ-1234" ${dis}></td>
-      <td><input value="${esc(desc)}" data-i="${i}" data-f="1" placeholder="description" ${dis}></td>
-      <td><button class="btn mini btn-x" data-del="${i}" ${dis}>x</button></td>`;
-    t.appendChild(tr);
-  });
-  t.querySelectorAll("input[data-i]").forEach(inp => {
-    inp.addEventListener("input", () => {
-      card.references[+inp.dataset.i][+inp.dataset.f] = inp.value;
-    });
-  });
-  t.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      if (card.references[+btn.dataset.del][2]) return;   // locked row
-      card.references.splice(+btn.dataset.del, 1);
-      renderReferences();
-    });
-  });
-}
-document.getElementById("addRefBtn").addEventListener("click", () => {
-  card.references.push(["", "", false]);
-  renderReferences();
-});
-
-function renderTextList(listId, key) {
-  const el = document.getElementById(listId);
-  el.innerHTML = "";
-  card[key].forEach(([val, locked], i) => {
-    const dis = locked ? "disabled" : "";
-    const row = document.createElement("div");
-    row.className = "list-row";
-    row.innerHTML = `<textarea data-key="${key}" data-i="${i}" ${dis}>${esc(val)}</textarea>
-      <button class="btn mini btn-x" data-key="${key}" data-del="${i}" ${dis}>x</button>`;
-    el.appendChild(row);
-  });
-  el.querySelectorAll("textarea[data-key]").forEach(ta => {
-    ta.addEventListener("input", () => { card[ta.dataset.key][+ta.dataset.i][0] = ta.value; });
-  });
-  el.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      if (card[btn.dataset.key][+btn.dataset.del][1]) return;   // locked row
-      card[btn.dataset.key].splice(+btn.dataset.del, 1);
-      renderTextList(listId, btn.dataset.key);
-    });
-  });
-}
-document.getElementById("addNoteBtn").addEventListener("click", () => {
-  card.notes.push(["", false]); renderTextList("notesList", "notes");
-});
-document.getElementById("addWarningBtn").addEventListener("click", () => {
-  card.warnings.push(["", false]); renderTextList("warningsList", "warnings");
-});
-
-function download(filename, blobOrText, mime) {
-  const blob = blobOrText instanceof Blob ? blobOrText : new Blob([blobOrText], {type: mime || "text/plain"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob); a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-}
-
-function freezeCurrentCard() {
-  card.locked = true;
-  card.points.forEach(p => { p.locked = true; });
-  card.nomenclature.forEach(row => { row[3] = true; });
-  card.references.forEach(row => { row[2] = true; });
-  card.notes.forEach(row => { row[1] = true; });
-  card.warnings.forEach(row => { row[1] = true; });
-}
-function unfreezeCard() {
-  card.locked = false;
-  card.points.forEach(p => { p.locked = false; });
-  card.nomenclature.forEach(row => { row[3] = false; });
-  card.references.forEach(row => { row[2] = false; });
-  card.notes.forEach(row => { row[1] = false; });
-  card.warnings.forEach(row => { row[1] = false; });
-}
-function rerenderAll() {
-  bindMeta(); renderPoints(); renderNomenclature(); renderReferences();
-  renderTextList("notesList", "notes"); renderTextList("warningsList", "warnings");
-}
-async function saveCard(statusEl) {
-  statusEl.textContent = "saving...";
-  try {
-    const res = await fetch("/save", {method: "POST", body: JSON.stringify(card)});
-    const data = await res.json();
-    statusEl.textContent = data.saved ? `Saved to ${data.path}` : `Save failed: ${data.error || "unknown error"}`;
-  } catch (err) {
-    statusEl.textContent = `Save failed: ${err}`;
-  }
-}
-document.getElementById("saveLockedBtn").addEventListener("click", () => {
-  // Locking is a workflow marker, not security. Freezing happens
-  // client-side so the editor reflects it immediately, not just the file.
-  freezeCurrentCard();
-  rerenderAll();
-  saveCard(document.getElementById("saveStatus"));
-});
-document.getElementById("saveUnlockedBtn").addEventListener("click", () => {
-  unfreezeCard();
-  rerenderAll();
-  saveCard(document.getElementById("saveStatus"));
-});
-document.getElementById("loadJsonBtn").addEventListener("click", () => {
-  document.getElementById("loadJsonFile").click();
-});
-function normalizePairList(items, width) {
-  // Pads each row to `width` (the last element the locked flag); accepts
-  // a bare string for a single-element row (pre-locking notes/warnings).
-  return (items || []).map(item => {
-    let row = typeof item === "string" ? [item] : item.slice();
-    while (row.length < width - 1) row.push("");
-    if (row.length < width) row.push(false);
-    return row.slice(0, width);
-  });
-}
-function normalizeCard(c) {
-  c.nomenclature = normalizePairList(c.nomenclature, 4);
-  c.references = normalizePairList(c.references, 3);
-  c.notes = normalizePairList(c.notes, 2);
-  c.warnings = normalizePairList(c.warnings, 2);
-  if (!c.quality_assurance) c.quality_assurance = "";
-  if (!c.requirements) c.requirements = "";
-  if (!c.locked) c.locked = false;
-  (c.points || []).forEach(p => {
-    if (!("locked" in p)) p.locked = false;
-    if (!("flagged" in p)) p.flagged = false;
-    if (!p.images) p.images = [];
-    if (!("observed" in p)) p.observed = "";
-    if (!("usb_port" in p)) p.usb_port = "";
-    if (!("measure_command" in p)) p.measure_command = "";
-    if (!p.measurements) p.measurements = [];
-  });
-  return c;
-}
-function loadCardIntoUI(c) {
-  card = normalizeCard(c);
-  bindMeta(); renderPoints(); renderNomenclature(); renderReferences();
-  renderTextList("notesList", "notes"); renderTextList("warningsList", "warnings");
-}
-document.getElementById("loadJsonFile").addEventListener("change", (e) => {
-  const f = e.target.files[0]; if (!f) return;
-  f.text().then(txt => loadCardIntoUI(JSON.parse(txt)));
-});
-
-async function postExport(path, filename, mime) {
-  // Open the print window synchronously, before the await below -- many
-  // popup blockers kill a window.open() called after a fetch() resolves.
-  let w = null;
-  if (path === "/export/print") {
-    w = window.open("", "_blank");
-    if (w) w.document.write("Generating...");
-  }
-  try {
-    const res = await fetch(path, {method: "POST", body: JSON.stringify(card)});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    const text = await res.text();
-    if (path === "/export/print") {
-      if (w) { w.document.open(); w.document.write(text); w.document.close(); }
-    } else {
-      download(filename, text, mime);
-    }
-  } catch (err) {
-    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
-    document.getElementById("saveStatus").textContent = `Export failed: ${err}`;
-  }
-}
-document.getElementById("exportCsvBtn").addEventListener("click", () =>
-  postExport("/export/csv", (card.id || "card") + ".csv", "text/csv"));
-document.getElementById("exportPrintBtn").addEventListener("click", () =>
-  postExport("/export/print"));
-document.getElementById("exportDocxBtn").addEventListener("click", async () => {
-  try {
-    const res = await fetch("/export/test/docx", {method: "POST", body: JSON.stringify(card)});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    download((card.id || "test") + ".docx", await res.blob());
-  } catch (err) {
-    document.getElementById("saveStatus").textContent = `Docx export failed: ${err}`;
-  }
-});
-
-bindMeta();
-card.points = [{seq:10, action:"", expected:"", observed:"", reference:"",
-                responsible_party:"", date:"", time:"", initial:"", quality:"",
-                locked:false, flagged:false, images:[],
-                usb_port:"", measure_command:"", measurements:[]}];
-renderPoints();
-renderNomenclature();
-renderReferences();
-renderTextList("notesList", "notes");
-renderTextList("warningsList", "warnings");
-
-// If opened as ?load=<filename>, fetch that .test file and populate the
-// editor with it -- how the campaign page opens a specific test in a tab.
-const _loadFile = new URLSearchParams(window.location.search).get("load");
-if (_loadFile) {
-  fetch("/load?file=" + encodeURIComponent(_loadFile))
-    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
-    .then(loadCardIntoUI)
-    .catch(() => { document.getElementById("m-id").value = _loadFile.replace(/\\.test$/, ""); });
-}
-
-// Lets an embedding page (the campaign tab bar) read the live editor
-// state, since `card` is a module-scope `let` otherwise unreachable from an iframe.
-window.getCard = () => card;
-
-// Only inside a campaign tab: ask the campaign page to open this card's Test Report tab.
-if (window.self !== window.top && window.parent.openReportTab) {
-  const buildBtn = document.getElementById("buildReportBtn");
-  buildBtn.style.display = "";
-  buildBtn.addEventListener("click", () => {
-    const file = new URLSearchParams(location.search).get("load") || "";
-    window.parent.openReportTab(file.replace(/\\.test$/, "") || card.id);
-  });
-}
-</script>
-</body>
-</html>
-"""
-
-
-
-_CAMPAIGN_HTML = """<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<title>\U0001F680 \u2728 STARFIRE</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="/static/starfire.css">
-</head>
-<body class="editor-doc">
-<div id="tabbar"></div>
-<div id="panels">
-  <div class="panel active split" id="panel-campaign">
-    <div class="report-side">
-      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
-      <div class="side-btns">
-        <button class="btn" id="loadCampBtn">import campaign file</button>
-        <input type="file" id="loadCampFile" accept=".camp,application/json" style="display:none">
-        <button class="btn" id="saveCampBtn">export campaign file (.camp)</button>
-        <button class="btn" id="printCampBtn">generate .pdf</button>
-        <button class="btn" id="docxCampBtn">export .docx</button>
-        <button class="btn" id="genVcrmBtn">generate VCRM</button>
-        <button class="btn" id="buildSrBtn">build campaign report</button>
-      </div>
-      <div id="saveStatus" class="hint"></div>
-    </div>
-    <div class="side-main"><div class="side-inner">
-
-    <h2>Campaign metadata</h2>
-    <div class="meta">
-      <div class="field"><label>ID</label><input id="c-id"></div>
-      <div class="field"><label>Title</label><input id="c-title"></div>
-      <div class="field"><label>Revision</label><input id="c-revision"></div>
-      <div class="field"><label>Project</label><input id="c-project"></div>
-      <div class="field"><label>Author</label><input id="c-author"></div>
-      <div class="field"><label>Test Lead</label><input id="c-test_lead"></div>
-      <div class="field"><label>Quality Assurance</label><input id="c-quality_assurance"></div>
-      <div class="field"><label>Date</label><input id="c-date"></div>
-      <div class="field"><label>System / Subsystem</label><input id="c-system"></div>
-      <div class="field" id="jira-epic-field" style="display:none"><label>Jira Epic Key</label><input id="c-jira_epic_key" placeholder="PROJ-142"></div>
-    </div>
-
-    <h2 class="no-rule">Requirements</h2>
-    <table class="datatable" id="reqTable">
-      <tr><th>Requirement</th><th>Description</th><th class="blank-th" style="width:60px"></th></tr>
-    </table>
-    <div class="row"><button class="btn btn-plus" id="addReqBtn" title="add requirement">+</button></div>
-
-    <h2 class="no-rule">Modules</h2>
-    <table class="datatable" id="modTable">
-      <colgroup><col style="width:28%"><col><col style="width:16%"><col style="width:60px"></colgroup>
-      <tr><th>Module</th><th>Description</th><th>Scope</th><th class="blank-th"></th></tr>
-    </table>
-    <div class="row"><button class="btn btn-plus" id="addModBtn" title="add module">+</button></div>
-    <div id="modHint" class="hint"></div>
-
-    <h2 class="no-rule">Test Series</h2>
-    <table class="datatable tests-format" id="testsTable">
-      <colgroup>
-      <col style="width:4%"><col style="width:10%"><col style="width:33%">
-      <col style="width:12%"><col style="width:12%"><col style="width:9%"><col style="width:20%">
-      </colgroup>
-      <tr><th>#</th><th>Test ID</th><th>Title</th><th>Author</th><th>Requirements</th><th>Status</th><th class="blank-th"></th></tr>
-    </table>
-    <div class="row"><button class="btn btn-plus" id="addTestBtn" title="add test">+</button></div>
-    <div class="row">
-      <select id="browseTestFiles"><option value="">Browse existing .test files...</option></select>
-      <button class="btn" id="addBrowsedTestBtn">select</button>
-    </div>
-    <div id="browseStatus" class="hint"></div>
-
-    <h2 class="no-rule">Ancillary Tests</h2>
-    <table class="datatable tests-format" id="ancTestsTable">
-      <colgroup>
-      <col style="width:4%"><col style="width:10%"><col style="width:33%">
-      <col style="width:12%"><col style="width:12%"><col style="width:9%"><col style="width:20%">
-      </colgroup>
-      <tr><th>#</th><th>Test ID</th><th>Title</th><th>Author</th><th>Requirements</th><th>Status</th><th class="blank-th"></th></tr>
-    </table>
-    <div class="row"><button class="btn btn-plus" id="addAncTestBtn" title="add test">+</button></div>
-    <div class="row">
-      <select id="browseAncTestFiles"><option value="">Browse existing .test files...</option></select>
-      <button class="btn" id="addBrowsedAncTestBtn">select</button>
-    </div>
-    <div id="ancBrowseStatus" class="hint"></div>
-
-    <h2 class="no-rule">Sections</h2>
-    <div id="sectionsList"></div>
-    <div class="row"><button class="btn btn-plus" id="addSectionBtn" title="add section">+</button></div>
-
-    </div></div>
-  </div>
-</div>
-
-<script>
-let camp = {
-  id: "SC-001", title: "Untitled Campaign", revision: "A", author: "",
-  date: new Date().toISOString().slice(0,10), project: "", test_lead: "",
-  quality_assurance: "", system: "", subsystem: "", jira_epic_key: "",
-  requirements: [], modules: [], tests: [], ancillary_tests: [], sections: [], reports: {}
-};
-
-// True only if jira_config.json was found in the working directory at startup.
-const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
-if (JIRA_AVAILABLE) document.getElementById("jira-epic-field").style.display = "";
-
-function esc(s) { return (s??"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-
-const metaFields = ["id","title","revision","author","date","project","test_lead","quality_assurance","jira_epic_key"];
-function bindMeta() {
-  metaFields.forEach(f => {
-    const el = document.getElementById("c-" + f);
-    el.value = camp[f];
-    el.addEventListener("input", () => {
-      camp[f] = el.value;
-      if (f === "id" || f === "title") renderTabBar();
-    });
-  });
-  const sysEl = document.getElementById("c-system");
-  sysEl.value = [camp.system, camp.subsystem].filter(Boolean).join(" / ");
-  sysEl.addEventListener("input", () => {
-    const parts = sysEl.value.split("/").map(s => s.trim());
-    camp.system = parts[0] || ""; camp.subsystem = parts[1] || "";
-  });
-}
-
-function renderRequirements() {
-  const t = document.getElementById("reqTable");
-  t.querySelectorAll("tr.datarow").forEach(r => r.remove());
-  camp.requirements.forEach(([code, desc], i) => {
-    const tr = document.createElement("tr");
-    tr.className = "datarow";
-    tr.innerHTML = `
-      <td><input value="${esc(code)}" data-i="${i}" data-f="0" placeholder="REQ-1234"></td>
-      <td><input value="${esc(desc)}" data-i="${i}" data-f="1" placeholder="description"></td>
-      <td><button class="btn mini btn-x" data-del="${i}">x</button></td>`;
-    t.appendChild(tr);
-  });
-  t.querySelectorAll("input[data-i]").forEach(inp => {
-    inp.addEventListener("input", () => { camp.requirements[+inp.dataset.i][+inp.dataset.f] = inp.value; });
-  });
-  t.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => { camp.requirements.splice(+btn.dataset.del, 1); renderRequirements(); });
-  });
-}
-document.getElementById("addReqBtn").addEventListener("click", () => {
-  camp.requirements.push(["", ""]);
-  renderRequirements();
-});
-
-// Modules: runnable files in dist/ (see /list_modules) that a test point's
-// Activate button may run. Scope blank = any point; TC-001 = any point on
-// that card; TC-001-20 = that point only.
-let moduleFiles = [];
-// Kind by name, mirroring how the server runs it (case-sensitive, like os.path.splitext):
-// no extension = a binary, .py/.jl/.sh = that language, anything else = "other".
-function moduleKind(name) {
-  if (!name) return "";
-  const dot = name.lastIndexOf(".");
-  const ext = dot > 0 ? name.slice(dot) : "";
-  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh"})[ext] || "other";
-}
-function renderModules() {
-  const t = document.getElementById("modTable");
-  t.querySelectorAll("tr.datarow").forEach(r => r.remove());
-  camp.modules.forEach((m, i) => {
-    // A saved module that's no longer in dist/ stays selectable, flagged, so it isn't silently dropped.
-    const names = moduleFiles.includes(m.module) || !m.module ? moduleFiles : [m.module, ...moduleFiles];
-    const opts = [`<option value="">[choose module]</option>`].concat(names.map(n =>
-      `<option class="mod-${moduleKind(n)}" value="${esc(n)}"${n === m.module ? " selected" : ""}>${esc(n)}${moduleFiles.includes(n) ? "" : " (missing)"}</option>`));
-    const tr = document.createElement("tr");
-    tr.className = "datarow";
-    tr.innerHTML = `
-      <td><select class="mod-${moduleKind(m.module)}" data-i="${i}" data-f="module">${opts.join("")}</select></td>
-      <td><input value="${esc(m.description)}" data-i="${i}" data-f="description" placeholder="optional"></td>
-      <td><input value="${esc(m.scope)}" data-i="${i}" data-f="scope" placeholder="any test point"></td>
-      <td><button class="btn mini btn-x" data-del="${i}">x</button></td>`;
-    t.appendChild(tr);
-  });
-  t.querySelectorAll("input[data-i], select[data-i]").forEach(el => {
-    el.addEventListener("input", () => {
-      camp.modules[+el.dataset.i][el.dataset.f] = el.value;
-      if (el.dataset.f === "module") el.className = "mod-" + moduleKind(el.value);
-    });
-  });
-  t.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => { camp.modules.splice(+btn.dataset.del, 1); renderModules(); });
-  });
-  document.getElementById("modHint").textContent = moduleFiles.length
-    ? "" : "No runnable files found. Put programs (chmod +x) or .py / .sh / .jl scripts in the dist/ folder next to starfire.";
-}
-async function loadModuleFiles() {
-  try {
-    const res = await fetch("/list_modules");
-    const next = (await res.json()).modules || [];
-    // Redrawing while a picker is open would close it, so only when the list actually changed.
-    if (JSON.stringify(next) !== JSON.stringify(moduleFiles)) { moduleFiles = next; renderModules(); }
-  } catch (err) { /* leave the list as it was */ }
-}
-document.getElementById("addModBtn").addEventListener("click", () => {
-  camp.modules.push({module: "", description: "", scope: ""});
-  renderModules();
-  loadModuleFiles();
-});
-window.addEventListener("focus", loadModuleFiles);
-// Test tabs (iframes) read the live list from here when they offer or run a module.
-window.getCampaignModules = () => camp.modules;
-window.getCampaignId = () => camp.id;
-
-// Google Material Symbols, embedded inline (not a file/CDN) so they work
-// fully offline; fill="currentColor" picks up each button's own hover color.
-const ICON_ARROW_UPWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-160v-487L216-423l-56-57 320-320 320 320-56 57-224-224v487h-80Z"/></svg>';
-const ICON_ARROW_DOWNWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-800v487L216-537l-56 57 320 320 320-320-56-57-224 224v-487h-80Z"/></svg>';
-const ICON_OPEN_IN_NEW = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z"/></svg>';
-const ICON_CLOSE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>';
-const ICON_BOOKMARK_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-640q0-33 23.5-56.5T280-840h240v80H280v518l200-86 200 86v-278h80v400L480-240 200-120Zm80-640h240-240Zm400 160v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80Z"/></svg>';
-
-const STATUS_OPTIONS = [
-  ["", "[None]"],
-  ["COMPLETE", "\U0001F535 COMPLETE"],
-  ["IN_PROGRESS", "\U0001F7E2 IN PROGRESS"],
-  // No native colored-circle emoji is genuinely magenta -- purple is the
-  // closest a real Unicode circle gets.
-  ["TO_DO", "\U0001F7E3 TO DO"],
-  ["BLOCKED", "\U0001F534 BLOCKED"],
-];
-// Plain-text labels (no colored dot -- that's UI-only, never shown in the
-// VCRM or any export), matching STATUS_LABELS in starfire.py.
-const STATUS_LABELS = {
-  COMPLETE: "COMPLETE", IN_PROGRESS: "IN PROGRESS", TO_DO: "TO DO", BLOCKED: "BLOCKED",
-};
-function statusSelect(i, current) {
-  const opts = STATUS_OPTIONS.map(([v, label]) =>
-    `<option value="${v}"${v === current ? " selected" : ""}>${label}</option>`).join("");
-  return `<select data-i="${i}" data-f="status">${opts}</select>`;
-}
-
-function nextSeqFor(list) {
-  const max = list.reduce((m, t) => Math.max(m, +t.seq || 0), 0);
-  return max + 1;   // campaigns number tests 1, 2, 3... not by 10s
-}
-
-function renderTestsTable(list, tableId) {
-  const t = document.getElementById(tableId);
-  t.querySelectorAll("tr.datarow").forEach(r => r.remove());
-  list.forEach((row, i) => {
-    const tr = document.createElement("tr");
-    tr.className = "datarow";
-    tr.innerHTML = `
-      <td><input value="${esc(row.seq)}" data-i="${i}" data-f="seq"></td>
-      <td><input value="${esc(row.test_id)}" data-i="${i}" data-f="test_id" placeholder="TC-001"></td>
-      <td class="meta-cell">${esc(row.title || "")}</td>
-      <td class="meta-cell">${esc(row.author || "")}</td>
-      <td class="meta-cell">${esc(row.requirements || "")}</td>
-      <td>${statusSelect(i, row.status)}</td>
-      <td class="actions-cell">
-        <button class="btn btn-icon" data-open="${i}" title="open">${ICON_OPEN_IN_NEW}</button>
-        <button class="btn btn-icon" data-del="${i}" title="remove">${ICON_CLOSE}</button>
-        ${JIRA_AVAILABLE ? `<button class="btn btn-icon" data-jira="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
-      </td>`;
-    t.appendChild(tr);
-  });
-  t.querySelectorAll("input[data-f], select[data-f]").forEach(el => {
-    const ev = el.tagName === "SELECT" ? "change" : "input";
-    el.addEventListener(ev, () => {
-      list[+el.dataset.i][el.dataset.f] = el.value;
-    });
-  });
-  // Title/Author/Requirements are pulled from the linked .test file --
-  // refresh on blur (not every keystroke) so focus isn't yanked mid-type.
-  t.querySelectorAll('input[data-f="test_id"]').forEach(el => {
-    el.addEventListener("blur", () => backfillMetadataForRow(list, tableId, +el.dataset.i));
-  });
-  t.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => { list.splice(+btn.dataset.del, 1); renderTestsTable(list, tableId); });
-  });
-  t.querySelectorAll("button[data-open]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const row = list[+btn.dataset.open];
-      if ((row.test_id || "").trim()) openTestTab(row.test_id, row.title);
-    });
-  });
-  t.querySelectorAll("button[data-jira]").forEach(btn => {
-    btn.addEventListener("click", () => createTestJiraTicket(list, tableId, +btn.dataset.jira));
-  });
-}
-function renderTests() { renderTestsTable(camp.tests, "testsTable"); }
-function renderAncillaryTests() { renderTestsTable(camp.ancillary_tests, "ancTestsTable"); }
-
-// Reuses the browse-picker's own status line for ticket-click results,
-// rather than adding a third message area -- the two actions never overlap.
-const TICKET_STATUS_EL_FOR_TABLE = { testsTable: "browseStatus", ancTestsTable: "ancBrowseStatus" };
-
-async function createTestJiraTicket(list, tableId, i) {
-  const row = list[i];
-  const statusEl = document.getElementById(TICKET_STATUS_EL_FOR_TABLE[tableId]);
-  const summary = `${row.test_id || "(no ID)"}: ${row.title || "(no title)"}`;
-  const description = [
-    `Test: ${row.test_id || ""} -- ${row.title || ""}`,
-    `Status: ${STATUS_LABELS[row.status] || row.status || "[None]"}`,
-    `Requirement(s): ${row.requirements || ""}`,
-  ].join("\\n");
-  statusEl.textContent = "Creating ticket...";
-  try {
-    const res = await fetch("/create_jira_ticket", {
-      method: "POST",
-      body: JSON.stringify({
-        summary, description, issue_type: "Task",
-        epic_key: camp.jira_epic_key || "",
-      }),
-    });
-    const result = await res.json();
-    if (result.success) {
-      statusEl.innerHTML = `Created <a href="${esc(result.url)}" target="_blank" rel="noopener">${esc(result.key)}</a>`;
-    } else {
-      statusEl.textContent = `Ticket creation failed: ${result.error || "unknown error"}`;
-    }
-  } catch (err) {
-    statusEl.textContent = `Ticket creation failed: ${err}`;
-  }
-}
-
-async function backfillMetadataForRow(list, tableId, i) {
-  const row = list[i];
-  const testId = (row.test_id || "").trim();
-  if (!testId) return;
-  const filename = testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test";
-  try {
-    const res = await fetch("/load?file=" + encodeURIComponent(filename));
-    if (!res.ok) return;   // no matching file yet -- leave title/author/requirements as-is, silently
-    const data = await res.json();
-    row.title = data.title || "";
-    row.author = data.author || "";
-    row.requirements = data.requirements || "";
-    renderTestsTable(list, tableId);
-  } catch (err) {
-    // transient error -- same "silent, no validation" spirit as the rest
-    // of this traceability; nothing here is load-bearing.
-  }
-}
-
-document.getElementById("addTestBtn").addEventListener("click", () => {
-  camp.tests.push({seq: nextSeqFor(camp.tests), test_id: "", title: "", author: "", requirements: "", status: ""});
-  renderTests();
-});
-document.getElementById("addAncTestBtn").addEventListener("click", () => {
-  camp.ancillary_tests.push({seq: nextSeqFor(camp.ancillary_tests), test_id: "", title: "", author: "", requirements: "", status: ""});
-  renderAncillaryTests();
-});
-
-// Browse .test files already on disk, rather than requiring the exact
-// Test ID up front -- for a file created earlier by this person or a teammate.
-async function refreshFileList(selectId) {
-  const sel = document.getElementById(selectId);
-  const current = sel.value;
-  try {
-    const res = await fetch("/list_files?ext=.test");
-    const data = await res.json();
-    sel.innerHTML = '<option value="">Browse existing .test files...</option>' +
-      (data.files || []).map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
-    if ((data.files || []).includes(current)) sel.value = current;
-  } catch (err) {
-    document.getElementById(selectId === "browseTestFiles" ? "browseStatus" : "ancBrowseStatus")
-      .textContent = `Couldn't list files: ${err}`;
-  }
-}
-async function addBrowsedFile(selectId, list, tableId, statusId) {
-  const sel = document.getElementById(selectId);
-  const filename = sel.value;
-  const status = document.getElementById(statusId);
-  if (!filename) return;
-  const testId = filename.replace(/\\.test$/, "");
-  if (list.some(t => t.test_id === testId)) {
-    status.textContent = `${testId} is already in this table.`;
-    return;
-  }
-  // Grab title/author/requirements too, if we can -- not fatal if this
-  // fails, the row just gets added with those left blank to fill in by hand.
-  let title = "", author = "", requirements = "";
-  try {
-    const res = await fetch("/load?file=" + encodeURIComponent(filename));
-    if (res.ok) {
-      const data = await res.json();
-      title = data.title || ""; author = data.author || ""; requirements = data.requirements || "";
-    }
-  } catch (err) { /* leave title/author/requirements blank */ }
-  list.push({seq: nextSeqFor(list), test_id: testId, title: title, author: author,
-             requirements: requirements, status: ""});
-  renderTestsTable(list, tableId);
-}
-document.getElementById("browseTestFiles").addEventListener("focus", () => refreshFileList("browseTestFiles"));
-document.getElementById("addBrowsedTestBtn").addEventListener("click", () =>
-  addBrowsedFile("browseTestFiles", camp.tests, "testsTable", "browseStatus"));
-document.getElementById("browseAncTestFiles").addEventListener("focus", () => refreshFileList("browseAncTestFiles"));
-document.getElementById("addBrowsedAncTestBtn").addEventListener("click", () =>
-  addBrowsedFile("browseAncTestFiles", camp.ancillary_tests, "ancTestsTable", "ancBrowseStatus"));
-refreshFileList("browseTestFiles");
-refreshFileList("browseAncTestFiles");
-
-function renderSections() {
-  const list = document.getElementById("sectionsList");
-  list.innerHTML = "";
-  camp.sections.forEach(([header, text], i) => {
-    const div = document.createElement("div");
-    div.className = "sec-card";
-    div.innerHTML = `
-      <div class="sec-head">
-        <input value="${esc(header)}" data-i="${i}" data-f="0" placeholder="Section header">
-        <button class="btn mini btn-x" data-del="${i}">x</button>
-      </div>
-      <textarea data-i="${i}" data-f="1" placeholder="Write or paste anything here">${esc(text)}</textarea>`;
-    list.appendChild(div);
-  });
-  list.querySelectorAll("input[data-i], textarea[data-i]").forEach(el => {
-    el.addEventListener("input", () => { camp.sections[+el.dataset.i][+el.dataset.f] = el.value; });
-  });
-  list.querySelectorAll("button[data-del]").forEach(btn => {
-    btn.addEventListener("click", () => { srSectionDeleted(+btn.dataset.del); camp.sections.splice(+btn.dataset.del, 1); renderSections(); });
-  });
-}
-document.getElementById("addSectionBtn").addEventListener("click", () => {
-  camp.sections.push(["", ""]);
-  renderSections();
-});
-
-function download(filename, blobOrText, mime) {
-  const blob = blobOrText instanceof Blob ? blobOrText : new Blob([blobOrText], {type: mime || "text/plain"});
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob); a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-}
-
-document.getElementById("saveCampBtn").addEventListener("click", async () => {
-  const status = document.getElementById("saveStatus");
-  status.textContent = "saving...";
-  try {
-    const res = await fetch("/save_campaign", {method: "POST", body: JSON.stringify(camp)});
-    const data = await res.json();
-    status.textContent = data.saved ? `Saved to ${data.path}` : `Save failed: ${data.error || "unknown error"}`;
-  } catch (err) {
-    status.textContent = `Save failed: ${err}`;
-  }
-});
-document.getElementById("loadCampBtn").addEventListener("click", () => {
-  document.getElementById("loadCampFile").click();
-});
-document.getElementById("loadCampFile").addEventListener("change", (e) => {
-  const f = e.target.files[0]; if (!f) return;
-  f.text().then(txt => {
-    camp = JSON.parse(txt);
-    if (!camp.requirements) camp.requirements = [];
-    if (!camp.modules) camp.modules = [];
-    if (!camp.reports) camp.reports = {};
-    if (!camp.tests) camp.tests = [];
-    if (!camp.ancillary_tests) camp.ancillary_tests = [];
-    if (!camp.sections) camp.sections = [];
-    if (!camp.jira_epic_key) camp.jira_epic_key = "";
-    bindMeta(); renderRequirements(); renderModules(); renderTests(); renderAncillaryTests(); renderSections();
-  });
-});
-document.getElementById("printCampBtn").addEventListener("click", async () => {
-  // Open synchronously, before the await below -- popup blockers can kill
-  // a window.open() called after a fetch() resolves.
-  const w = window.open("", "_blank");
-  if (w) w.document.write("Generating...");
-  try {
-    const res = await fetch("/export/campaign/print", {method: "POST", body: JSON.stringify(camp)});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    const text = await res.text();
-    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
-  } catch (err) {
-    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
-    document.getElementById("saveStatus").textContent = `Print failed: ${err}`;
-  }
-});
-document.getElementById("docxCampBtn").addEventListener("click", async () => {
-  const status = document.getElementById("saveStatus");
-  try {
-    const res = await fetch("/export/campaign/docx", {method: "POST", body: JSON.stringify(camp)});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    const blob = await res.blob();
-    download((camp.id || "campaign") + ".docx", blob);
-  } catch (err) {
-    status.textContent = `Docx export failed: ${err}`;
-  }
-});
-
-// ---- Tab bar ----
-let openTabs = [];   // [{key, label}], key = filename for test tabs
-let activeTab = "campaign";
-
-function renderTabBar() {
-  const bar = document.getElementById("tabbar");
-  bar.innerHTML = "";
-  updateAppendButtons();
-  const campBtn = document.createElement("button");
-  campBtn.className = "tab-btn" + (activeTab === "campaign" ? " active" : "");
-  campBtn.textContent = camp.id || "Campaign";
-  campBtn.addEventListener("click", () => switchTab("campaign"));
-  bar.appendChild(campBtn);
-  openTabs.forEach(tab => {
-    const btn = document.createElement("button");
-    btn.className = "tab-btn" + (activeTab === tab.key ? " active" : "");
-    btn.innerHTML = `<span>${esc(tab.label || tab.key)}</span><span class="close-x" data-close="${esc(tab.key)}">x</span>`;
-    btn.addEventListener("click", (e) => {
-      if (e.target.dataset.close) { closeTestTab(e.target.dataset.close); return; }
-      switchTab(tab.key);
-    });
-    bar.appendChild(btn);
-  });
-}
-
-function updateAppendButtons() {
-  const on = openTabs.some(t => t.key === SR_KEY);
-  document.querySelectorAll("[data-rappend], #appendVcrmBtn").forEach(b => { b.style.display = on ? "" : "none"; });
-}
-
-function switchTab(key) {
-  activeTab = key;
-  if (key === SR_KEY) { srSync(); renderSrSide(); renderSrPreview(); }
-  if (key.startsWith("report-")) loadReport(key, key.slice(7));
-  document.getElementById("panel-campaign").classList.toggle("active", key === "campaign");
-  openTabs.forEach(tab => {
-    const panel = document.getElementById("panel-" + tab.key);
-    if (panel) panel.classList.toggle("active", key === tab.key);
-  });
-  renderTabBar();
-}
-
-function openTestTab(testId, title) {
-  const filename = testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test";
-  if (!openTabs.some(t => t.key === filename)) {
-    openTabs.push({key: filename, label: testId});
-    const panel = document.createElement("div");
-    panel.className = "test-panel";
-    panel.id = "panel-" + filename;
-    panel.innerHTML = `<iframe src="/test?load=${encodeURIComponent(filename)}"></iframe>`;
-    document.getElementById("panels").appendChild(panel);
-    const iframe = panel.querySelector("iframe");
-    iframe.addEventListener("load", () => {
-      // The editor's own ?load= fetch is async and typically resolves
-      // after this "load" event fires, so retry briefly rather than assume it's ready.
-      pollForLockIcon(iframe, filename, 10);
-      // The epic key is a plain variable the editor sets synchronously at
-      // script top, so it's already there by the time "load" fires -- no retry needed.
-      if (iframe.contentWindow) {
-        iframe.contentWindow.starfireJiraEpicKey = camp.jira_epic_key || "";
-      }
-    });
-  }
-  switchTab(filename);
-}
-
-// ---- Campaign report (SR) tab: header, sections, and appended VCRM / Test Reports ----
-const SR_KEY = "__sr__";
-function srIdFor(id) {
-  const s = String(id || "").trim();
-  return /^sc-/i.test(s) ? "SR-" + s.slice(3) : "SR-" + (s || "000");
-}
-function srHead() {
-  return [srIdFor(camp.id), camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" ");
-}
-function srItemLabel(it) {
-  if (it.type === "vcrm") return "VCRM";
-  if (it.type === "report") return reportIdFor(it.card);
-  const sec = it.idx !== undefined ? camp.sections[it.idx] : null;
-  return (sec ? sec[0] : it.header) || "(untitled section)";
-}
-
-// The VCRM and Sections always come first; Test Reports follow (each group keeps its own order).
-const srIsReport = it => it.type === "report";
-function srOrder() {
-  camp.campaign_report.items.sort((a, b) => srIsReport(a) - srIsReport(b));
-}
-
-// Sections stay live: every non-empty one the user hasn't removed from the report is in it.
-function srSync() {
-  const rep = camp.campaign_report;
-  if (!rep) return;
-  rep.dismissed = rep.dismissed || [];
-  rep.items = rep.items.filter(it => it.type !== "section" || it.idx === undefined || camp.sections[it.idx]);
-  camp.sections.forEach(([h, t], i) => {
-    const has = rep.items.some(it => it.type === "section" && it.idx === i);
-    if (!has && !rep.dismissed.includes(i) && ((h || "").trim() || (t || "").trim())) rep.items.push({type: "section", idx: i});
-  });
-  srOrder();
-}
-
-// A section deleted on the campaign tab shifts the ones after it.
-function srSectionDeleted(i) {
-  const rep = camp.campaign_report;
-  if (!rep) return;
-  const shift = n => n > i ? n - 1 : n;
-  rep.items = rep.items.filter(it => !(it.type === "section" && it.idx === i));
-  rep.items.forEach(it => { if (it.type === "section" && it.idx !== undefined) it.idx = shift(it.idx); });
-  rep.dismissed = (rep.dismissed || []).filter(n => n !== i).map(shift);
-}
-const SR_KINDS = {section: "section", vcrm: "matrix", report: "test report"};
-
-function srAppend(item) {
-  if (!camp.campaign_report) return "No campaign report yet.";
-  const items = camp.campaign_report.items;
-  if (items.some(x => x.type === item.type && x.card === item.card)) return "Already in " + srIdFor(camp.id);
-  items.push(item);
-  srOrder();
-  renderSrSide();
-  renderSrPreview();
-  return "Appended to " + srIdFor(camp.id);
-}
-
-function openSrTab() {
-  if (!camp.campaign_report) camp.campaign_report = {items: [], dismissed: []};
-  if (!openTabs.some(t => t.key === SR_KEY)) {
-    openTabs.push({key: SR_KEY, label: srIdFor(camp.id)});
-    const panel = document.createElement("div");
-    panel.className = "test-panel report-panel";
-    panel.id = "panel-" + SR_KEY;
-    panel.innerHTML = `
-      <div class="report-side">
-        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
-        <div class="report-box"><div class="report-label">Campaign report for</div><div class="report-for sr-for"></div></div>
-        <div class="report-box">
-          <div class="report-label">Contents</div>
-          <div class="sr-items"></div>
-          <div class="report-hint">Open the VCRM or a Test Report and press + append to add it here.</div>
-        </div>
-        <div class="report-btns">
-          <button class="btn" data-srrefresh>refresh</button>
-          <button class="btn" data-srprint>print / pdf</button>
-          <button class="btn" data-srdocx>.docx</button>
-        </div>
-        <div class="report-hint sr-status"></div>
-      </div>
-      <iframe class="report-frame" title="campaign report preview"></iframe>`;
-    document.getElementById("panels").appendChild(panel);
-    panel.querySelector("[data-srrefresh]").addEventListener("click", () => { srSync(); renderSrSide(); renderSrPreview(); });
-    panel.querySelector("[data-srprint]").addEventListener("click", printSr);
-    panel.querySelector("[data-srdocx]").addEventListener("click", docxSr);
-  }
-  switchTab(SR_KEY);
-}
-
-function renderSrSide() {
-  const panel = document.getElementById("panel-" + SR_KEY);
-  if (!panel || !camp.campaign_report) return;
-  panel.querySelector(".sr-for").textContent = srHead();
-  const items = camp.campaign_report.items, list = panel.querySelector(".sr-items");
-  list.innerHTML = items.length ? items.map((it, i) => `
-    <div class="sr-item">
-      <span class="sr-label"><span class="report-fname">${esc(srItemLabel(it))}</span><span class="report-kind">${SR_KINDS[it.type] || ""}</span></span>
-      <button class="btn mini btn-icon" data-srup="${i}" title="move up"${i === 0 || srIsReport(items[i - 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_UPWARD}</button>
-      <button class="btn mini btn-icon" data-srdown="${i}" title="move down"${i === items.length - 1 || srIsReport(items[i + 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_DOWNWARD}</button>
-      <button class="btn mini btn-icon btn-x" data-srdel="${i}" title="remove">${ICON_CLOSE}</button>
-    </div>`).join("") : `<div class="report-hint">Nothing added yet.</div>`;
-  const edit = (name, fn) => list.querySelectorAll(`button[data-${name}]`).forEach(b => b.addEventListener("click", () => {
-    fn(+b.dataset[name]);
-    renderSrSide();
-    renderSrPreview();
-  }));
-  edit("srup", i => { [items[i - 1], items[i]] = [items[i], items[i - 1]]; });
-  edit("srdown", i => { [items[i + 1], items[i]] = [items[i], items[i + 1]]; });
-  edit("srdel", i => {
-    const it = items[i];
-    if (it.type === "section" && it.idx !== undefined) camp.campaign_report.dismissed.push(it.idx);
-    items.splice(i, 1);
-  });
-}
-
-async function renderSrPreview() {
-  const panel = document.getElementById("panel-" + SR_KEY);
-  if (!panel) return;
-  const frame = panel.querySelector(".report-frame");
-  const res = await fetch("/export/campaign_report/print", {method: "POST", body: JSON.stringify({campaign: camp, preview: true})});
-  const scroll = frame.contentWindow ? frame.contentWindow.scrollY : 0;
-  frame.onload = () => frame.contentWindow.scrollTo(0, scroll);
-  frame.srcdoc = await res.text();
-}
-
-async function printSr() {
-  const w = window.open("", "_blank");
-  if (w) w.document.write("Generating...");
-  try {
-    const res = await fetch("/export/campaign_report/print", {method: "POST", body: JSON.stringify({campaign: camp, preview: false})});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    const text = await res.text();
-    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
-  } catch (err) {
-    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
-  }
-}
-
-async function docxSr() {
-  const status = document.querySelector("#panel-" + SR_KEY + " .sr-status");
-  try {
-    const res = await fetch("/export/campaign_report/docx", {method: "POST", body: JSON.stringify({campaign: camp})});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    download(srIdFor(camp.id) + ".docx", await res.blob());
-  } catch (err) {
-    status.textContent = `Docx export failed: ${err}`;
-  }
-}
-document.getElementById("buildSrBtn").addEventListener("click", openSrTab);
-
-// ---- Test Report (TR) tabs: one card's saved .test file, rendered by the server ----
-function reportIdFor(testId) {
-  const id = String(testId || "").trim();
-  return /^tc-/i.test(id) ? "TR-" + id.slice(3) : "TR-" + (id || "000");
-}
-const REPORT_KINDS = {csv: "csv", image: "image", txt: "text output", other: "listed by name"};
-const reportState = {};   // tab key -> {card, files, active}
-
-function openReportTab(testId) {
-  const key = "report-" + testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test";
-  if (!openTabs.some(t => t.key === key)) {
-    openTabs.push({key, label: reportIdFor(testId)});
-    const panel = document.createElement("div");
-    panel.className = "test-panel report-panel";
-    panel.id = "panel-" + key;
-    panel.innerHTML = `
-      <div class="report-side">
-        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
-        <div class="report-box"><div class="report-label">Report for</div><div class="report-for"></div></div>
-        <div class="report-box">
-          <div class="report-label report-files-title">Files for point</div>
-          <div class="report-files"></div>
-          <div class="report-hint">Files named <span class="report-prefix"></span>-anything.ext appear here. Tick the ones to add to the report. Click a point in the report to switch.</div>
-        </div>
-        <div class="report-btns">
-          <button class="btn" data-rrefresh>refresh</button>
-          <button class="btn" data-rprint>print / pdf</button>
-          <button class="btn" data-rdocx>.docx</button>
-          <button class="btn" data-rappend style="display:none">+ append</button>
-        </div>
-        <div class="report-hint report-status"></div>
-      </div>
-      <iframe class="report-frame" title="test report preview"></iframe>`;
-    document.getElementById("panels").appendChild(panel);
-    panel.querySelector("[data-rrefresh]").addEventListener("click", () => loadReport(key, key.slice(7)));
-    panel.querySelector("[data-rprint]").addEventListener("click", () => printReport(key));
-    panel.querySelector("[data-rdocx]").addEventListener("click", () => docxReport(key));
-    panel.querySelector("[data-rappend]").addEventListener("click", () => {
-      const st = reportState[key];
-      if (st && st.card) panel.querySelector(".report-status").textContent = srAppend({type: "report", card: st.card.id});
-    });
-  }
-  switchTab(key);
-}
-
-function reportTicks(card) {
-  camp.reports = camp.reports || {};
-  return camp.reports[card.id] = camp.reports[card.id] || {};
-}
-
-function reportPlots(card) {
-  const t = reportTicks(card);
-  return t.plot = t.plot || {};
-}
-
-function reportPayload(key, preview) {
-  const st = reportState[key];
-  return {card: st.card, campaign: camp.id || "", files: reportTicks(st.card), preview};
-}
-
-async function loadReport(key, filename) {
-  const panel = document.getElementById("panel-" + key);
-  if (!panel) return;
-  const st = reportState[key] || (reportState[key] = {active: null});
-  const status = panel.querySelector(".report-status");
-  try {
-    const res = await fetch("/load?file=" + encodeURIComponent(filename));
-    if (!res.ok) throw new Error(`${filename} not found. Save the card first.`);
-    st.card = await res.json();
-    const fr = await fetch(`/point_files?campaign=${encodeURIComponent(camp.id || "")}&card=${encodeURIComponent(st.card.id || "")}`);
-    st.files = (await fr.json()).files || {};
-    const seqs = (st.card.points || []).map(p => String(p.seq));
-    if (!seqs.includes(st.active)) st.active = seqs[0] || null;
-    status.textContent = "Shows the card as last saved.";
-  } catch (err) {
-    status.textContent = String(err.message || err);
-    return;
-  }
-  renderReportSide(key);
-  await renderReportPreview(key);
-}
-
-function renderReportSide(key) {
-  const st = reportState[key], panel = document.getElementById("panel-" + key);
-  if (!st || !st.card || !panel) return;
-  panel.querySelector(".report-for").textContent = [reportIdFor(st.card.id), st.card.title, st.card.revision ? "REV " + st.card.revision.toUpperCase() : ""].filter(Boolean).join(" ");
-  panel.querySelector(".report-files-title").textContent = "Files for point " + (st.active ?? "");
-  panel.querySelector(".report-prefix").textContent = `${camp.id || "XX-000"}-${st.card.id}-${st.active}`;
-  const files = st.files[st.active] || [];
-  const ticked = reportTicks(st.card)[st.active] || [], plotted = reportPlots(st.card)[st.active] || [];
-  const list = panel.querySelector(".report-files");
-  list.innerHTML = files.length ? files.map((f, j) => `
-    <label class="report-file"><input type="checkbox" data-rfile="${j}"${ticked.includes(f.name) ? " checked" : ""}>
-      <span><span class="report-fname">${esc(f.name)}</span><span class="report-kind kind-${esc(f.kind)}">${REPORT_KINDS[f.kind] || ""}</span></span>${f.kind === "csv" && ticked.includes(f.name) ? `<button class="btn btn-plot${plotted.includes(f.name) ? " on" : ""}" data-rplot="${j}">plot</button>` : ""}</label>`).join("")
-    : `<div class="report-hint">No files for this point yet.</div>`;
-  list.querySelectorAll("input[data-rfile]").forEach(cb => cb.addEventListener("change", () => {
-    const all = reportTicks(st.card), name = files[+cb.dataset.rfile].name;
-    all[st.active] = (all[st.active] || []).filter(n => n !== name).concat(cb.checked ? [name] : []);
-    if (!cb.checked) { const pl = reportPlots(st.card); pl[st.active] = (pl[st.active] || []).filter(n => n !== name); }
-    renderReportSide(key);
-    renderReportPreview(key);
-  }));
-  list.querySelectorAll("button[data-rplot]").forEach(b => b.addEventListener("click", e => {
-    e.preventDefault();
-    const pl = reportPlots(st.card), name = files[+b.dataset.rplot].name, cur = pl[st.active] || [];
-    pl[st.active] = cur.includes(name) ? cur.filter(n => n !== name) : cur.concat([name]);
-    renderReportSide(key);
-    renderReportPreview(key);
-  }));
-}
-
-async function renderReportPreview(key) {
-  const st = reportState[key], panel = document.getElementById("panel-" + key);
-  const frame = panel.querySelector(".report-frame");
-  const res = await fetch("/export/report/print", {method: "POST", body: JSON.stringify(reportPayload(key, true))});
-  const scroll = frame.contentWindow ? frame.contentWindow.scrollY : 0;
-  frame.onload = () => {
-    const doc = frame.contentDocument;
-    frame.contentWindow.scrollTo(0, scroll);
-    doc.querySelectorAll(".rp-point").forEach(sec => {
-      sec.classList.toggle("rp-active", sec.dataset.seq === String(st.active));
-      sec.addEventListener("click", () => {
-        st.active = sec.dataset.seq;
-        doc.querySelectorAll(".rp-point").forEach(x => x.classList.toggle("rp-active", x === sec));
-        renderReportSide(key);
-      });
-    });
-  };
-  frame.srcdoc = await res.text();
-}
-
-async function printReport(key) {
-  if (!reportState[key] || !reportState[key].card) return;
-  // Opened before the await, so a popup blocker doesn't kill it.
-  const w = window.open("", "_blank");
-  if (w) w.document.write("Generating...");
-  try {
-    const res = await fetch("/export/report/print", {method: "POST", body: JSON.stringify(reportPayload(key, false))});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    const text = await res.text();
-    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
-  } catch (err) {
-    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
-  }
-}
-
-async function docxReport(key) {
-  const st = reportState[key];
-  if (!st || !st.card) return;
-  const status = document.getElementById("panel-" + key).querySelector(".report-status");
-  try {
-    const res = await fetch("/export/report/docx", {method: "POST", body: JSON.stringify(reportPayload(key, false))});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    download(reportIdFor(st.card.id) + ".docx", await res.blob());
-  } catch (err) {
-    status.textContent = `Docx export failed: ${err}`;
-  }
-}
-
-function pollForLockIcon(iframe, filename, attemptsLeft) {
-  if (attemptsLeft <= 0) return;
-  const iCard = iframe.contentWindow.getCard ? iframe.contentWindow.getCard() : null;
-  if (iCard && iCard.locked) {
-    const tab = openTabs.find(t => t.key === filename);
-    const lockIcon = "\U0001F512";
-    if (tab && !tab.label.startsWith(lockIcon)) {
-      tab.label = lockIcon + " " + tab.label;
-      renderTabBar();
-    }
-    return;
-  }
-  setTimeout(() => pollForLockIcon(iframe, filename, attemptsLeft - 1), 200);
-}
-
-function closeTestTab(key) {
-  openTabs = openTabs.filter(t => t.key !== key);
-  const panel = document.getElementById("panel-" + key);
-  if (panel) panel.remove();
-  if (activeTab === key) switchTab("campaign");
-  else renderTabBar();
-}
-
-// A single reserved tab, regenerated in place rather than duplicated on
-// repeat clicks. Read-only: shows a computed snapshot, not edited in the UI.
-const VCRM_KEY = "__vcrm__";
-let currentVcrm = null;
-
-function vcrmCoveringStr(row) {
-  if (!row.covering_tests.length) return "--";
-  return row.covering_tests.map(c => `${c.test_id} (${STATUS_LABELS[c.status] || c.status || "[None]"})`).join(", ");
-}
-
-async function generateVcrm() {
-  const status = document.getElementById("saveStatus");
-  try {
-    const res = await fetch("/vcrm", {method: "POST", body: JSON.stringify(camp)});
-    if (!res.ok) throw new Error(`server returned ${res.status}`);
-    currentVcrm = await res.json();
-  } catch (err) {
-    status.textContent = `VCRM generation failed: ${err}`;
-    return;
-  }
-
-  if (!openTabs.some(t => t.key === VCRM_KEY)) {
-    openTabs.push({key: VCRM_KEY, label: "VCRM"});
-  }
-  let panel = document.getElementById("panel-" + VCRM_KEY);
-  if (!panel) {
-    panel = document.createElement("div");
-    panel.className = "panel split";
-    panel.id = "panel-" + VCRM_KEY;
-    document.getElementById("panels").appendChild(panel);
-  }
-  const rows = currentVcrm.rows.map(r => `
-    <tr>
-      <td>${esc(r.requirement)}</td>
-      <td>${esc(r.description)}</td>
-      <td>${esc(vcrmCoveringStr(r))}</td>
-      <td>${esc(r.coverage)}</td>
-      <td>${esc(currentVcrm.generated)}</td>
-    </tr>`).join("");
-  panel.innerHTML = `
-    <div class="report-side">
-      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
-      <div class="report-box"><div class="report-label">Verification Cross-Reference Matrix for Test Campaign</div>
-        <div class="report-for">${esc([camp.id, camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" "))}</div></div>
-      <div class="side-btns">
-        <button class="btn" id="saveVcrmBtn">export .vcrm file</button>
-        <button class="btn" id="printVcrmBtn">generate .pdf</button>
-        <button class="btn" id="docxVcrmBtn">export .docx</button>
-        <button class="btn" id="csvVcrmBtn">export .csv</button>
-        <button class="btn" id="appendVcrmBtn" style="display:none">+ append</button>
-      </div>
-      <div id="vcrmStatus" class="hint"></div>
-    </div>
-    <div class="side-main"><div class="side-inner">
-    <div class="side-head">${esc([camp.id, camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" "))}</div>
-    <div class="side-meta">
-      <span><b>Campaign:</b> ${esc(camp.id)}</span>
-      <span><b>Project:</b> ${esc(camp.project)}</span>
-      <span><b>System/Subsystem:</b> ${esc(camp.system)} / ${esc(camp.subsystem)}</span>
-    </div>
-    <div class="side-meta">
-      <span><b>Test Lead:</b> ${esc(camp.test_lead)}</span>
-      <span><b>Quality Assurance:</b> ${esc(camp.quality_assurance)}</span>
-      <span><b>Date:</b> ${esc(camp.date)}</span>
-    </div>
-    <h2 class="no-rule">Verification Cross-Reference Matrix</h2>
-    <table class="datatable">
-      <tr><th>Requirement</th><th>Description</th><th>Covering Tests</th><th>Status</th><th>Updated</th></tr>
-      ${rows || '<tr><td colspan="5">No requirements entered on this campaign yet.</td></tr>'}
-    </table>
-    </div></div>`;
-
-  const vcrmStatus = panel.querySelector("#vcrmStatus");
-  panel.querySelector("#appendVcrmBtn").addEventListener("click", () => { vcrmStatus.textContent = srAppend({type: "vcrm"}); });
-  updateAppendButtons();
-  panel.querySelector("#saveVcrmBtn").addEventListener("click", async () => {
-    try {
-      const res = await fetch("/save_vcrm", {method: "POST", body: JSON.stringify(currentVcrm)});
-      const data = await res.json();
-      vcrmStatus.textContent = data.saved ? `Saved to ${data.path}` : `Save failed: ${data.error || "unknown error"}`;
-    } catch (err) {
-      vcrmStatus.textContent = `Save failed: ${err}`;
-    }
-  });
-  panel.querySelector("#printVcrmBtn").addEventListener("click", async () => {
-    // Open synchronously, before the await below -- see the same note on
-    // printCampBtn above for why.
-    const w = window.open("", "_blank");
-    if (w) w.document.write("Generating...");
-    try {
-      const res = await fetch("/export/vcrm/print", {method: "POST", body: JSON.stringify(currentVcrm)});
-      if (!res.ok) throw new Error(`server returned ${res.status}`);
-      const text = await res.text();
-      if (w) { w.document.open(); w.document.write(text); w.document.close(); }
-    } catch (err) {
-      if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
-      vcrmStatus.textContent = `Print failed: ${err}`;
-    }
-  });
-  panel.querySelector("#csvVcrmBtn").addEventListener("click", async () => {
-    try {
-      const res = await fetch("/export/vcrm/csv", {method: "POST", body: JSON.stringify(currentVcrm)});
-      if (!res.ok) throw new Error(`server returned ${res.status}`);
-      download((currentVcrm.campaign_id || "vcrm") + "-test-matrix.csv", await res.text(), "text/csv");
-    } catch (err) {
-      vcrmStatus.textContent = `CSV export failed: ${err}`;
-    }
-  });
-  panel.querySelector("#docxVcrmBtn").addEventListener("click", async () => {
-    try {
-      const res = await fetch("/export/vcrm/docx", {method: "POST", body: JSON.stringify(currentVcrm)});
-      if (!res.ok) throw new Error(`server returned ${res.status}`);
-      const blob = await res.blob();
-      download((currentVcrm.campaign_id || "vcrm") + ".docx", blob);
-    } catch (err) {
-      vcrmStatus.textContent = `Docx export failed: ${err}`;
-    }
-  });
-
-  switchTab(VCRM_KEY);
-}
-document.getElementById("genVcrmBtn").addEventListener("click", generateVcrm);
-
-bindMeta();
-camp.tests = [{seq: 1, test_id: "", title: "", author: "", requirements: "", status: ""}];
-renderRequirements();
-renderModules();
-loadModuleFiles();
-renderTests();
-renderAncillaryTests();
-renderSections();
-renderTabBar();
-</script>
-</body>
-</html>
-"""
 
 
 # HTTP server
@@ -3045,7 +1218,6 @@ def _safe_filename(stem: str, ext: str) -> str:
 
 # Optional integrations, each checked once at startup: jira_config.json turns Jira tickets on;
 # an executable `starfire-hw` (built from starfire.cpp) turns Sample / Activate on.
-JIRA_AVAILABLE = jira_ticket.load_config() is not None
 
 
 def _program_dir() -> str:
@@ -3056,6 +1228,176 @@ def _modules_dir() -> str:
     # The dist/ folder: next to the built binary, or ./dist beside this script when run from source (where starfi.sh puts its output).
     here = _program_dir()
     return here if getattr(sys, "frozen", False) else os.path.join(here, "dist")
+
+
+# Jira tickets: on only if jira_config.json is in the working directory or next to the program.
+JIRA_CONFIG_FILENAME = "jira_config.json"
+
+JIRA_CONFIG_TEMPLATE = {
+    "base_url": "https://yourteam.atlassian.net",
+    "email": "you@example.com",
+    "api_token": "",
+    "project_key": "PROJ",
+    # Bug for test point tickets, Task for campaign test rows.
+    "issue_type": "Bug",
+    "test_issue_type": "Task",
+    # Set automatically after the first ticket with an epic key.
+    "epic_link_field": None,
+}
+
+
+def _jira_config_path() -> str:
+    # Working directory first, then beside the program (dist/ when run from source).
+    for d in (os.getcwd(), _program_dir(), _modules_dir()):
+        p = os.path.join(d, JIRA_CONFIG_FILENAME)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(os.getcwd(), JIRA_CONFIG_FILENAME)
+
+
+def jira_load_config() -> dict | None:
+    path = _jira_config_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    required = ("base_url", "email", "api_token", "project_key")
+    if not all(cfg.get(k) for k in required):
+        return None
+    cfg["issue_type"] = cfg.get("issue_type") or "Bug"
+    cfg["test_issue_type"] = cfg.get("test_issue_type") or "Task"
+    cfg["epic_link_field"] = cfg.get("epic_link_field") or None
+    return cfg
+
+
+def _jira_save_epic_field(field_name: str) -> None:
+    # Best-effort cache; a failed write just means re-detecting next time.
+    path = _jira_config_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["epic_link_field"] = field_name
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
+def _jira_auth_header(cfg: dict) -> str:
+    token = base64.b64encode(f"{cfg['email']}:{cfg['api_token']}".encode()).decode()
+    return f"Basic {token}"
+
+
+def _jira_api_request(cfg: dict, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+    url = cfg["base_url"].rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", _jira_auth_header(cfg))
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else {})
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        try:
+            return e.code, json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            return e.code, {"errorMessages": [raw.decode(errors="replace")]}
+    except urllib.error.URLError as e:
+        return 0, {"errorMessages": [str(e.reason)]}
+
+
+def _jira_error_text(body: dict) -> str:
+    parts = list(body.get("errorMessages") or [])
+    for field, msg in (body.get("errors") or {}).items():
+        parts.append(f"{field}: {msg}")
+    return "; ".join(parts) if parts else "unknown Jira error"
+
+
+def _jira_find_epic_field(cfg: dict) -> str | None:
+    """Classic projects: find the custom field named 'Epic Link'."""
+    status, body = _jira_api_request(
+        cfg, "GET",
+        f"/rest/api/2/issue/createmeta?projectKeys={cfg['project_key']}&expand=projects.issuetypes.fields",
+    )
+    if status != 200:
+        return None
+    for project in body.get("projects", []):
+        for issuetype in project.get("issuetypes", []):
+            for field_id, field_meta in issuetype.get("fields", {}).items():
+                if (field_meta.get("name") or "").strip().lower() == "epic link":
+                    return field_id
+    return None
+
+
+def jira_create_ticket(summary: str, description: str, epic_key: str = "",
+                    issue_type: str | None = None) -> dict:
+    """Returns {"success": True, "key", "url"} or {"success": False, "error"}; never raises.
+    issue_type overrides the config's issue_type for this call."""
+    cfg = jira_load_config()
+    if not cfg:
+        return {"success": False,
+                 "error": f"No usable {JIRA_CONFIG_FILENAME} found "
+                          f"(or it's missing base_url/email/api_token/project_key)."}
+
+    issue = {
+        "project": {"key": cfg["project_key"]},
+        "summary": summary,
+        "description": description,
+        "issuetype": {"name": issue_type or cfg["issue_type"]},
+    }
+
+    epic_key = (epic_key or "").strip()
+    if epic_key:
+        cached = cfg.get("epic_link_field")
+        if cached:
+            issue[cached] = epic_key if cached != "parent" else {"key": epic_key}
+        else:
+            # Team-managed projects first; no metadata lookup needed.
+            issue["parent"] = {"key": epic_key}
+
+    status, body = _jira_api_request(cfg, "POST", "/rest/api/2/issue", {"fields": issue})
+
+    if status == 201:
+        if epic_key and not cfg.get("epic_link_field"):
+            _jira_save_epic_field("parent")
+        key = body.get("key", "")
+        return {"success": True, "key": key, "url": f"{cfg['base_url'].rstrip('/')}/browse/{key}"}
+
+    # "parent" failed: likely a classic project, so retry with the Epic Link field.
+    if epic_key and not cfg.get("epic_link_field") and "parent" in issue:
+        custom_field = _jira_find_epic_field(cfg)
+        if custom_field:
+            issue.pop("parent")
+            issue[custom_field] = epic_key
+            status2, body2 = _jira_api_request(cfg, "POST", "/rest/api/2/issue", {"fields": issue})
+            if status2 == 201:
+                _jira_save_epic_field(custom_field)
+                key = body2.get("key", "")
+                return {"success": True, "key": key,
+                         "url": f"{cfg['base_url'].rstrip('/')}/browse/{key}"}
+            return {"success": False, "error": _jira_error_text(body2)}
+
+    return {"success": False, "error": _jira_error_text(body)}
+
+
+JIRA_AVAILABLE = jira_load_config() is not None
+
+
+def _static_dir() -> str:
+    # Beside this script; in a PyInstaller build the bundled data is in sys._MEIPASS instead.
+    base = sys._MEIPASS if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS") else os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "static")
+
+
+def _read_static(name: str) -> str:
+    with open(os.path.join(_static_dir(), name), encoding="utf-8") as f:
+        return f.read()
 
 
 def _find_hardware_binary() -> str:
@@ -3143,12 +1485,28 @@ def _parse_args(text) -> list:
     return shlex.split(text)
 
 
+def _point_files_state(campaign_id: str, card_id: str, point_seq) -> dict:
+    # {name: (mtime, size)} of the files named for this point, to see what a run wrote.
+    pat = _point_file_pattern(campaign_id, card_id)
+    state = {}
+    try:
+        for n in os.listdir(os.getcwd()):
+            m = pat.match(n)
+            if m and m.group(1) == str(point_seq) and os.path.isfile(n):
+                st = os.stat(n)
+                state[n] = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        pass
+    return state
+
+
 def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: str = "", args="") -> dict:
     """Run one module from dist/ and wait for it. The name must be a bare
     filename that list_modules() reports -- never a path, so the browser can't
     point this at anything else. The module runs in the working directory
     (where .test files live) with STARFIRE_CAMPAIGN, STARFIRE_CARD, STARFIRE_POINT
     and, if found, STARFIRE_HW (path to starfire-hw) in its environment.
+    The result's "files" lists the files named for this point that the run created or changed.
     args is one command-line string, split into plain argv entries (no shell),
     so it reaches a module in any language the same way."""
     if name not in list_modules():
@@ -3167,6 +1525,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     argv += extra
     key = (str(card_id), str(point_seq))
     started = time.monotonic()
+    before = _point_files_state(campaign_id, card_id, point_seq)
     with _RUNS_LOCK:
         if key in _RUNS:
             return {"status": "failed", "error": "a module is already running on this point"}
@@ -3199,6 +1558,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         "exit_code": proc.returncode,
         "seconds": round(time.monotonic() - started, 1),
         "output": _cap_lines(out.decode("utf-8", "replace")),
+        "files": sorted(n for n, st in _point_files_state(campaign_id, card_id, point_seq).items() if before.get(n) != st),
     }
     if timed_out:
         result["error"] = f"timed out after {_MODULE_TIMEOUT_S} s"
@@ -3231,8 +1591,8 @@ def _fill_flags(html: str) -> str:
     return (html.replace("__JIRA_AVAILABLE__", "true" if JIRA_AVAILABLE else "false")
                 .replace("__HARDWARE_AVAILABLE__", "true" if HARDWARE_AVAILABLE else "false"))
 
-_TEST_HTML = _fill_flags(_TEST_HTML)
-_CAMPAIGN_HTML = _fill_flags(_CAMPAIGN_HTML)
+_TEST_HTML = _fill_flags(_read_static("test.html"))
+_CAMPAIGN_HTML = _fill_flags(_read_static("campaign.html"))
 
 _POINT_FILE_EXTS = ("csv", "txt")
 _POINT_FILE_MAX = 5_000_000   # characters
@@ -3283,7 +1643,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"modules": list_modules()})
         elif path == "/point_files":
             qs = parse_qs(parsed.query)
-            self._send_json(200, {"files": list_point_files((qs.get("campaign") or [""])[0], (qs.get("card") or [""])[0])})
+            try:
+                attached = json.loads(qs["attached"][0]) if "attached" in qs else None
+            except json.JSONDecodeError:
+                attached = {}
+            self._send_json(200, {"files": list_point_files((qs.get("campaign") or [""])[0], (qs.get("card") or [""])[0],
+                                                              attached if isinstance(attached, dict) or attached is None else {})})
         elif path == "/list_files":
             # Lists files in the working directory by extension.
             qs = parse_qs(parsed.query)
@@ -3306,15 +1671,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
     def _serve_static(self, filename: str) -> None:
-        # CSS assets live next to the script itself, not cwd (reserved for
-        # user data). Under a PyInstaller build __file__ isn't reliable for
-        # bundled data, so sys._MEIPASS (the extraction dir) is used instead.
         safe = os.path.basename(filename)
-        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            base_dir = sys._MEIPASS
-        else:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(base_dir, "static", safe)
+        file_path = os.path.join(_static_dir(), safe)
         if not safe or not os.path.isfile(file_path):
             self._send(404, "text/plain", b"not found")
             return
@@ -3373,12 +1731,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"success": False, "error": f"bad request: {e}"})
             return
         try:
-            result = jira_ticket.create_ticket(
+            result = jira_create_ticket(
                 payload.get("summary", ""), payload.get("description", ""),
                 payload.get("epic_key", ""), payload.get("issue_type") or None,
             )
         except Exception as e:
-            result = {"success": False, "error": f"jira_ticket.py raised: {e}"}
+            result = {"success": False, "error": f"Jira ticket creation raised: {e}"}
         self._send_json(200, result)
 
     def _handle_hardware(self, raw_body: bytes):
@@ -3446,6 +1804,20 @@ class _Handler(BaseHTTPRequestHandler):
                                         payload.get("point", ""), payload.get("campaign", ""),
                                         payload.get("args", "")))
 
+    def _handle_add_card_file(self, raw_body: bytes):
+        # {"campaign", "card", "point", "name", "data": base64} -> <campaign>-<card>-<point>-<name>
+        payload = self._local_json_payload(raw_body)
+        if payload is None:
+            return
+        try:
+            data = base64.b64decode(payload.get("data") or "", validate=True)
+        except (binascii.Error, ValueError, TypeError):
+            self._send_json(400, {"saved": False, "error": "bad request"})
+            return
+        r = add_card_file(str(payload.get("campaign") or ""), str(payload.get("card") or ""),
+                          payload.get("point"), payload.get("name"), data)
+        self._send_json(200 if r["saved"] else 400, r)
+
     def _handle_break_module(self, raw_body: bytes):
         payload = self._local_json_payload(raw_body)
         if payload is None:
@@ -3488,6 +1860,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._handle_break_module(raw)
         if path == "/save_point_file":
             return self._handle_save_point_file(raw)
+        if path == "/add_card_file":
+            return self._handle_add_card_file(raw)
         try:
             data = json.loads(raw)
         except json.JSONDecodeError as e:
@@ -3512,7 +1886,7 @@ class _Handler(BaseHTTPRequestHandler):
             else:
                 self._write_file(_safe_filename(card.id, ".test"), card.to_dict())
         # Campaign routes
-        elif path in ("/save_campaign", "/export/campaign/print", "/export/campaign/docx", "/vcrm"):
+        elif path in ("/save_campaign", "/export/campaign/print", "/export/campaign/docx", "/vcrm", "/campaign_status"):
             camp = Campaign.from_dict(data)
             if path == "/save_campaign":
                 self._write_file(_safe_filename(camp.id, ".camp"), camp.to_dict())
@@ -3520,8 +1894,13 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, "text/html", export_campaign_print_html(camp, host).encode())
             elif path == "/export/campaign/docx":
                 self._send(200, _DOCX_MIME, export_campaign_docx(camp))
+            elif path == "/campaign_status":
+                self._send_json(200, campaign_statuses(camp))
             else:
                 self._send_json(200, compute_vcrm(camp))
+        # Create test: {"campaign": <the .camp dict>, "requirements": [codes]}
+        elif path == "/create_test":
+            self._send_json(200, create_test(Campaign.from_dict(data["campaign"]), data["requirements"]))
         # Test Report routes: {"card", "campaign", "files": {seq: [names]}, "preview"}
         elif path in ("/export/report/print", "/export/report/docx"):
             card = TestCard.from_dict(data["card"])
