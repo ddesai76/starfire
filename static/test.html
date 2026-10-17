@@ -1,0 +1,1040 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Starfire -- test card</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/starfire.css">
+</head>
+<body class="editor-doc">
+<div id="panels"><div class="panel active split">
+<div class="report-side">
+<div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+<div class="side-btns" id="exportRow">
+  <button class="btn" id="loadJsonBtn">import test file</button>
+  <input type="file" id="loadJsonFile" accept=".test,.json,application/json" style="display:none">
+  <button class="btn" id="saveUnlockedBtn">export unlocked test file (.test)</button>
+  <button class="btn" id="saveLockedBtn">export locked test file (.test)</button>
+  <button class="btn" id="exportCsvBtn">export .csv</button>
+  <button class="btn" id="exportPrintBtn">generate card</button>
+  <button class="btn" id="exportDocxBtn">export .docx</button>
+  <button class="btn" id="buildReportBtn" style="display:none">build test report</button>
+</div>
+<div id="saveStatus" class="hint"></div>
+</div>
+<div class="side-main"><div class="side-inner">
+
+<h2>Card metadata</h2>
+<div class="meta">
+  <div class="field"><label>ID</label><input id="m-id"></div>
+  <div class="field"><label>Title</label><input id="m-title"></div>
+  <div class="field"><label>Revision</label><input id="m-revision"></div>
+  <div class="field"><label>Project</label><input id="m-project"></div>
+  <div class="field"><label>Author</label><input id="m-author"></div>
+  <div class="field"><label>Test Conductor</label><input id="m-test_conductor"></div>
+  <div class="field"><label>Quality Assurance</label><input id="m-quality_assurance"></div>
+  <div class="field"><label>Date</label><input id="m-date"></div>
+  <div class="field"><label>System / Subsystem</label><input id="m-system"></div>
+  <div class="field"><label>Test type</label><input id="m-test_type"></div>
+  <div class="field"><label>Article / S/N</label><input id="m-article"></div>
+  <div class="field"><label>Requirement(s)</label><input id="m-requirements"></div>
+</div>
+
+<h2 class="no-rule">Test points</h2>
+<div id="pointsList"></div>
+<div class="row"><button class="btn btn-plus" id="addPointBtn" title="add point">+</button></div>
+
+<h2 class="no-rule">Nomenclature</h2>
+<table class="nomtable" id="nomTable">
+  <tr><th>Symbol</th><th>Definition</th><th>Units</th><th class="blank-th" style="width:60px"></th></tr>
+</table>
+<div class="row"><button class="btn btn-plus" id="addNomBtn" title="add symbol">+</button></div>
+
+<h2 class="no-rule">References</h2>
+<table class="nomtable" id="refTable">
+  <tr><th>Reference</th><th>Description</th><th class="blank-th" style="width:60px"></th></tr>
+</table>
+<div class="row"><button class="btn btn-plus" id="addRefBtn" title="add reference">+</button></div>
+
+
+<h2 class="no-rule">Warnings</h2>
+<div id="warningsList"></div>
+<div class="row"><button class="btn btn-plus" id="addWarningBtn" title="add warning">+</button></div>
+
+<h2 class="no-rule">Notes</h2>
+<div id="notesList"></div>
+<div class="row"><button class="btn btn-plus" id="addNoteBtn" title="add note">+</button></div>
+
+</div></div>
+</div></div>
+
+<script>
+// True only if jira_config.json was found in the working directory at
+// startup -- see the Jira section of starfire.py.
+const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
+
+// True only if the starfire-hw binary was found -- the Measure
+// panel opens either way, this just controls whether Sample/Activate send anything.
+const HARDWARE_AVAILABLE = __HARDWARE_AVAILABLE__;
+
+// Set by the campaign page right after this iframe loads (openTestTab());
+// `var` (not `let`) so that external write reaches this binding.
+var starfireJiraEpicKey = "";
+
+let card = {
+  id: "TC-001", title: "Untitled Test Card", revision: "A", author: "",
+  date: new Date().toISOString().slice(0,10), project: "", test_conductor: "",
+  quality_assurance: "", system: "", subsystem: "", test_type: "", article: "", requirements: "",
+  points: [], nomenclature: [], references: [], notes: [], warnings: [], locked: false,
+  files_migrated: true
+};
+
+const metaFields = ["id","title","revision","author","date","project","test_conductor","quality_assurance","test_type","article","requirements"];
+const ALWAYS_EDITABLE_META = new Set(["test_conductor", "quality_assurance", "date", "article"]);
+function bindMeta() {
+  metaFields.forEach(f => {
+    const el = document.getElementById("m-" + f);
+    el.value = card[f] ?? "";
+    el.disabled = !!card.locked && !ALWAYS_EDITABLE_META.has(f);
+    el.addEventListener("input", () => { card[f] = el.value; });
+  });
+  const sysEl = document.getElementById("m-system");
+  sysEl.value = [card.system, card.subsystem].filter(Boolean).join(" / ");
+  sysEl.disabled = !!card.locked;
+  sysEl.addEventListener("input", () => {
+    const parts = sysEl.value.split("/").map(s => s.trim());
+    card.system = parts[0] || ""; card.subsystem = parts[1] || "";
+  });
+}
+
+function nextSeq() {
+  const max = card.points.reduce((m, p) => Math.max(m, +p.seq || 0), 0);
+  return Math.floor(max / 10) * 10 + 10;
+}
+
+// Number for a copy of point i, which goes right below it: the midpoint of the gap to the
+// next point if there is one (20, 30 -> 25), else the lowest unused number above it.
+function duplicateSeq(points, i) {
+  const used = new Set(points.map(p => +p.seq));
+  const s = +points[i].seq, n = i + 1 < points.length ? +points[i + 1].seq : NaN;
+  const mid = Math.floor((s + n) / 2);
+  if (n - s > 1 && !used.has(mid)) return mid;
+  if (isNaN(n) || n <= s) { const next = nextSeq(); if (!used.has(next) && next > s) return next; }
+  let k = s + 1;
+  while (used.has(k)) k++;
+  return k;
+}
+
+// A copy of point i with only its procedure kept (not results, sign-off, photos or files).
+function duplicatePoint(i) {
+  const src = card.points[i];
+  card.points.splice(i + 1, 0, {seq: duplicateSeq(card.points, i), action: src.action, expected: src.expected,
+                     observed: "", reference: src.reference, responsible_party: src.responsible_party,
+                     date: "", time: "", initial: "", quality: "", locked: false, flagged: false, images: [], files: [],
+                     usb_port: src.usb_port, measure_command: src.measure_command, measurements: []});
+}
+
+// Google Material Symbols, embedded inline (not a file/CDN) so they work
+// fully offline; fill="currentColor" picks up each button's own hover color.
+const ICON_FLAG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-680h360l16 80h224v400H520l-16-80H280v280h-80Zm300-440Zm86 160h134v-240H510l-16-80H280v240h290l16 80Z"/></svg>';
+const ICON_PHOTO_CAMERA = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-260q75 0 127.5-52.5T660-440q0-75-52.5-127.5T480-620q-75 0-127.5 52.5T300-440q0 75 52.5 127.5T480-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29ZM160-120q-33 0-56.5-23.5T80-200v-480q0-33 23.5-56.5T160-760h126l74-80h240l74 80h126q33 0 56.5 23.5T880-680v480q0 33-23.5 56.5T800-120H160Zm0-80h640v-480H638l-73-80H395l-73 80H160v480Zm320-240Z"/></svg>';
+const ICON_ADD_A_PHOTO = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-440ZM120-120q-33 0-56.5-23.5T40-200v-480q0-33 23.5-56.5T120-760h126l74-80h240v80H355l-73 80H120v480h640v-360h80v360q0 33-23.5 56.5T760-120H120Zm640-560v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80ZM440-260q75 0 127.5-52.5T620-440q0-75-52.5-127.5T440-620q-75 0-127.5 52.5T260-440q0 75 52.5 127.5T440-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29Z"/></svg>';
+const ICON_SPEED = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-316.5q38-.5 56-27.5l224-336-336 224q-27 18-28.5 55t22.5 61q24 24 62 23.5Zm0-483.5q59 0 113.5 16.5T696-734l-76 48q-33-17-68.5-25.5T480-720q-133 0-226.5 93.5T160-400q0 42 11.5 83t32.5 77h552q23-38 33.5-79t10.5-85q0-36-8.5-70T766-540l48-76q30 47 47.5 100T880-406q1 57-13 109t-41 99q-11 18-30 28t-40 10H204q-21 0-40-10t-30-28q-26-45-40-95.5T80-400q0-83 31.5-155.5t86-127Q252-737 325-768.5T480-800Zm7 313Z"/></svg>';
+const ICON_DOWNLOAD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-320 280-520l56-58 104 104v-326h80v326l104-104 56 58-200 200ZM240-160q-33 0-56.5-23.5T160-240v-120h80v120h480v-120h80v120q0 33-23.5 56.5T720-160H240Z"/></svg>';
+const ICON_BOLT = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m422-232 207-248H469l29-227-185 267h139l-30 208ZM320-80l40-280H160l360-520h80l-40 320h240L400-80h-80Zm151-390Z"/></svg>';
+// Crosshair: "sample this reading". Children set fill="none" explicitly, since
+// .btn-icon svg's CSS fill would otherwise paint them solid.
+const ICON_BOOKMARK_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-640q0-33 23.5-56.5T280-840h240v80H280v518l200-86 200 86v-278h80v400L480-240 200-120Zm80-640h240-240Zm400 160v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80Z"/></svg>';
+const ICON_ARROW_UPWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-160v-487L216-423l-56-57 320-320 320 320-56 57-224-224v487h-80Z"/></svg>';
+const ICON_ARROW_DOWNWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-800v487L216-537l-56 57 320 320 320-320-56-57-224 224v-487h-80Z"/></svg>';
+const ICON_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-440H200v-80h240v-240h80v240h240v80H520v240h-80v-240Z"/></svg>';
+const ICON_ATTACH = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M720-330q0 104-73 177T470-80q-104 0-177-73t-73-177v-370q0-75 52.5-127.5T400-880q75 0 127.5 52.5T580-700v350q0 46-32 78t-78 32q-46 0-78-32t-32-78v-330h80v330q0 13 8.5 21.5T470-320q13 0 21.5-8.5T500-350v-350q-1-42-29.5-71T400-800q-42 0-71 29t-29 71v370q-1 71 49 120.5T470-160q70 0 119-49.5T640-330v-390h80v390Z"/></svg>';
+const ICON_CONTENT_COPY = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M360-240q-33 0-56.5-23.5T280-320v-480q0-33 23.5-56.5T360-880h360q33 0 56.5 23.5T800-800v480q0 33-23.5 56.5T720-240H360Zm0-80h360v-480H360v480ZM200-80q-33 0-56.5-23.5T120-160v-560h80v560h440v80H200Zm160-240v-480 480Z"/></svg>';
+const ICON_CLOSE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>';
+// A thumbnail chip's own label icon, distinct from the point-button-cluster icons above.
+const ICON_IMAGE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm0-80h560v-560H200v560Zm40-80h480L570-480 450-320l-90-120-120 160Zm-40 80v-560 560Z"/></svg>';
+
+const QUALITY_OPTIONS = [
+  ["", "[None]"],
+  ["RFI", "🔵 RFI"],
+  ["PASS", "🟢 PASS"],
+  ["CAUTION", "🟠 CAUTION"],
+  ["FAIL", "🔴 FAIL"],
+];
+function qualitySelect(i, current) {
+  const opts = QUALITY_OPTIONS.map(([v, label]) =>
+    `<option value="${v}"${v === current ? " selected" : ""}>${label}</option>`).join("");
+  return `<select data-i="${i}" data-f="quality">${opts}</select>`;
+}
+
+// One camera stream shared across all points, acquired once via
+// getUserMedia() -- reaches any UVC-class video device the OS exposes.
+let cameraStream = null;
+let cameraVideo = null;
+let cameraCanvas = null;
+let previewOpenIndex = null;
+
+function ensureCameraElements() {
+  if (!cameraVideo) {
+    cameraVideo = document.createElement("video");
+    cameraVideo.autoplay = true;
+    cameraVideo.muted = true;
+    cameraVideo.playsInline = true;
+    cameraVideo.className = "cam-preview";
+  }
+  if (!cameraCanvas) cameraCanvas = document.createElement("canvas");
+}
+
+async function ensureCameraStream() {
+  if (cameraStream) return cameraStream;
+  ensureCameraElements();
+  cameraStream = await navigator.mediaDevices.getUserMedia({video: true});
+  cameraVideo.srcObject = cameraStream;
+  return cameraStream;
+}
+
+function reattachPreviewIfOpen() {
+  if (previewOpenIndex === null) return;
+  const slot = document.getElementById("pt-camera-" + previewOpenIndex);
+  if (slot && cameraVideo) slot.appendChild(cameraVideo);
+}
+
+function showCamMessage(i, text) {
+  const el = document.getElementById("pt-cam-msg-" + i);
+  if (!el) return;
+  el.textContent = text;
+  setTimeout(() => { if (el.textContent === text) el.textContent = ""; }, 4000);
+}
+
+async function capturePointImage(i) {
+  try {
+    await ensureCameraStream();
+  } catch (err) {
+    showCamMessage(i, "No camera available");
+    return;
+  }
+  const w = cameraVideo.videoWidth, h = cameraVideo.videoHeight;
+  if (!w || !h) { showCamMessage(i, "Camera not ready yet -- try again"); return; }
+  cameraCanvas.width = w; cameraCanvas.height = h;
+  cameraCanvas.getContext("2d").drawImage(cameraVideo, 0, 0, w, h);
+  const dataUrl = cameraCanvas.toDataURL("image/jpeg", 0.9);
+  try {
+    const res = await fetch("/capture_image", {method: "POST", body: JSON.stringify({data: dataUrl})});
+    const result = await res.json();
+    if (!result.saved) throw new Error(result.error || "unknown error");
+    card.points[i].images = card.points[i].images || [];
+    card.points[i].images.push(result.filename);
+    renderPoints();
+    showCamMessage(i, "Captured " + result.filename);
+  } catch (err) {
+    showCamMessage(i, "Capture failed: " + err);
+  }
+}
+
+async function createJiraTicket(i) {
+  const p = card.points[i];
+  const msgEl = document.getElementById("pt-jira-msg-" + i);
+  if (msgEl) msgEl.innerHTML = "Creating ticket...";
+  const summary = `${card.id} pt ${p.seq}: ${(p.action || "(no action text)").slice(0, 120)}`;
+  const description = [
+    `Test: ${card.id} -- ${card.title}`,
+    `Point ${p.seq}`,
+    `Action: ${p.action || ""}`,
+    `Expected: ${p.expected || ""}`,
+    `Observed: ${p.observed || ""}`,
+    `Reference: ${p.reference || ""}`,
+    `Quality: ${p.quality || ""}`,
+  ].join("\n");
+  try {
+    const res = await fetch("/create_jira_ticket", {
+      method: "POST",
+      body: JSON.stringify({summary, description, epic_key: starfireJiraEpicKey || ""}),
+    });
+    const result = await res.json();
+    if (!msgEl) return;
+    if (result.success) {
+      msgEl.innerHTML = `Created <a href="${esc(result.url)}" target="_blank" rel="noopener">${esc(result.key)}</a>`;
+    } else {
+      msgEl.textContent = `Ticket creation failed: ${result.error || "unknown error"}`;
+    }
+  } catch (err) {
+    if (msgEl) msgEl.textContent = `Ticket creation failed: ${err}`;
+  }
+}
+
+function togglePreview(i) {
+  if (previewOpenIndex === i) {
+    if (cameraVideo && cameraVideo.parentElement) cameraVideo.parentElement.removeChild(cameraVideo);
+    previewOpenIndex = null;
+    return;
+  }
+  ensureCameraStream().then(() => {
+    const slot = document.getElementById("pt-camera-" + i);
+    if (cameraVideo.parentElement) cameraVideo.parentElement.removeChild(cameraVideo);
+    slot.appendChild(cameraVideo);
+    previewOpenIndex = i;
+  }).catch(() => {
+    showCamMessage(i, "No camera available");
+  });
+}
+
+// Unlike the camera (one shared hardware stream, so only one point's
+// preview can be open at a time), Measure is just form fields -- any
+// number of points can have it open simultaneously.
+let measureOpenIndices = new Set();
+
+// The gauge button opens/closes the panel (a point that already has readings keeps
+// its panel showing, so closing only hides an empty one).
+function toggleMeasure(i) {
+  if (!measureOpenIndices.delete(i)) {
+    measureOpenIndices.add(i);
+    // First open of a point with no readings -- seed one blank row so
+    // there's something to type into right away.
+    if (card.points[i].measurements.length === 0) {
+      card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
+    }
+  }
+  renderPoints();
+}
+
+// SEND: the line in the Command box goes to the instrument. starfire-hw says
+// whether it was a query or a command: a query's reply is logged as a reading,
+// a command is just confirmed here.
+async function sendMeasurement(i) {
+  const p = card.points[i];
+  const msgEl = document.getElementById("pt-measure-msg-" + i);
+  const say = (cls, text) => { if (msgEl) { msgEl.className = "module-status " + cls; msgEl.textContent = text; } };
+  if (!HARDWARE_AVAILABLE) return say("failed", "starfire-hw not found -- nothing was sent.");
+  if (!p.usb_port || !p.measure_command) return say("failed", "Enter a USB port and a command first.");
+  say("running", "Sending...");
+  try {
+    const res = await fetch("/measure", {
+      method: "POST",
+      body: JSON.stringify({port: p.usb_port, command: p.measure_command}),
+    });
+    const result = await res.json();
+    if (!result.success) return say("failed", result.error || "Send failed");
+    if (result.kind !== "query") {
+      return say("complete", `Sent ${p.measure_command} at ${new Date().toLocaleTimeString("en-GB")}`);
+    }
+    if (p.measurements.length >= 8) {
+      return say("failed", `Reply: ${result.value} (not logged: maximum 8 readings, delete a row first)`);
+    }
+    const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
+    p.measurements.push({command: p.measure_command, value: result.value, timestamp: ts, auto: true});
+    renderPoints();
+  } catch (err) {
+    say("failed", `Send failed: ${err}`);
+  }
+}
+
+// Modules (Activate / bolt): scripts or binaries in dist/ that the campaign's
+// Modules table registers. The registry is read live from the campaign page
+// we're embedded in; a standalone card has none, so nothing can be run.
+// Panel-open and run state are transient (never saved) and keyed by the point
+// object, so they follow a point when it's moved up or down.
+const moduleState = new WeakMap();
+
+function campaignModules() {
+  try {
+    return (window.parent !== window && window.parent.getCampaignModules) ? window.parent.getCampaignModules() : [];
+  } catch (e) { return []; }
+}
+
+// Scope "" = any point; "TC-001" = any point on that card; "TC-001-20" = that point only.
+function moduleInScope(m, cardId, seq) {
+  const s = (m.scope || "").trim().toLowerCase();
+  if (!s) return true;
+  const id = (cardId || "").trim().toLowerCase();
+  return s === id || s === id + "-" + seq;
+}
+
+function modulesFor(p) {
+  return campaignModules().filter(m => (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module);
+}
+
+function modulePanelHtml(i, p) {
+  const st = moduleState.get(p) || {};
+  const names = modulesFor(p);
+  const none = names.length === 0
+    ? `<div class="pt-cam-msg">No modules registered for this point. Add one in the campaign's Modules table.</div>` : "";
+  return `
+    <div class="send-row mod-row">
+      <div><label>Module</label>
+      <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(st.name || "")}"></div>
+      <datalist id="pt-modlist-${i}">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>
+      <div><label>Arguments</label>
+      <input data-modargs="${i}" value="${esc(st.args || "")}"></div>
+      <button class="btn mini" data-modrun="${i}"${st.status === "running" ? " disabled" : ""}>run</button>
+      <button class="btn mini break-btn" data-modbreak="${i}"${st.status === "running" ? "" : " disabled"}>break</button>
+    </div>
+    <div class="module-status failed">${esc(st.fileMsg || "")}</div>
+    ${none}
+    <div class="module-status ${esc(st.status || "")}">${esc(st.text || "")}</div>
+    ${st.output ? `<pre class="module-output">${esc(st.output)}</pre>
+    <div class="panel-actions">
+      <button class="btn mini btn-icon btn-download" data-modsave="${i}" title="save output as ${esc(pointFileName(p, "txt"))}" aria-label="save module output">${ICON_DOWNLOAD}</button>
+      <span class="module-status complete">${esc(st.saved || "")}</span>
+    </div>` : ""}`;
+}
+
+function bindModulePanel(i) {
+  const root = document.getElementById("pt-module-" + i);
+  if (!root) return;
+  const p = card.points[i];
+  const inp = root.querySelector("input[data-modname]");
+  if (inp) inp.addEventListener("input", () => {
+    const st = moduleState.get(p) || {};
+    st.name = inp.value;
+    moduleState.set(p, st);
+  });
+  const argsInp = root.querySelector("input[data-modargs]");
+  if (argsInp) argsInp.addEventListener("input", () => {
+    const st = moduleState.get(p) || {};
+    st.args = argsInp.value;
+    moduleState.set(p, st);
+  });
+  const btn = root.querySelector("button[data-modrun]");
+  if (btn) btn.addEventListener("click", () => runModule(p));
+  const brk = root.querySelector("button[data-modbreak]");
+  if (brk) brk.addEventListener("click", () => breakModule(p));
+  const sv = root.querySelector("button[data-modsave]");
+  if (sv) sv.addEventListener("click", async () => {
+    const st = moduleState.get(p);
+    st.saved = await savePointFile(p, "txt", st.output);
+    refreshModulePanel(p);
+  });
+}
+
+// Redraws just this point's module panel (not the whole list) so a run
+// finishing doesn't steal focus from whatever the person is typing elsewhere.
+function moduleIsOpen(p) { return !!(moduleState.get(p) || {}).open; }
+
+function refreshModulePanel(p) {
+  const i = card.points.indexOf(p);
+  const root = document.getElementById("pt-module-" + i);
+  if (!root || !moduleIsOpen(p)) return;
+  root.innerHTML = modulePanelHtml(i, p);
+  bindModulePanel(i);
+}
+
+// A point's files are the ones attached to it: they are what its Test Report offers.
+function attachFile(p, name) {
+  if ((p.files || []).includes(name)) return false;
+  p.files = (p.files || []).concat(name);
+  return true;
+}
+
+// Uploads a file as <campaign>-<card>-<point>-<name> and attaches it to the point.
+async function addCardFile(p, file) {
+  const st = moduleState.get(p) || {};
+  moduleState.set(p, st);
+  try {
+    const data = await new Promise((ok, no) => {
+      const r = new FileReader();
+      r.onload = () => ok(String(r.result).split(",")[1] || "");
+      r.onerror = () => no(r.error);
+      r.readAsDataURL(file);
+    });
+    const res = await fetch("/add_card_file", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({campaign: pointCampaign() || "XX-000", card: card.id, point: p.seq, name: file.name, data}),
+    });
+    const r = await res.json();
+    st.fileMsg = r.saved ? "" : `Add failed: ${r.error || "unknown error"}`;
+    if (r.saved) attachFile(p, r.filename);
+  } catch (err) {
+    st.fileMsg = `Add failed: ${err}`;
+  }
+  if (st.fileMsg) st.open = true;   // a failure shows in the module panel
+  renderPoints();
+}
+
+async function runModule(p) {
+  const st = moduleState.get(p) || {};
+  moduleState.set(p, st);
+  const name = (st.name || "").trim();
+  if (!name) {
+    Object.assign(st, {status: "failed", text: "Enter a module name.", output: ""});
+    return refreshModulePanel(p);
+  }
+  if (!modulesFor(p).includes(name)) {
+    Object.assign(st, {status: "failed", output: "",
+      text: `${name} isn't registered for this point. Add it to the campaign's Modules table, with a scope that includes it.`});
+    return refreshModulePanel(p);
+  }
+  Object.assign(st, {status: "running", text: "Running...", output: "", saved: ""});
+  refreshModulePanel(p);
+  try {
+    const res = await fetch("/run_module", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({module: name, card: card.id, point: p.seq, campaign: pointCampaign() || "XX-000", args: st.args || ""}),
+    });
+    const r = await res.json();
+    const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
+    st.status = ["complete", "broken"].includes(r.status) ? r.status : "failed";
+    st.text = `${st.status.toUpperCase()}${detail ? " (" + detail + ")" : ""}${r.error ? ": " + r.error : ""}`;
+    st.output = r.output || "";
+    if ((r.files || []).map(n => attachFile(p, n)).includes(true)) renderPoints();   // files the run wrote for this point
+  } catch (err) {
+    Object.assign(st, {status: "failed", text: `FAILED: ${err}`, output: ""});
+  }
+  refreshModulePanel(p);
+}
+
+async function breakModule(p) {
+  const st = moduleState.get(p) || {};
+  try {
+    const res = await fetch("/break_module", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({card: card.id, point: p.seq}),
+    });
+    const r = await res.json();
+    if (!r.success) { st.text = r.error || "Break failed"; refreshModulePanel(p); }
+  } catch (err) {
+    st.text = `Break failed: ${err}`;
+    refreshModulePanel(p);
+  }
+}
+
+function pointCampaign() {
+  try { return (window.parent !== window && window.parent.getCampaignId) ? window.parent.getCampaignId() : ""; } catch (e) { return ""; }
+}
+
+// <campaign>-<card>-<point>.<ext>, as the server will name it.
+function pointFileName(p, ext) {
+  const part = s => String(s || "").trim().replace(/[^A-Za-z0-9._-]/g, "_");
+  return `${part(pointCampaign()) || "XX-000"}-${part(card.id) || "TC"}-${p.seq}.${ext}`;
+}
+
+// Saves text next to the .test files; returns the line to show.
+async function savePointFile(p, ext, content) {
+  try {
+    const res = await fetch("/save_point_file", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({campaign: pointCampaign() || "XX-000", card: card.id, point: p.seq, ext, content}),
+    });
+    const r = await res.json();
+    if (r.saved) { attachFile(p, r.filename); renderPoints(); }
+    return r.saved ? `Saved ${r.filename}` : `Save failed: ${r.error || "unknown error"}`;
+  } catch (err) {
+    return `Save failed: ${err}`;
+  }
+}
+
+function measureCsv(p) {
+  const q = v => /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
+  const rows = p.measurements.filter(m => m.value).map(m => [m.auto ? m.command : "", m.value, m.timestamp].map(q).join(","));
+  return ["command,value,timestamp", ...rows].join("\n") + "\n";
+}
+
+function measurePanelHtml(i, p) {
+  const open = measureOpenIndices.has(i);
+  const rows = p.measurements.map((m, j) => {
+    if (m.auto) {
+      return `<tr>
+        <td>${esc(m.command)}</td><td>${esc(m.value)}</td><td>${esc(m.timestamp)}</td>
+        <td class="actions-cell"><button class="btn mini btn-icon btn-x" data-mdel="${j}" data-i="${i}" title="delete row">${ICON_CLOSE}</button></td>
+      </tr>`;
+    }
+    // Manual row: Command never applies (no instrument query was sent for
+    // a by-eye reading), Value is the one genuinely manual field,
+    // Timestamp is set via "now", never typed.
+    return `<tr>
+      <td>--</td>
+      <td><input data-mi="${i}" data-mj="${j}" data-mf="value" value="${esc(m.value)}"></td>
+      <td class="measure-ts-cell">
+        <span>${esc(m.timestamp)}</span>
+        <button class="btn mini" data-mnow="${j}" data-i="${i}" title="now">now</button>
+      </td>
+      <td class="actions-cell"><button class="btn mini btn-icon btn-x" data-mdel="${j}" data-i="${i}" title="delete row">${ICON_CLOSE}</button></td>
+    </tr>`;
+  }).join("");
+  const canAddRow = p.measurements.length < 8;
+  const fields = open ? `
+    <div class="measure-fields">
+      <div><label>USB Port</label><input data-i="${i}" data-f="usb_port" value="${esc(p.usb_port)}" placeholder="/dev/usbtmc0"></div>
+    </div>
+    <label>Command</label>
+    <div class="send-row">
+      <input data-i="${i}" data-f="measure_command" value="${esc(p.measure_command)}" placeholder="MEAS:VOLT:DC?  or  OUTP ON">
+      <button class="btn mini" data-msend="${i}">send</button>
+    </div>
+    <div class="module-status" id="pt-measure-msg-${i}"></div>` : "";
+  return `
+    ${fields}
+    <table class="measure-table">
+      <colgroup><col class="mt-cmd"><col class="mt-val"><col class="mt-ts"><col class="mt-del"></colgroup>
+      <tr><th>Command</th><th>Value</th><th>Timestamp</th><th class="blank-th"></th></tr>
+      ${rows}
+    </table>
+    <div class="panel-actions">
+      ${open && canAddRow ? `<button class="btn mini btn-plus" data-madd="${i}" title="add row">+</button>` : ""}
+      ${p.measurements.some(m => m.value) ? `<button class="btn mini btn-icon btn-download" data-msave="${i}" title="save readings as ${esc(pointFileName(p, "csv"))}" aria-label="save readings">${ICON_DOWNLOAD}</button>` : ""}
+      <span class="module-status complete" id="pt-measure-save-${i}"></span>
+    </div>`;
+}
+
+function renderPoints() {
+  const list = document.getElementById("pointsList");
+  list.innerHTML = "";
+  card.points.forEach((p, i) => {
+    const locked = !!p.locked;
+    const flagged = !!p.flagged;
+    const dis = locked ? "disabled" : "";
+    const div = document.createElement("div");
+    div.className = "pt-card" + (locked ? " locked" : "") + (flagged ? " flagged" : "");
+    const imgChips = (p.images || []).map(fn =>
+      `<span class="thumb-chip">${ICON_IMAGE} ${esc(fn)} <button class="btn mini btn-x" data-rm-img="${esc(fn)}" data-i="${i}">x</button></span>`
+    ).join("");
+    const fileChips = (p.files || []).map(fn =>
+      `<span class="thumb-chip">${ICON_ATTACH} ${esc(fn)} <button class="btn mini btn-x" data-rm-file="${esc(fn)}" data-i="${i}">x</button></span>`
+    ).join("");
+    // Ticket is offered on CAUTION/FAIL (a verdict), not on flagged,
+    // which is just a "pay attention here" highlight independent of pass/fail.
+    const showJiraBtn = JIRA_AVAILABLE && (p.quality === "CAUTION" || p.quality === "FAIL");
+    div.innerHTML = `
+      <div class="pt-head">
+        <input class="seq" data-i="${i}" data-f="seq" value="${esc(p.seq)}">
+        ${locked ? '<span class="lock-tag">🔒 locked</span>' : ""}
+        <div class="pt-btns">
+          <button class="btn mini btn-icon flag-btn${flagged ? " flagged" : ""}" data-act="flag" data-i="${i}" title="flag">${ICON_FLAG}</button>
+          <button class="btn mini btn-icon" data-act="preview" data-i="${i}" title="camera preview">${ICON_PHOTO_CAMERA}</button>
+          <button class="btn mini btn-icon" data-act="capture" data-i="${i}" title="capture image">${ICON_ADD_A_PHOTO}</button>
+          <button class="btn mini btn-icon measure-toggle" data-act="measure" data-i="${i}" title="measure">${ICON_SPEED}</button>
+          <button class="btn mini btn-icon module-toggle" data-act="module" data-i="${i}" title="activate (run a module)">${ICON_BOLT}</button>
+          <button class="btn mini btn-icon" data-act="addfile" data-i="${i}" title="add a file to this test card">${ICON_ADD}</button>
+          ${showJiraBtn ? `<button class="btn mini btn-icon" data-act="jira" data-i="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
+          <span class="pt-btn-gap"></span>
+          <button class="btn mini btn-icon" data-act="dup" data-i="${i}" title="duplicate as the next point">${ICON_CONTENT_COPY}</button>
+          <button class="btn mini btn-icon" data-act="up" data-i="${i}" title="move up">${ICON_ARROW_UPWARD}</button>
+          <button class="btn mini btn-icon" data-act="down" data-i="${i}" title="move down">${ICON_ARROW_DOWNWARD}</button>
+          <button class="btn mini btn-icon btn-x" data-act="del" data-i="${i}" ${dis} title="delete point">${ICON_CLOSE}</button>
+        </div>
+      </div>
+      <div class="pt-main">
+        <div><label>Action</label><textarea data-i="${i}" data-f="action" ${dis}>${esc(p.action)}</textarea></div>
+        <div><label>Expected Result</label><textarea data-i="${i}" data-f="expected" ${dis}>${esc(p.expected)}</textarea></div>
+        <div><label>Observed Result</label><textarea data-i="${i}" data-f="observed">${esc(p.observed)}</textarea></div>
+        <div><label>Reference</label><textarea data-i="${i}" data-f="reference" ${dis}>${esc(p.reference)}</textarea></div>
+      </div>
+      <div class="pt-sign">
+        <div><label>Responsible Party</label><input data-i="${i}" data-f="responsible_party" value="${esc(p.responsible_party)}" ${dis}></div>
+        <div><label>Date</label><input data-i="${i}" data-f="date" value="${esc(p.date)}"></div>
+        <div><label>Time (24h)</label>
+          <div class="time-row">
+            <input data-i="${i}" data-f="time" value="${esc(p.time)}">
+            <button class="btn mini" data-now="${i}">now</button>
+          </div>
+        </div>
+        <div><label>Initial</label><input data-i="${i}" data-f="initial" value="${esc(p.initial)}"></div>
+        <div><label>Quality</label>${qualitySelect(i, p.quality)}</div>
+      </div>
+      <div class="pt-expand-row">
+        <div class="pt-camera" id="pt-camera-${i}"></div>
+        <div class="pt-measure" id="pt-measure-${i}">${(measureOpenIndices.has(i) || p.measurements.length > 0) ? measurePanelHtml(i, p) : ""}</div>
+        <div class="pt-module" id="pt-module-${i}">${moduleIsOpen(p) ? modulePanelHtml(i, p) : ""}</div>
+      </div>
+      <div class="pt-images" id="pt-images-${i}">${imgChips}${fileChips}</div>
+      <div class="pt-cam-msg" id="pt-cam-msg-${i}"></div>
+      <div class="pt-cam-msg" id="pt-jira-msg-${i}"></div>`;
+    list.appendChild(div);
+  });
+  reattachPreviewIfOpen();
+  list.querySelectorAll("input[data-f], textarea[data-f], select[data-f]").forEach(el => {
+    el.addEventListener("input", () => {
+      card.points[+el.dataset.i][el.dataset.f] = el.value;
+    });
+  });
+  list.querySelectorAll("select[data-f]").forEach(el => {
+    el.addEventListener("change", () => {
+      card.points[+el.dataset.i][el.dataset.f] = el.value;
+      // Quality change needs a re-render: the Jira ticket button's
+      // visibility is derived from it, not just displayed.
+      if (el.dataset.f === "quality") renderPoints();
+    });
+  });
+  list.querySelectorAll("button[data-act]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = +btn.dataset.i, act = btn.dataset.act;
+      if (act === "del") {
+        if (card.points[i].locked) return;   // locked points can't be removed
+        card.points.splice(i, 1);
+      }
+      if (act === "dup") duplicatePoint(i);
+      if (act === "up" && i > 0) [card.points[i-1], card.points[i]] = [card.points[i], card.points[i-1]];
+      if (act === "down" && i < card.points.length - 1) [card.points[i+1], card.points[i]] = [card.points[i], card.points[i+1]];
+      if (act === "flag") {
+        card.points[i].flagged = !card.points[i].flagged;   // works regardless of locked
+      }
+      if (act === "capture") { capturePointImage(i); return; }
+      if (act === "preview") { togglePreview(i); return; }
+      if (act === "jira") { createJiraTicket(i); return; }
+      if (act === "measure") { toggleMeasure(i); return; }
+      if (act === "addfile") {
+        const inp = document.createElement("input");
+        inp.type = "file";
+        inp.addEventListener("change", () => { if (inp.files[0]) addCardFile(card.points[i], inp.files[0]); });
+        inp.click();
+        return;
+      }
+      if (act === "module") {
+        const st = moduleState.get(card.points[i]) || {};
+        st.open = !st.open;
+        moduleState.set(card.points[i], st);
+      }
+      renderPoints();
+    });
+  });
+  list.querySelectorAll("button[data-msave]").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const i = +btn.dataset.msave;
+      const msg = await savePointFile(card.points[i], "csv", measureCsv(card.points[i]));
+      const el = document.getElementById("pt-measure-save-" + i);
+      if (el) el.textContent = msg;
+    });
+  });
+  list.querySelectorAll("button[data-msend]").forEach(btn => {
+    btn.addEventListener("click", () => sendMeasurement(+btn.dataset.msend));
+  });
+  card.points.forEach((_, i) => bindModulePanel(i));
+  list.querySelectorAll("button[data-madd]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = +btn.dataset.madd;
+      if (card.points[i].measurements.length < 8) {
+        card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
+        renderPoints();
+      }
+    });
+  });
+  list.querySelectorAll("button[data-mdel]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = +btn.dataset.i;
+      card.points[i].measurements.splice(+btn.dataset.mdel, 1);
+      renderPoints();
+    });
+  });
+  list.querySelectorAll("input[data-mi]").forEach(el => {
+    el.addEventListener("input", () => {
+      card.points[+el.dataset.mi].measurements[+el.dataset.mj][el.dataset.mf] = el.value;
+    });
+  });
+  list.querySelectorAll("button[data-mnow]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = +btn.dataset.i, j = +btn.dataset.mnow;
+      const now = new Date();
+      card.points[i].measurements[j].timestamp = now.toISOString().slice(0, 16).replace("T", " ");
+      renderPoints();
+    });
+  });
+  list.querySelectorAll("button[data-rm-img]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = +btn.dataset.i, fn = btn.dataset.rmImg;
+      // Detaches the filename from this point only -- the .jpg file
+      // itself is left on disk, not deleted.
+      card.points[i].images = (card.points[i].images || []).filter(x => x !== fn);
+      renderPoints();
+    });
+  });
+  list.querySelectorAll("button[data-rm-file]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      // Detaches the file from this point (and its report); it stays on disk.
+      const i = +btn.dataset.i, fn = btn.dataset.rmFile;
+      card.points[i].files = (card.points[i].files || []).filter(x => x !== fn);
+      renderPoints();
+    });
+  });
+  list.querySelectorAll("button[data-now]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const i = +btn.dataset.now, d = new Date(), pad = n => String(n).padStart(2, "0");
+      card.points[i].date = `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+      card.points[i].time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;   // 24h
+      renderPoints();
+    });
+  });
+}
+
+function esc(s) { return (s??"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+document.getElementById("addPointBtn").addEventListener("click", () => {
+  card.points.push({seq: nextSeq(), action:"", expected:"", observed:"", reference:"",
+                     responsible_party:"", date:"", time:"", initial:"", quality:"",
+                     locked: false, flagged: false, images: [], files: [],
+                     usb_port: "", measure_command: "", measurements: []});
+  renderPoints();
+});
+
+function renderNomenclature() {
+  const t = document.getElementById("nomTable");
+  t.querySelectorAll("tr.nomrow").forEach(r => r.remove());
+  card.nomenclature.forEach(([sym, defn, units, locked], i) => {
+    const dis = locked ? "disabled" : "";
+    const tr = document.createElement("tr");
+    tr.className = "nomrow";
+    tr.innerHTML = `
+      <td><input value="${esc(sym)}" data-i="${i}" data-f="0" placeholder="\\alpha" ${dis}></td>
+      <td><input value="${esc(defn)}" data-i="${i}" data-f="1" placeholder="definition" ${dis}></td>
+      <td><input value="${esc(units||"")}" data-i="${i}" data-f="2" placeholder="units" ${dis}></td>
+      <td><button class="btn mini btn-x" data-del="${i}" ${dis}>x</button></td>`;
+    t.appendChild(tr);
+  });
+  t.querySelectorAll("input[data-i]").forEach(inp => {
+    inp.addEventListener("input", () => {
+      card.nomenclature[+inp.dataset.i][+inp.dataset.f] = inp.value;
+    });
+  });
+  t.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      if (card.nomenclature[+btn.dataset.del][3]) return;   // locked row
+      card.nomenclature.splice(+btn.dataset.del, 1);
+      renderNomenclature();
+    });
+  });
+}
+document.getElementById("addNomBtn").addEventListener("click", () => {
+  card.nomenclature.push(["", "", "", false]);
+  renderNomenclature();
+});
+
+function renderReferences() {
+  const t = document.getElementById("refTable");
+  t.querySelectorAll("tr.refrow").forEach(r => r.remove());
+  card.references.forEach(([ref, desc, locked], i) => {
+    const dis = locked ? "disabled" : "";
+    const tr = document.createElement("tr");
+    tr.className = "refrow";
+    tr.innerHTML = `
+      <td><input value="${esc(ref)}" data-i="${i}" data-f="0" placeholder="REQ-1234" ${dis}></td>
+      <td><input value="${esc(desc)}" data-i="${i}" data-f="1" placeholder="description" ${dis}></td>
+      <td><button class="btn mini btn-x" data-del="${i}" ${dis}>x</button></td>`;
+    t.appendChild(tr);
+  });
+  t.querySelectorAll("input[data-i]").forEach(inp => {
+    inp.addEventListener("input", () => {
+      card.references[+inp.dataset.i][+inp.dataset.f] = inp.value;
+    });
+  });
+  t.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      if (card.references[+btn.dataset.del][2]) return;   // locked row
+      card.references.splice(+btn.dataset.del, 1);
+      renderReferences();
+    });
+  });
+}
+document.getElementById("addRefBtn").addEventListener("click", () => {
+  card.references.push(["", "", false]);
+  renderReferences();
+});
+
+function renderTextList(listId, key) {
+  const el = document.getElementById(listId);
+  el.innerHTML = "";
+  card[key].forEach(([val, locked], i) => {
+    const dis = locked ? "disabled" : "";
+    const row = document.createElement("div");
+    row.className = "list-row";
+    row.innerHTML = `<textarea data-key="${key}" data-i="${i}" ${dis}>${esc(val)}</textarea>
+      <button class="btn mini btn-x" data-key="${key}" data-del="${i}" ${dis}>x</button>`;
+    el.appendChild(row);
+  });
+  el.querySelectorAll("textarea[data-key]").forEach(ta => {
+    ta.addEventListener("input", () => { card[ta.dataset.key][+ta.dataset.i][0] = ta.value; });
+  });
+  el.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      if (card[btn.dataset.key][+btn.dataset.del][1]) return;   // locked row
+      card[btn.dataset.key].splice(+btn.dataset.del, 1);
+      renderTextList(listId, btn.dataset.key);
+    });
+  });
+}
+document.getElementById("addNoteBtn").addEventListener("click", () => {
+  card.notes.push(["", false]); renderTextList("notesList", "notes");
+});
+document.getElementById("addWarningBtn").addEventListener("click", () => {
+  card.warnings.push(["", false]); renderTextList("warningsList", "warnings");
+});
+
+function download(filename, blobOrText, mime) {
+  const blob = blobOrText instanceof Blob ? blobOrText : new Blob([blobOrText], {type: mime || "text/plain"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+function freezeCurrentCard() {
+  card.locked = true;
+  card.points.forEach(p => { p.locked = true; });
+  card.nomenclature.forEach(row => { row[3] = true; });
+  card.references.forEach(row => { row[2] = true; });
+  card.notes.forEach(row => { row[1] = true; });
+  card.warnings.forEach(row => { row[1] = true; });
+}
+function unfreezeCard() {
+  card.locked = false;
+  card.points.forEach(p => { p.locked = false; });
+  card.nomenclature.forEach(row => { row[3] = false; });
+  card.references.forEach(row => { row[2] = false; });
+  card.notes.forEach(row => { row[1] = false; });
+  card.warnings.forEach(row => { row[1] = false; });
+}
+function rerenderAll() {
+  bindMeta(); renderPoints(); renderNomenclature(); renderReferences();
+  renderTextList("notesList", "notes"); renderTextList("warningsList", "warnings");
+}
+async function saveCard(statusEl) {
+  statusEl.textContent = "saving...";
+  try {
+    const res = await fetch("/save", {method: "POST", body: JSON.stringify(card)});
+    const data = await res.json();
+    statusEl.textContent = data.saved ? `Saved to ${data.path}` : `Save failed: ${data.error || "unknown error"}`;
+  } catch (err) {
+    statusEl.textContent = `Save failed: ${err}`;
+  }
+}
+document.getElementById("saveLockedBtn").addEventListener("click", () => {
+  // Locking is a workflow marker, not security. Freezing happens
+  // client-side so the editor reflects it immediately, not just the file.
+  freezeCurrentCard();
+  rerenderAll();
+  saveCard(document.getElementById("saveStatus"));
+});
+document.getElementById("saveUnlockedBtn").addEventListener("click", () => {
+  unfreezeCard();
+  rerenderAll();
+  saveCard(document.getElementById("saveStatus"));
+});
+document.getElementById("loadJsonBtn").addEventListener("click", () => {
+  document.getElementById("loadJsonFile").click();
+});
+function normalizePairList(items, width) {
+  // Pads each row to `width` (the last element the locked flag); accepts
+  // a bare string for a single-element row (pre-locking notes/warnings).
+  return (items || []).map(item => {
+    let row = typeof item === "string" ? [item] : item.slice();
+    while (row.length < width - 1) row.push("");
+    if (row.length < width) row.push(false);
+    return row.slice(0, width);
+  });
+}
+function normalizeCard(c) {
+  c.nomenclature = normalizePairList(c.nomenclature, 4);
+  c.references = normalizePairList(c.references, 3);
+  c.notes = normalizePairList(c.notes, 2);
+  c.warnings = normalizePairList(c.warnings, 2);
+  if (!c.quality_assurance) c.quality_assurance = "";
+  if (!c.requirements) c.requirements = "";
+  if (!c.locked) c.locked = false;
+  if (!c.files_migrated) c.files_migrated = false;
+  (c.points || []).forEach(p => {
+    if (!("locked" in p)) p.locked = false;
+    if (!("flagged" in p)) p.flagged = false;
+    if (!p.images) p.images = [];
+    if (!p.files) p.files = [];
+    if (!("observed" in p)) p.observed = "";
+    if (!("usb_port" in p)) p.usb_port = "";
+    if (!("measure_command" in p)) p.measure_command = "";
+    if (!p.measurements) p.measurements = [];
+  });
+  return c;
+}
+function loadCardIntoUI(c) {
+  card = normalizeCard(c);
+  bindMeta(); renderPoints(); renderNomenclature(); renderReferences();
+  renderTextList("notesList", "notes"); renderTextList("warningsList", "warnings");
+}
+document.getElementById("loadJsonFile").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then(txt => loadCardIntoUI(JSON.parse(txt)));
+});
+
+async function postExport(path, filename, mime) {
+  // Open the print window synchronously, before the await below -- many
+  // popup blockers kill a window.open() called after a fetch() resolves.
+  let w = null;
+  if (path === "/export/print") {
+    w = window.open("", "_blank");
+    if (w) w.document.write("Generating...");
+  }
+  try {
+    const res = await fetch(path, {method: "POST", body: JSON.stringify(card)});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const text = await res.text();
+    if (path === "/export/print") {
+      if (w) { w.document.open(); w.document.write(text); w.document.close(); }
+    } else {
+      download(filename, text, mime);
+    }
+  } catch (err) {
+    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
+    document.getElementById("saveStatus").textContent = `Export failed: ${err}`;
+  }
+}
+document.getElementById("exportCsvBtn").addEventListener("click", () =>
+  postExport("/export/csv", (card.id || "card") + ".csv", "text/csv"));
+document.getElementById("exportPrintBtn").addEventListener("click", () =>
+  postExport("/export/print"));
+document.getElementById("exportDocxBtn").addEventListener("click", async () => {
+  try {
+    const res = await fetch("/export/test/docx", {method: "POST", body: JSON.stringify(card)});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    download((card.id || "test") + ".docx", await res.blob());
+  } catch (err) {
+    document.getElementById("saveStatus").textContent = `Docx export failed: ${err}`;
+  }
+});
+
+bindMeta();
+card.points = [{seq:10, action:"", expected:"", observed:"", reference:"",
+                responsible_party:"", date:"", time:"", initial:"", quality:"",
+                locked:false, flagged:false, images:[], files:[],
+                usb_port:"", measure_command:"", measurements:[]}];
+renderPoints();
+renderNomenclature();
+renderReferences();
+renderTextList("notesList", "notes");
+renderTextList("warningsList", "warnings");
+
+// If opened as ?load=<filename>, fetch that .test file and populate the
+// editor with it -- how the campaign page opens a specific test in a tab.
+const _loadFile = new URLSearchParams(window.location.search).get("load");
+if (_loadFile) {
+  fetch("/load?file=" + encodeURIComponent(_loadFile))
+    .then(r => { if (!r.ok) throw new Error("not found"); return r.json(); })
+    .then(c => { loadCardIntoUI(c); return attachExistingFiles(); })
+    .catch(() => { document.getElementById("m-id").value = _loadFile.replace(/\.test$/, ""); });
+}
+
+// One-off for cards saved before points owned their files: attach the files already named for each point.
+async function attachExistingFiles() {
+  if (card.files_migrated) return;
+  const q = new URLSearchParams({campaign: pointCampaign() || "XX-000", card: card.id});
+  const found = (await (await fetch("/point_files?" + q)).json()).files || {};
+  card.points.forEach(p => (found[p.seq] || []).forEach(f => attachFile(p, f.name)));
+  card.files_migrated = true;
+  renderPoints();
+}
+
+// Lets an embedding page (the campaign tab bar) read the live editor
+// state, since `card` is a module-scope `let` otherwise unreachable from an iframe.
+window.getCard = () => card;
+
+// Only inside a campaign tab: ask the campaign page to open this card's Test Report tab.
+if (window.self !== window.top && window.parent.openReportTab) {
+  const buildBtn = document.getElementById("buildReportBtn");
+  buildBtn.style.display = "";
+  buildBtn.addEventListener("click", () => {
+    const file = new URLSearchParams(location.search).get("load") || "";
+    window.parent.openReportTab(file.replace(/\.test$/, "") || card.id);
+  });
+}
+</script>
+</body>
+</html>

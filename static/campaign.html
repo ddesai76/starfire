@@ -1,0 +1,1026 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>🚀 ✨ STARFIRE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/starfire.css">
+</head>
+<body class="editor-doc">
+<div id="tabbar"></div>
+<div id="panels">
+  <div class="panel active split" id="panel-campaign">
+    <div class="report-side">
+      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+      <div class="side-btns">
+        <button class="btn" id="loadCampBtn">import campaign file</button>
+        <input type="file" id="loadCampFile" accept=".camp,application/json" style="display:none">
+        <button class="btn" id="saveCampBtn">export campaign file (.camp)</button>
+        <button class="btn" id="printCampBtn">generate .pdf</button>
+        <button class="btn" id="docxCampBtn">export .docx</button>
+        <button class="btn" id="genVcrmBtn">generate VCRM</button>
+        <button class="btn" id="buildSrBtn">build campaign report</button>
+      </div>
+      <div id="saveStatus" class="hint"></div>
+    </div>
+    <div class="side-main"><div class="side-inner">
+
+    <h2>Campaign metadata</h2>
+    <div class="meta">
+      <div class="field"><label>ID</label><input id="c-id"></div>
+      <div class="field"><label>Title</label><input id="c-title"></div>
+      <div class="field"><label>Revision</label><input id="c-revision"></div>
+      <div class="field"><label>Project</label><input id="c-project"></div>
+      <div class="field"><label>Author</label><input id="c-author"></div>
+      <div class="field"><label>Test Lead</label><input id="c-test_lead"></div>
+      <div class="field"><label>Quality Assurance</label><input id="c-quality_assurance"></div>
+      <div class="field"><label>Date</label><input id="c-date"></div>
+      <div class="field" id="jira-epic-field" style="visibility:hidden"><label>Jira Epic Key</label><input id="c-jira_epic_key" placeholder="PROJ-142"></div>
+    </div>
+
+    <h2 class="no-rule">Requirements</h2>
+    <table class="datatable" id="reqTable">
+      <tr><th>Requirement</th><th>Source</th><th>Description</th><th title="T = Test, A = Analysis, D = Demonstration, I = Inspection">Method</th><th class="blank-th" style="width:60px"></th></tr>
+    </table>
+    <div class="row"><button class="btn btn-plus" id="addReqBtn" title="add requirement">+</button></div>
+
+    <h2 class="no-rule">Modules</h2>
+    <table class="datatable" id="modTable">
+      <colgroup><col style="width:28%"><col><col style="width:16%"><col style="width:60px"></colgroup>
+      <tr><th>Module</th><th>Description</th><th>Scope</th><th class="blank-th"></th></tr>
+    </table>
+    <div class="row"><button class="btn btn-plus" id="addModBtn" title="add module">+</button></div>
+    <div id="modHint" class="hint"></div>
+
+    <h2 class="no-rule">Test Series</h2>
+    <table class="datatable tests-format" id="testsTable">
+      <colgroup>
+      <col style="width:4%"><col style="width:10%"><col style="width:33%">
+      <col style="width:12%"><col style="width:12%"><col style="width:9%"><col style="width:20%">
+      </colgroup>
+      <tr><th>#</th><th>Test ID</th><th>Title</th><th>Author</th><th>Requirements</th><th>Status</th><th class="blank-th"></th></tr>
+    </table>
+    <div class="row"><button class="btn btn-plus" id="addTestBtn" title="add test">+</button></div>
+    <div class="row">
+      <select id="browseTestFiles"><option value="">Browse existing .test files...</option></select>
+      <button class="btn" id="addBrowsedTestBtn">select</button>
+    </div>
+    <div id="browseStatus" class="hint"></div>
+
+    <h2 class="no-rule">Ancillary Tests</h2>
+    <table class="datatable tests-format" id="ancTestsTable">
+      <colgroup>
+      <col style="width:4%"><col style="width:10%"><col style="width:33%">
+      <col style="width:12%"><col style="width:12%"><col style="width:9%"><col style="width:20%">
+      </colgroup>
+      <tr><th>#</th><th>Test ID</th><th>Title</th><th>Author</th><th>Requirements</th><th>Status</th><th class="blank-th"></th></tr>
+    </table>
+    <div class="row"><button class="btn btn-plus" id="addAncTestBtn" title="add test">+</button></div>
+    <div class="row">
+      <select id="browseAncTestFiles"><option value="">Browse existing .test files...</option></select>
+      <button class="btn" id="addBrowsedAncTestBtn">select</button>
+    </div>
+    <div id="ancBrowseStatus" class="hint"></div>
+
+    <h2 class="no-rule">Sections</h2>
+    <div id="sectionsList"></div>
+    <div class="row"><button class="btn btn-plus" id="addSectionBtn" title="add section">+</button></div>
+
+    </div></div>
+  </div>
+</div>
+
+<script>
+let camp = {
+  id: "SC-001", title: "Untitled Campaign", revision: "A", author: "",
+  date: new Date().toISOString().slice(0,10), project: "", test_lead: "",
+  quality_assurance: "", jira_epic_key: "",
+  requirements: [], modules: [], tests: [], ancillary_tests: [], sections: [], reports: {}
+};
+
+// True only if jira_config.json was found in the working directory at startup.
+const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
+if (JIRA_AVAILABLE) document.getElementById("jira-epic-field").style.visibility = "";
+
+function esc(s) { return (s??"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+
+const metaFields = ["id","title","revision","author","date","project","test_lead","quality_assurance","jira_epic_key"];
+function bindMeta() {
+  metaFields.forEach(f => {
+    const el = document.getElementById("c-" + f);
+    el.value = camp[f];
+    el.addEventListener("input", () => {
+      camp[f] = el.value;
+      if (f === "id" || f === "title") renderTabBar();
+    });
+  });
+}
+
+function renderRequirements() {
+  const t = document.getElementById("reqTable");
+  t.querySelectorAll("tr.datarow").forEach(r => r.remove());
+  camp.requirements.forEach((r, i) => {
+    while (r.length < 4) r.push(r.length === 3 ? "T" : "");   // older files: [code, description]
+    const [code, desc, source, method] = r;
+    const tr = document.createElement("tr");
+    tr.className = "datarow";
+    tr.innerHTML = `
+      <td><input value="${esc(code)}" data-i="${i}" data-f="0" placeholder="REQ-1234"></td>
+      <td><input value="${esc(source)}" data-i="${i}" data-f="2"></td>
+      <td><input value="${esc(desc)}" data-i="${i}" data-f="1" placeholder="description"></td>
+      <td><select data-i="${i}" data-f="3" title="T = Test, A = Analysis, D = Demonstration, I = Inspection">${
+        ["T", "A", "D", "I"].map(m => `<option${m === method ? " selected" : ""}>${m}</option>`).join("")}</select></td>
+      <td><button class="btn mini btn-x" data-del="${i}">x</button></td>`;
+    t.appendChild(tr);
+  });
+  t.querySelectorAll("input[data-i], select[data-i]").forEach(inp => {
+    inp.addEventListener("input", () => { camp.requirements[+inp.dataset.i][+inp.dataset.f] = inp.value; });
+  });
+  t.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => { camp.requirements.splice(+btn.dataset.del, 1); renderRequirements(); });
+  });
+}
+document.getElementById("addReqBtn").addEventListener("click", () => {
+  camp.requirements.push(["", "", "", "T"]);
+  renderRequirements();
+});
+
+// Modules: runnable files in dist/ (see /list_modules) that a test point's
+// Activate button may run. Scope blank = any point; TC-001 = any point on
+// that card; TC-001-20 = that point only.
+let moduleFiles = [];
+// Kind by name, mirroring how the server runs it (case-sensitive, like os.path.splitext):
+// no extension = a binary, .py/.jl/.sh = that language, anything else = "other".
+function moduleKind(name) {
+  if (!name) return "";
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot) : "";
+  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh"})[ext] || "other";
+}
+function renderModules() {
+  const t = document.getElementById("modTable");
+  t.querySelectorAll("tr.datarow").forEach(r => r.remove());
+  camp.modules.forEach((m, i) => {
+    // A saved module that's no longer in dist/ stays selectable, flagged, so it isn't silently dropped.
+    const names = moduleFiles.includes(m.module) || !m.module ? moduleFiles : [m.module, ...moduleFiles];
+    const opts = [`<option value="">[choose module]</option>`].concat(names.map(n =>
+      `<option class="mod-${moduleKind(n)}" value="${esc(n)}"${n === m.module ? " selected" : ""}>${esc(n)}${moduleFiles.includes(n) ? "" : " (missing)"}</option>`));
+    const tr = document.createElement("tr");
+    tr.className = "datarow";
+    tr.innerHTML = `
+      <td><select class="mod-${moduleKind(m.module)}" data-i="${i}" data-f="module">${opts.join("")}</select></td>
+      <td><input value="${esc(m.description)}" data-i="${i}" data-f="description" placeholder="optional"></td>
+      <td><input value="${esc(m.scope)}" data-i="${i}" data-f="scope" placeholder="any test point"></td>
+      <td><button class="btn mini btn-x" data-del="${i}">x</button></td>`;
+    t.appendChild(tr);
+  });
+  t.querySelectorAll("input[data-i], select[data-i]").forEach(el => {
+    el.addEventListener("input", () => {
+      camp.modules[+el.dataset.i][el.dataset.f] = el.value;
+      if (el.dataset.f === "module") el.className = "mod-" + moduleKind(el.value);
+    });
+  });
+  t.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => { camp.modules.splice(+btn.dataset.del, 1); renderModules(); });
+  });
+  document.getElementById("modHint").textContent = moduleFiles.length
+    ? "" : "No runnable files found. Put programs (chmod +x) or .py / .sh / .jl scripts in the dist/ folder next to starfire.";
+}
+async function loadModuleFiles() {
+  try {
+    const res = await fetch("/list_modules");
+    const next = (await res.json()).modules || [];
+    // Redrawing while a picker is open would close it, so only when the list actually changed.
+    if (JSON.stringify(next) !== JSON.stringify(moduleFiles)) { moduleFiles = next; renderModules(); }
+  } catch (err) { /* leave the list as it was */ }
+}
+document.getElementById("addModBtn").addEventListener("click", () => {
+  camp.modules.push({module: "", description: "", scope: ""});
+  renderModules();
+  loadModuleFiles();
+});
+window.addEventListener("focus", loadModuleFiles);
+// Test tabs (iframes) read the live list from here when they offer or run a module.
+window.getCampaignModules = () => camp.modules;
+window.getCampaignId = () => camp.id;
+
+// Google Material Symbols, embedded inline (not a file/CDN) so they work
+// fully offline; fill="currentColor" picks up each button's own hover color.
+const ICON_ARROW_UPWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-160v-487L216-423l-56-57 320-320 320 320-56 57-224-224v487h-80Z"/></svg>';
+const ICON_ARROW_DOWNWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-800v487L216-537l-56 57 320 320 320-320-56-57-224 224v-487h-80Z"/></svg>';
+const ICON_OPEN_IN_NEW = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z"/></svg>';
+const ICON_CLOSE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>';
+const ICON_BOOKMARK_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-640q0-33 23.5-56.5T280-840h240v80H280v518l200-86 200 86v-278h80v400L480-240 200-120Zm80-640h240-240Zm400 160v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80Z"/></svg>';
+
+// Computed on the server from each test card's point sign-offs; never typed.
+let statusByTest = {};
+async function refreshStatuses() {
+  try {
+    const res = await fetch("/campaign_status", {method: "POST", body: JSON.stringify(camp)});
+    if (res.ok) statusByTest = await res.json();
+  } catch (err) { /* keep the statuses already shown */ }
+  renderTests();
+  renderAncillaryTests();
+}
+function statusFor(row) { return statusByTest[(row.test_id || "").trim()] || ""; }
+
+function nextSeqFor(list) {
+  const max = list.reduce((m, t) => Math.max(m, +t.seq || 0), 0);
+  return max + 1;   // campaigns number tests 1, 2, 3... not by 10s
+}
+
+function renderTestsTable(list, tableId) {
+  const t = document.getElementById(tableId);
+  t.querySelectorAll("tr.datarow").forEach(r => r.remove());
+  list.forEach((row, i) => {
+    const tr = document.createElement("tr");
+    tr.className = "datarow";
+    tr.innerHTML = `
+      <td><input value="${esc(row.seq)}" data-i="${i}" data-f="seq"></td>
+      <td><input value="${esc(row.test_id)}" data-i="${i}" data-f="test_id" placeholder="TC-001"></td>
+      <td class="meta-cell">${esc(row.title || "")}</td>
+      <td class="meta-cell">${esc(row.author || "")}</td>
+      <td class="meta-cell">${esc(row.requirements || "")}</td>
+      <td class="meta-cell">${esc(statusFor(row))}</td>
+      <td class="actions-cell">
+        <button class="btn btn-icon" data-open="${i}" title="open">${ICON_OPEN_IN_NEW}</button>
+        <button class="btn btn-icon" data-del="${i}" title="remove">${ICON_CLOSE}</button>
+        ${JIRA_AVAILABLE ? `<button class="btn btn-icon" data-jira="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
+      </td>`;
+    t.appendChild(tr);
+  });
+  t.querySelectorAll("input[data-f]").forEach(el => {
+    el.addEventListener("input", () => {
+      list[+el.dataset.i][el.dataset.f] = el.value;
+    });
+  });
+  // Title/Author/Requirements are pulled from the linked .test file --
+  // refresh on blur (not every keystroke) so focus isn't yanked mid-type.
+  t.querySelectorAll('input[data-f="test_id"]').forEach(el => {
+    el.addEventListener("blur", () => backfillMetadataForRow(list, tableId, +el.dataset.i));
+  });
+  t.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => { list.splice(+btn.dataset.del, 1); renderTestsTable(list, tableId); });
+  });
+  t.querySelectorAll("button[data-open]").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const row = list[+btn.dataset.open];
+      if ((row.test_id || "").trim()) openTestTab(row.test_id, row.title);
+    });
+  });
+  t.querySelectorAll("button[data-jira]").forEach(btn => {
+    btn.addEventListener("click", () => createTestJiraTicket(list, tableId, +btn.dataset.jira));
+  });
+}
+function renderTests() { renderTestsTable(camp.tests, "testsTable"); }
+function renderAncillaryTests() { renderTestsTable(camp.ancillary_tests, "ancTestsTable"); }
+
+// Reuses the browse-picker's own status line for ticket-click results,
+// rather than adding a third message area -- the two actions never overlap.
+const TICKET_STATUS_EL_FOR_TABLE = { testsTable: "browseStatus", ancTestsTable: "ancBrowseStatus" };
+
+async function createTestJiraTicket(list, tableId, i) {
+  const row = list[i];
+  const statusEl = document.getElementById(TICKET_STATUS_EL_FOR_TABLE[tableId]);
+  const summary = `${row.test_id || "(no ID)"}: ${row.title || "(no title)"}`;
+  const description = [
+    `Test: ${row.test_id || ""} -- ${row.title || ""}`,
+    `Status: ${statusFor(row) || "[None]"}`,
+    `Requirement(s): ${row.requirements || ""}`,
+  ].join("\n");
+  statusEl.textContent = "Creating ticket...";
+  try {
+    const res = await fetch("/create_jira_ticket", {
+      method: "POST",
+      body: JSON.stringify({
+        summary, description, issue_type: "Task",
+        epic_key: camp.jira_epic_key || "",
+      }),
+    });
+    const result = await res.json();
+    if (result.success) {
+      statusEl.innerHTML = `Created <a href="${esc(result.url)}" target="_blank" rel="noopener">${esc(result.key)}</a>`;
+    } else {
+      statusEl.textContent = `Ticket creation failed: ${result.error || "unknown error"}`;
+    }
+  } catch (err) {
+    statusEl.textContent = `Ticket creation failed: ${err}`;
+  }
+}
+
+async function backfillMetadataForRow(list, tableId, i) {
+  const row = list[i];
+  const testId = (row.test_id || "").trim();
+  if (!testId) return;
+  const filename = testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test";
+  try {
+    const res = await fetch("/load?file=" + encodeURIComponent(filename));
+    if (!res.ok) return;   // no matching file yet -- leave title/author/requirements as-is, silently
+    const data = await res.json();
+    row.title = data.title || "";
+    row.author = data.author || "";
+    row.requirements = data.requirements || "";
+    refreshStatuses();
+  } catch (err) {
+    // transient error -- same "silent, no validation" spirit as the rest
+    // of this traceability; nothing here is load-bearing.
+  }
+}
+
+document.getElementById("addTestBtn").addEventListener("click", () => {
+  camp.tests.push({seq: nextSeqFor(camp.tests), test_id: "", title: "", author: "", requirements: ""});
+  renderTests();
+});
+document.getElementById("addAncTestBtn").addEventListener("click", () => {
+  camp.ancillary_tests.push({seq: nextSeqFor(camp.ancillary_tests), test_id: "", title: "", author: "", requirements: ""});
+  renderAncillaryTests();
+});
+
+// Browse .test files already on disk, rather than requiring the exact
+// Test ID up front -- for a file created earlier by this person or a teammate.
+async function refreshFileList(selectId) {
+  const sel = document.getElementById(selectId);
+  const current = sel.value;
+  try {
+    const res = await fetch("/list_files?ext=.test");
+    const data = await res.json();
+    sel.innerHTML = '<option value="">Browse existing .test files...</option>' +
+      (data.files || []).map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
+    if ((data.files || []).includes(current)) sel.value = current;
+  } catch (err) {
+    document.getElementById(selectId === "browseTestFiles" ? "browseStatus" : "ancBrowseStatus")
+      .textContent = `Couldn't list files: ${err}`;
+  }
+}
+async function addBrowsedFile(selectId, list, tableId, statusId) {
+  const sel = document.getElementById(selectId);
+  const filename = sel.value;
+  const status = document.getElementById(statusId);
+  if (!filename) return;
+  const testId = filename.replace(/\.test$/, "");
+  if (list.some(t => t.test_id === testId)) {
+    status.textContent = `${testId} is already in this table.`;
+    return;
+  }
+  // Grab title/author/requirements too, if we can -- not fatal if this
+  // fails, the row just gets added with those left blank to fill in by hand.
+  let title = "", author = "", requirements = "";
+  try {
+    const res = await fetch("/load?file=" + encodeURIComponent(filename));
+    if (res.ok) {
+      const data = await res.json();
+      title = data.title || ""; author = data.author || ""; requirements = data.requirements || "";
+    }
+  } catch (err) { /* leave title/author/requirements blank */ }
+  list.push({seq: nextSeqFor(list), test_id: testId, title: title, author: author,
+             requirements: requirements});
+  refreshStatuses();
+}
+document.getElementById("browseTestFiles").addEventListener("focus", () => refreshFileList("browseTestFiles"));
+document.getElementById("addBrowsedTestBtn").addEventListener("click", () =>
+  addBrowsedFile("browseTestFiles", camp.tests, "testsTable", "browseStatus"));
+document.getElementById("browseAncTestFiles").addEventListener("focus", () => refreshFileList("browseAncTestFiles"));
+document.getElementById("addBrowsedAncTestBtn").addEventListener("click", () =>
+  addBrowsedFile("browseAncTestFiles", camp.ancillary_tests, "ancTestsTable", "ancBrowseStatus"));
+refreshFileList("browseTestFiles");
+refreshFileList("browseAncTestFiles");
+
+function renderSections() {
+  const list = document.getElementById("sectionsList");
+  list.innerHTML = "";
+  camp.sections.forEach(([header, text], i) => {
+    const div = document.createElement("div");
+    div.className = "sec-card";
+    div.innerHTML = `
+      <div class="sec-head">
+        <input value="${esc(header)}" data-i="${i}" data-f="0" placeholder="Section header">
+        <button class="btn mini btn-x" data-del="${i}">x</button>
+      </div>
+      <textarea data-i="${i}" data-f="1" placeholder="Write or paste anything here">${esc(text)}</textarea>`;
+    list.appendChild(div);
+  });
+  list.querySelectorAll("input[data-i], textarea[data-i]").forEach(el => {
+    el.addEventListener("input", () => { camp.sections[+el.dataset.i][+el.dataset.f] = el.value; });
+  });
+  list.querySelectorAll("button[data-del]").forEach(btn => {
+    btn.addEventListener("click", () => { srSectionDeleted(+btn.dataset.del); camp.sections.splice(+btn.dataset.del, 1); renderSections(); });
+  });
+}
+document.getElementById("addSectionBtn").addEventListener("click", () => {
+  camp.sections.push(["", ""]);
+  renderSections();
+});
+
+function download(filename, blobOrText, mime) {
+  const blob = blobOrText instanceof Blob ? blobOrText : new Blob([blobOrText], {type: mime || "text/plain"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+document.getElementById("saveCampBtn").addEventListener("click", async () => {
+  const status = document.getElementById("saveStatus");
+  status.textContent = "saving...";
+  try {
+    const res = await fetch("/save_campaign", {method: "POST", body: JSON.stringify(camp)});
+    const data = await res.json();
+    status.textContent = data.saved ? `Saved to ${data.path}` : `Save failed: ${data.error || "unknown error"}`;
+  } catch (err) {
+    status.textContent = `Save failed: ${err}`;
+  }
+});
+document.getElementById("loadCampBtn").addEventListener("click", () => {
+  document.getElementById("loadCampFile").click();
+});
+document.getElementById("loadCampFile").addEventListener("change", (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  f.text().then(txt => {
+    camp = JSON.parse(txt);
+    if (!camp.requirements) camp.requirements = [];
+    if (!camp.modules) camp.modules = [];
+    if (!camp.reports) camp.reports = {};
+    if (!camp.tests) camp.tests = [];
+    if (!camp.ancillary_tests) camp.ancillary_tests = [];
+    if (!camp.sections) camp.sections = [];
+    if (!camp.jira_epic_key) camp.jira_epic_key = "";
+    bindMeta(); renderRequirements(); renderModules(); renderSections(); refreshStatuses();
+  });
+});
+document.getElementById("printCampBtn").addEventListener("click", async () => {
+  // Open synchronously, before the await below -- popup blockers can kill
+  // a window.open() called after a fetch() resolves.
+  const w = window.open("", "_blank");
+  if (w) w.document.write("Generating...");
+  try {
+    const res = await fetch("/export/campaign/print", {method: "POST", body: JSON.stringify(camp)});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const text = await res.text();
+    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
+  } catch (err) {
+    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
+    document.getElementById("saveStatus").textContent = `Print failed: ${err}`;
+  }
+});
+document.getElementById("docxCampBtn").addEventListener("click", async () => {
+  const status = document.getElementById("saveStatus");
+  try {
+    const res = await fetch("/export/campaign/docx", {method: "POST", body: JSON.stringify(camp)});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const blob = await res.blob();
+    download((camp.id || "campaign") + ".docx", blob);
+  } catch (err) {
+    status.textContent = `Docx export failed: ${err}`;
+  }
+});
+
+// ---- Tab bar ----
+let openTabs = [];   // [{key, label}], key = filename for test tabs
+let activeTab = "campaign";
+
+function renderTabBar() {
+  const bar = document.getElementById("tabbar");
+  bar.innerHTML = "";
+  updateAppendButtons();
+  const campBtn = document.createElement("button");
+  campBtn.className = "tab-btn" + (activeTab === "campaign" ? " active" : "");
+  campBtn.textContent = camp.id || "Campaign";
+  campBtn.addEventListener("click", () => switchTab("campaign"));
+  bar.appendChild(campBtn);
+  openTabs.forEach(tab => {
+    const btn = document.createElement("button");
+    btn.className = "tab-btn" + (activeTab === tab.key ? " active" : "");
+    btn.innerHTML = `<span>${esc(tab.label || tab.key)}</span><span class="close-x" data-close="${esc(tab.key)}">x</span>`;
+    btn.addEventListener("click", (e) => {
+      if (e.target.dataset.close) { closeTestTab(e.target.dataset.close); return; }
+      switchTab(tab.key);
+    });
+    bar.appendChild(btn);
+  });
+}
+
+function updateAppendButtons() {
+  const on = openTabs.some(t => t.key === SR_KEY);
+  document.querySelectorAll("[data-rappend], #appendVcrmBtn").forEach(b => { b.style.display = on ? "" : "none"; });
+}
+
+function switchTab(key) {
+  activeTab = key;
+  if (key === "campaign") refreshStatuses();
+  if (key === SR_KEY) { srSync(); renderSrSide(); renderSrPreview(); }
+  if (key.startsWith("report-")) loadReport(key, key.slice(7));
+  document.getElementById("panel-campaign").classList.toggle("active", key === "campaign");
+  openTabs.forEach(tab => {
+    const panel = document.getElementById("panel-" + tab.key);
+    if (panel) panel.classList.toggle("active", key === tab.key);
+  });
+  renderTabBar();
+}
+
+function openTestTab(testId, title) {
+  const filename = testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test";
+  if (!openTabs.some(t => t.key === filename)) {
+    openTabs.push({key: filename, label: testId});
+    const panel = document.createElement("div");
+    panel.className = "test-panel";
+    panel.id = "panel-" + filename;
+    panel.innerHTML = `<iframe src="/test?load=${encodeURIComponent(filename)}"></iframe>`;
+    document.getElementById("panels").appendChild(panel);
+    const iframe = panel.querySelector("iframe");
+    iframe.addEventListener("load", () => {
+      // The editor's own ?load= fetch is async and typically resolves
+      // after this "load" event fires, so retry briefly rather than assume it's ready.
+      pollForLockIcon(iframe, filename, 10);
+      // The epic key is a plain variable the editor sets synchronously at
+      // script top, so it's already there by the time "load" fires -- no retry needed.
+      if (iframe.contentWindow) {
+        iframe.contentWindow.starfireJiraEpicKey = camp.jira_epic_key || "";
+      }
+    });
+  }
+  switchTab(filename);
+}
+
+// ---- Campaign report (SR) tab: header, sections, and appended VCRM / Test Reports ----
+const SR_KEY = "__sr__";
+function srIdFor(id) {
+  const s = String(id || "").trim();
+  return /^sc-/i.test(s) ? "SR-" + s.slice(3) : "SR-" + (s || "000");
+}
+function srHead() {
+  return [srIdFor(camp.id), camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" ");
+}
+function srItemLabel(it) {
+  if (it.type === "vcrm") return "VCRM";
+  if (it.type === "report") return reportIdFor(it.card);
+  const sec = it.idx !== undefined ? camp.sections[it.idx] : null;
+  return (sec ? sec[0] : it.header) || "(untitled section)";
+}
+
+// The VCRM and Sections always come first; Test Reports follow (each group keeps its own order).
+const srIsReport = it => it.type === "report";
+function srOrder() {
+  camp.campaign_report.items.sort((a, b) => srIsReport(a) - srIsReport(b));
+}
+
+// Sections stay live: every non-empty one the user hasn't removed from the report is in it.
+function srSync() {
+  const rep = camp.campaign_report;
+  if (!rep) return;
+  rep.dismissed = rep.dismissed || [];
+  rep.items = rep.items.filter(it => it.type !== "section" || it.idx === undefined || camp.sections[it.idx]);
+  camp.sections.forEach(([h, t], i) => {
+    const has = rep.items.some(it => it.type === "section" && it.idx === i);
+    if (!has && !rep.dismissed.includes(i) && ((h || "").trim() || (t || "").trim())) rep.items.push({type: "section", idx: i});
+  });
+  srOrder();
+}
+
+// A section deleted on the campaign tab shifts the ones after it.
+function srSectionDeleted(i) {
+  const rep = camp.campaign_report;
+  if (!rep) return;
+  const shift = n => n > i ? n - 1 : n;
+  rep.items = rep.items.filter(it => !(it.type === "section" && it.idx === i));
+  rep.items.forEach(it => { if (it.type === "section" && it.idx !== undefined) it.idx = shift(it.idx); });
+  rep.dismissed = (rep.dismissed || []).filter(n => n !== i).map(shift);
+}
+const SR_KINDS = {section: "section", vcrm: "matrix", report: "test report"};
+
+function srAppend(item) {
+  if (!camp.campaign_report) return "No campaign report yet.";
+  const items = camp.campaign_report.items;
+  if (items.some(x => x.type === item.type && x.card === item.card)) return "Already in " + srIdFor(camp.id);
+  items.push(item);
+  srOrder();
+  renderSrSide();
+  renderSrPreview();
+  return "Appended to " + srIdFor(camp.id);
+}
+
+function openSrTab() {
+  if (!camp.campaign_report) camp.campaign_report = {items: [], dismissed: []};
+  if (!openTabs.some(t => t.key === SR_KEY)) {
+    openTabs.push({key: SR_KEY, label: srIdFor(camp.id)});
+    const panel = document.createElement("div");
+    panel.className = "test-panel report-panel";
+    panel.id = "panel-" + SR_KEY;
+    panel.innerHTML = `
+      <div class="report-side">
+        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+        <div class="report-box"><div class="report-label">Campaign report for</div><div class="report-for sr-for"></div></div>
+        <div class="report-box">
+          <div class="report-label">Contents</div>
+          <div class="sr-items"></div>
+          <div class="report-hint">Open the VCRM or a Test Report and press + append to add it here.</div>
+        </div>
+        <div class="report-btns">
+          <button class="btn" data-srrefresh>refresh</button>
+          <button class="btn" data-srprint>print / pdf</button>
+          <button class="btn" data-srdocx>.docx</button>
+        </div>
+        <div class="report-hint sr-status"></div>
+      </div>
+      <iframe class="report-frame" title="campaign report preview"></iframe>`;
+    document.getElementById("panels").appendChild(panel);
+    panel.querySelector("[data-srrefresh]").addEventListener("click", () => { srSync(); renderSrSide(); renderSrPreview(); });
+    panel.querySelector("[data-srprint]").addEventListener("click", printSr);
+    panel.querySelector("[data-srdocx]").addEventListener("click", docxSr);
+  }
+  switchTab(SR_KEY);
+}
+
+function renderSrSide() {
+  const panel = document.getElementById("panel-" + SR_KEY);
+  if (!panel || !camp.campaign_report) return;
+  panel.querySelector(".sr-for").textContent = srHead();
+  const items = camp.campaign_report.items, list = panel.querySelector(".sr-items");
+  list.innerHTML = items.length ? items.map((it, i) => `
+    <div class="sr-item">
+      <span class="sr-label"><span class="report-fname">${esc(srItemLabel(it))}</span><span class="report-kind">${SR_KINDS[it.type] || ""}</span></span>
+      <button class="btn mini btn-icon" data-srup="${i}" title="move up"${i === 0 || srIsReport(items[i - 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_UPWARD}</button>
+      <button class="btn mini btn-icon" data-srdown="${i}" title="move down"${i === items.length - 1 || srIsReport(items[i + 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_DOWNWARD}</button>
+      <button class="btn mini btn-icon btn-x" data-srdel="${i}" title="remove">${ICON_CLOSE}</button>
+    </div>`).join("") : `<div class="report-hint">Nothing added yet.</div>`;
+  const edit = (name, fn) => list.querySelectorAll(`button[data-${name}]`).forEach(b => b.addEventListener("click", () => {
+    fn(+b.dataset[name]);
+    renderSrSide();
+    renderSrPreview();
+  }));
+  edit("srup", i => { [items[i - 1], items[i]] = [items[i], items[i - 1]]; });
+  edit("srdown", i => { [items[i + 1], items[i]] = [items[i], items[i + 1]]; });
+  edit("srdel", i => {
+    const it = items[i];
+    if (it.type === "section" && it.idx !== undefined) camp.campaign_report.dismissed.push(it.idx);
+    items.splice(i, 1);
+  });
+}
+
+async function renderSrPreview() {
+  const panel = document.getElementById("panel-" + SR_KEY);
+  if (!panel) return;
+  const frame = panel.querySelector(".report-frame");
+  const res = await fetch("/export/campaign_report/print", {method: "POST", body: JSON.stringify({campaign: camp, preview: true})});
+  const scroll = frame.contentWindow ? frame.contentWindow.scrollY : 0;
+  frame.onload = () => frame.contentWindow.scrollTo(0, scroll);
+  frame.srcdoc = await res.text();
+}
+
+async function printSr() {
+  const w = window.open("", "_blank");
+  if (w) w.document.write("Generating...");
+  try {
+    const res = await fetch("/export/campaign_report/print", {method: "POST", body: JSON.stringify({campaign: camp, preview: false})});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const text = await res.text();
+    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
+  } catch (err) {
+    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
+  }
+}
+
+async function docxSr() {
+  const status = document.querySelector("#panel-" + SR_KEY + " .sr-status");
+  try {
+    const res = await fetch("/export/campaign_report/docx", {method: "POST", body: JSON.stringify({campaign: camp})});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    download(srIdFor(camp.id) + ".docx", await res.blob());
+  } catch (err) {
+    status.textContent = `Docx export failed: ${err}`;
+  }
+}
+document.getElementById("buildSrBtn").addEventListener("click", openSrTab);
+
+// ---- Test Report (TR) tabs: one card's saved .test file, rendered by the server ----
+function reportIdFor(testId) {
+  const id = String(testId || "").trim();
+  return /^tc-/i.test(id) ? "TR-" + id.slice(3) : "TR-" + (id || "000");
+}
+const REPORT_KINDS = {csv: "csv", image: "image", txt: "text output", other: "listed by name"};
+const reportState = {};   // tab key -> {card, files, active}
+
+function openReportTab(testId) {
+  const key = "report-" + testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test";
+  if (!openTabs.some(t => t.key === key)) {
+    openTabs.push({key, label: reportIdFor(testId)});
+    const panel = document.createElement("div");
+    panel.className = "test-panel report-panel";
+    panel.id = "panel-" + key;
+    panel.innerHTML = `
+      <div class="report-side">
+        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+        <div class="report-box"><div class="report-label">Report for</div><div class="report-for"></div></div>
+        <div class="report-box">
+          <div class="report-label report-files-title">Files for point</div>
+          <div class="report-files"></div>
+          <div class="report-hint">Files named <span class="report-prefix"></span>-anything.ext appear here. Tick the ones to add to the report. Click a point in the report to switch.</div>
+        </div>
+        <div class="report-btns">
+          <button class="btn" data-rrefresh>refresh</button>
+          <button class="btn" data-rprint>print / pdf</button>
+          <button class="btn" data-rdocx>.docx</button>
+          <button class="btn" data-rappend style="display:none">+ append</button>
+        </div>
+        <div class="report-hint report-status"></div>
+      </div>
+      <iframe class="report-frame" title="test report preview"></iframe>`;
+    document.getElementById("panels").appendChild(panel);
+    panel.querySelector("[data-rrefresh]").addEventListener("click", () => loadReport(key, key.slice(7)));
+    panel.querySelector("[data-rprint]").addEventListener("click", () => printReport(key));
+    panel.querySelector("[data-rdocx]").addEventListener("click", () => docxReport(key));
+    panel.querySelector("[data-rappend]").addEventListener("click", () => {
+      const st = reportState[key];
+      if (st && st.card) panel.querySelector(".report-status").textContent = srAppend({type: "report", card: st.card.id});
+    });
+  }
+  switchTab(key);
+}
+
+function reportTicks(card) {
+  camp.reports = camp.reports || {};
+  return camp.reports[card.id] = camp.reports[card.id] || {};
+}
+
+function reportPlots(card) {
+  const t = reportTicks(card);
+  return t.plot = t.plot || {};
+}
+
+function reportPayload(key, preview) {
+  const st = reportState[key];
+  return {card: st.card, campaign: camp.id || "", files: reportTicks(st.card), preview};
+}
+
+async function loadReport(key, filename) {
+  const panel = document.getElementById("panel-" + key);
+  if (!panel) return;
+  const st = reportState[key] || (reportState[key] = {active: null});
+  const status = panel.querySelector(".report-status");
+  try {
+    const res = await fetch("/load?file=" + encodeURIComponent(filename));
+    if (!res.ok) throw new Error(`${filename} not found. Save the card first.`);
+    st.card = await res.json();
+    const attached = Object.fromEntries((st.card.points || []).map(p => [p.seq, p.files || []]));
+    const fr = await fetch(`/point_files?campaign=${encodeURIComponent(camp.id || "")}&card=${encodeURIComponent(st.card.id || "")}&attached=${encodeURIComponent(JSON.stringify(attached))}`);
+    st.files = (await fr.json()).files || {};
+    const seqs = (st.card.points || []).map(p => String(p.seq));
+    if (!seqs.includes(st.active)) st.active = seqs[0] || null;
+    status.textContent = "Shows the card as last saved.";
+  } catch (err) {
+    status.textContent = String(err.message || err);
+    return;
+  }
+  renderReportSide(key);
+  await renderReportPreview(key);
+}
+
+function renderReportSide(key) {
+  const st = reportState[key], panel = document.getElementById("panel-" + key);
+  if (!st || !st.card || !panel) return;
+  panel.querySelector(".report-for").textContent = [reportIdFor(st.card.id), st.card.title, st.card.revision ? "REV " + st.card.revision.toUpperCase() : ""].filter(Boolean).join(" ");
+  panel.querySelector(".report-files-title").textContent = "Files for point " + (st.active ?? "");
+  panel.querySelector(".report-prefix").textContent = `${camp.id || "XX-000"}-${st.card.id}-${st.active}`;
+  const files = st.files[st.active] || [];
+  const ticked = reportTicks(st.card)[st.active] || [], plotted = reportPlots(st.card)[st.active] || [];
+  const list = panel.querySelector(".report-files");
+  list.innerHTML = files.length ? files.map((f, j) => `
+    <label class="report-file"><input type="checkbox" data-rfile="${j}"${ticked.includes(f.name) ? " checked" : ""}>
+      <span><span class="report-fname">${esc(f.name)}</span><span class="report-kind kind-${esc(f.kind)}">${REPORT_KINDS[f.kind] || ""}</span></span>${f.kind === "csv" && ticked.includes(f.name) ? `<button class="btn btn-plot${plotted.includes(f.name) ? " on" : ""}" data-rplot="${j}">plot</button>` : ""}</label>`).join("")
+    : `<div class="report-hint">No files for this point yet.</div>`;
+  list.querySelectorAll("input[data-rfile]").forEach(cb => cb.addEventListener("change", () => {
+    const all = reportTicks(st.card), name = files[+cb.dataset.rfile].name;
+    all[st.active] = (all[st.active] || []).filter(n => n !== name).concat(cb.checked ? [name] : []);
+    if (!cb.checked) { const pl = reportPlots(st.card); pl[st.active] = (pl[st.active] || []).filter(n => n !== name); }
+    renderReportSide(key);
+    renderReportPreview(key);
+  }));
+  list.querySelectorAll("button[data-rplot]").forEach(b => b.addEventListener("click", e => {
+    e.preventDefault();
+    const pl = reportPlots(st.card), name = files[+b.dataset.rplot].name, cur = pl[st.active] || [];
+    pl[st.active] = cur.includes(name) ? cur.filter(n => n !== name) : cur.concat([name]);
+    renderReportSide(key);
+    renderReportPreview(key);
+  }));
+}
+
+async function renderReportPreview(key) {
+  const st = reportState[key], panel = document.getElementById("panel-" + key);
+  const frame = panel.querySelector(".report-frame");
+  const res = await fetch("/export/report/print", {method: "POST", body: JSON.stringify(reportPayload(key, true))});
+  const scroll = frame.contentWindow ? frame.contentWindow.scrollY : 0;
+  frame.onload = () => {
+    const doc = frame.contentDocument;
+    frame.contentWindow.scrollTo(0, scroll);
+    doc.querySelectorAll(".rp-point").forEach(sec => {
+      sec.classList.toggle("rp-active", sec.dataset.seq === String(st.active));
+      sec.addEventListener("click", () => {
+        st.active = sec.dataset.seq;
+        doc.querySelectorAll(".rp-point").forEach(x => x.classList.toggle("rp-active", x === sec));
+        renderReportSide(key);
+      });
+    });
+  };
+  frame.srcdoc = await res.text();
+}
+
+async function printReport(key) {
+  if (!reportState[key] || !reportState[key].card) return;
+  // Opened before the await, so a popup blocker doesn't kill it.
+  const w = window.open("", "_blank");
+  if (w) w.document.write("Generating...");
+  try {
+    const res = await fetch("/export/report/print", {method: "POST", body: JSON.stringify(reportPayload(key, false))});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    const text = await res.text();
+    if (w) { w.document.open(); w.document.write(text); w.document.close(); }
+  } catch (err) {
+    if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
+  }
+}
+
+async function docxReport(key) {
+  const st = reportState[key];
+  if (!st || !st.card) return;
+  const status = document.getElementById("panel-" + key).querySelector(".report-status");
+  try {
+    const res = await fetch("/export/report/docx", {method: "POST", body: JSON.stringify(reportPayload(key, false))});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    download(reportIdFor(st.card.id) + ".docx", await res.blob());
+  } catch (err) {
+    status.textContent = `Docx export failed: ${err}`;
+  }
+}
+
+function pollForLockIcon(iframe, filename, attemptsLeft) {
+  if (attemptsLeft <= 0) return;
+  const iCard = iframe.contentWindow.getCard ? iframe.contentWindow.getCard() : null;
+  if (iCard && iCard.locked) {
+    const tab = openTabs.find(t => t.key === filename);
+    const lockIcon = "🔒";
+    if (tab && !tab.label.startsWith(lockIcon)) {
+      tab.label = lockIcon + " " + tab.label;
+      renderTabBar();
+    }
+    return;
+  }
+  setTimeout(() => pollForLockIcon(iframe, filename, attemptsLeft - 1), 200);
+}
+
+function closeTestTab(key) {
+  openTabs = openTabs.filter(t => t.key !== key);
+  const panel = document.getElementById("panel-" + key);
+  if (panel) panel.remove();
+  if (activeTab === key) switchTab("campaign");
+  else renderTabBar();
+}
+
+// A single reserved tab, regenerated in place rather than duplicated on
+// repeat clicks. Read-only: shows a computed snapshot, not edited in the UI.
+const VCRM_KEY = "__vcrm__";
+let currentVcrm = null;
+
+const VCRM_COLUMNS = [["Requirement", "requirement"], ["Source", "source"], ["Description", "description"],
+  ["Method", "method"], ["Verification Event", "event"], ["Report", "report"], ["Status", "status"],
+  ["Updated", "updated"]];
+
+async function generateVcrm() {
+  const status = document.getElementById("saveStatus");
+  try {
+    const res = await fetch("/vcrm", {method: "POST", body: JSON.stringify(camp)});
+    if (!res.ok) throw new Error(`server returned ${res.status}`);
+    currentVcrm = await res.json();
+  } catch (err) {
+    status.textContent = `VCRM generation failed: ${err}`;
+    return;
+  }
+
+  if (!openTabs.some(t => t.key === VCRM_KEY)) {
+    openTabs.push({key: VCRM_KEY, label: "VCRM"});
+  }
+  let panel = document.getElementById("panel-" + VCRM_KEY);
+  if (!panel) {
+    panel = document.createElement("div");
+    panel.className = "panel split";
+    panel.id = "panel-" + VCRM_KEY;
+    document.getElementById("panels").appendChild(panel);
+  }
+  const rows = currentVcrm.rows.map(r =>
+    "<tr>" + VCRM_COLUMNS.map(([, key]) => `<td>${esc(r[key] || "")}</td>`).join("") +
+    `<td>${r.event === "NONE" ? `<input type="checkbox" class="vcrm-pick" value="${esc(r.requirement)}">` : ""}</td></tr>`).join("");
+  panel.innerHTML = `
+    <div class="report-side">
+      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+      <div class="report-box"><div class="report-label">Verification Cross-Reference Matrix for Test Campaign</div>
+        <div class="report-for">${esc([camp.id, camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" "))}</div></div>
+      <div class="side-btns">
+        <button class="btn" id="saveVcrmBtn">export .vcrm file</button>
+        <button class="btn" id="printVcrmBtn">generate .pdf</button>
+        <button class="btn" id="docxVcrmBtn">export .docx</button>
+        <button class="btn" id="csvVcrmBtn">export .csv</button>
+        <button class="btn" id="appendVcrmBtn" style="display:none">+ append</button>
+      </div>
+      <div id="vcrmStatus" class="hint"></div>
+    </div>
+    <div class="side-main"><div class="side-inner">
+    <div class="side-head">${esc([camp.id, camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" "))}</div>
+    <div class="side-meta">
+      <span><b>Campaign:</b> ${esc(camp.id)}</span>
+      <span><b>Project:</b> ${esc(camp.project)}</span>
+    </div>
+    <div class="side-meta">
+      <span><b>Test Lead:</b> ${esc(camp.test_lead)}</span>
+      <span><b>Quality Assurance:</b> ${esc(camp.quality_assurance)}</span>
+      <span><b>Date:</b> ${esc(camp.date)}</span>
+    </div>
+    <h2 class="no-rule">Verification Cross-Reference Matrix</h2>
+    <table class="datatable">
+      <tr>${VCRM_COLUMNS.map(([title]) => `<th>${title}</th>`).join("")}<th><button class="btn btn-icon" id="newTestSelBtn" title="create a test for the checked requirements" disabled>${ICON_OPEN_IN_NEW}</button></th></tr>
+      ${rows || '<tr><td colspan="9">No requirements entered on this campaign yet.</td></tr>'}
+    </table>
+    ${(currentVcrm.warnings || []).length ? `<h2 class="no-rule">Warnings</h2>
+    <ul class="vcrm-warnings">${currentVcrm.warnings.map(g => `<li>${esc(g)}</li>`).join("")}</ul>` : ""}
+    </div></div>`;
+
+  const vcrmStatus = panel.querySelector("#vcrmStatus");
+  const createTest = async (codes) => {
+    try {
+      const res = await fetch("/create_test", {method: "POST", body: JSON.stringify({campaign: camp, requirements: codes})});
+      const t = await res.json();
+      if (!res.ok) throw new Error(t.error || res.status);
+      camp.tests.push({seq: nextSeqFor(camp.tests), test_id: t.id, title: t.title, author: t.author,
+                       requirements: t.requirements});
+      document.getElementById("saveCampBtn").click();
+      await generateVcrm();
+      openTestTab(t.id, t.title);
+    } catch (err) {
+      vcrmStatus.textContent = `Create test failed: ${err}`;
+    }
+  };
+  const selBtn = panel.querySelector("#newTestSelBtn");
+  const boxes = [...panel.querySelectorAll(".vcrm-pick")];
+  boxes.forEach(box => box.addEventListener("change", () => { selBtn.disabled = !boxes.some(b => b.checked); }));
+  selBtn.addEventListener("click", () => createTest(boxes.filter(b => b.checked).map(b => b.value)));
+  panel.querySelector("#appendVcrmBtn").addEventListener("click", () => { vcrmStatus.textContent = srAppend({type: "vcrm"}); });
+  updateAppendButtons();
+  panel.querySelector("#saveVcrmBtn").addEventListener("click", async () => {
+    try {
+      const res = await fetch("/save_vcrm", {method: "POST", body: JSON.stringify(currentVcrm)});
+      const data = await res.json();
+      vcrmStatus.textContent = data.saved ? `Saved to ${data.path}` : `Save failed: ${data.error || "unknown error"}`;
+    } catch (err) {
+      vcrmStatus.textContent = `Save failed: ${err}`;
+    }
+  });
+  panel.querySelector("#printVcrmBtn").addEventListener("click", async () => {
+    // Open synchronously, before the await below -- see the same note on
+    // printCampBtn above for why.
+    const w = window.open("", "_blank");
+    if (w) w.document.write("Generating...");
+    try {
+      const res = await fetch("/export/vcrm/print", {method: "POST", body: JSON.stringify(currentVcrm)});
+      if (!res.ok) throw new Error(`server returned ${res.status}`);
+      const text = await res.text();
+      if (w) { w.document.open(); w.document.write(text); w.document.close(); }
+    } catch (err) {
+      if (w) { w.document.open(); w.document.write("Failed to generate: " + err); w.document.close(); }
+      vcrmStatus.textContent = `Print failed: ${err}`;
+    }
+  });
+  panel.querySelector("#csvVcrmBtn").addEventListener("click", async () => {
+    try {
+      const res = await fetch("/export/vcrm/csv", {method: "POST", body: JSON.stringify(currentVcrm)});
+      if (!res.ok) throw new Error(`server returned ${res.status}`);
+      download((currentVcrm.campaign_id || "vcrm") + "-test-matrix.csv", await res.text(), "text/csv");
+    } catch (err) {
+      vcrmStatus.textContent = `CSV export failed: ${err}`;
+    }
+  });
+  panel.querySelector("#docxVcrmBtn").addEventListener("click", async () => {
+    try {
+      const res = await fetch("/export/vcrm/docx", {method: "POST", body: JSON.stringify(currentVcrm)});
+      if (!res.ok) throw new Error(`server returned ${res.status}`);
+      const blob = await res.blob();
+      download((currentVcrm.campaign_id || "vcrm") + ".docx", blob);
+    } catch (err) {
+      vcrmStatus.textContent = `Docx export failed: ${err}`;
+    }
+  });
+
+  switchTab(VCRM_KEY);
+}
+document.getElementById("genVcrmBtn").addEventListener("click", generateVcrm);
+
+bindMeta();
+camp.tests = [{seq: 1, test_id: "", title: "", author: "", requirements: ""}];
+renderRequirements();
+renderModules();
+loadModuleFiles();
+renderTests();
+renderAncillaryTests();
+renderSections();
+refreshStatuses();
+renderTabBar();
+</script>
+</body>
+</html>
