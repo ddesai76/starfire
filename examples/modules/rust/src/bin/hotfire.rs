@@ -1,4 +1,3 @@
-
 // hotfire.rs:     EXAMPLE TEST MODULE (ELECTRIC PROPULSION HOT FIRE)
 // AUTHOR:         DANIEL DESAI
 // UPDATED:        2026-10-13
@@ -9,8 +8,8 @@
 // 
 // Usage:
 // 1. Build with cargo build --release.
-// 2. Copy the binary to the Starfire/dist folder. If there are other binaries with the same name (e.g. generated
-//    from hotfire.cpp, save with a different name).
+// 2. Copy the binary to the Starfire/dist folder (e.g. mv target/release/hotfire ../../../dist/hotfire). 
+//    If there are other binaries with the same name (e.g. generated from hotfire.cpp, save with a different name).
 // 3. Add the hotfire module to the desired test point(s) in Starfire.
 // 4. Press ACTIVATE (lightning bolt) on a test point, select hotfire, and press RUN.
 // 5. Select thrusters to fire by entering hex code; FF = 11111111 (default) fires all 8.
@@ -113,6 +112,8 @@ struct App {
     status: (String, Color32),
     term: Arc<AtomicBool>,
     rng: Rng,
+    sim: bool,
+    hold: Option<Instant>,
 }
 
 impl App {
@@ -154,14 +155,20 @@ impl App {
         self.say(&format!("FIRING {} / {} s", k + 1, samples), RED);
         self.k = Some(k + 1);
         if k + 1 >= samples {
-            self.end(false);
+            if self.sim {
+                // --sim: the data is done; keep the thrusters lit for 1 s, then end.
+                self.k = None;
+                self.hold = Some(Instant::now() + Duration::from_secs(1));
+            } else {
+                self.end(false);
+            }
         } else {
             self.next = Instant::now() + Duration::from_secs_f64(SAMPLE_TIME);
         }
     }
 
     fn fire(&mut self) {
-        if self.k.is_some() {
+        if self.k.is_some() || self.hold.is_some() {
             return;
         }
         let vals = match (self.values(), self.applied) {
@@ -173,6 +180,10 @@ impl App {
         println!("# fire=0x{:02X} burn_time={:.0} s", vals.0, vals.1);
         println!("time_s,voltage_V,current_uA,accel_um_s2");
         self.tick();
+        // --sim: run the rest of the burn now; the time column is still sim time.
+        while self.sim && self.k.is_some() {
+            self.tick();
+        }
     }
 
     fn end(&mut self, aborted: bool) {
@@ -204,6 +215,10 @@ impl eframe::App for App {
         }
         if self.k.is_some() && Instant::now() >= self.next {
             self.tick();
+        }
+        if self.hold.is_some_and(|at| Instant::now() >= at) {
+            self.hold = None;
+            self.end(false);
         }
         if self.close_at.is_some_and(|at| Instant::now() >= at) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -326,6 +341,8 @@ fn main() {
             status: (String::new(), FG),
             term,
             rng: Rng::new(),
+            sim: std::env::args().any(|a| a == "--sim"),
+            hold: None,
         }))
     }));
     if let Err(e) = result {
