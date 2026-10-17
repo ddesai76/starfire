@@ -2,22 +2,23 @@
 #
 # starfi.sh:      BUILD AND RUN LAUNCHER (LINUX)
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-14
+# UPDATED:        2026-10-15
 # VERSION:        0.1.0
 
-# Builds two Linux-executable binaries into a dist folder: "starfire" (the app, via PyInstaller)
-# and "starfire-hw" (the SCPI interface, from starfire.cpp via g++), and/or runs starfire from it.
-# The default dist folder is dist/.
+# Builds the Linux binary <starfire> into a dist/ folder, plus an optional
+# <starfire-hw> (the SCPI interface, from starfire.cpp via g++, skipped otherwise),
+# and/or runs starfire from it.
 #
 # Directory structure (pre-build):
 # ├── starfi.sh
-# ├── jira_ticket.py           (builds into starfire)
-# ├── starfire.cpp             (builds to starfire-hw)
+# ├── starfire.cpp             (optional; builds to starfire-hw)
 # ├── starfire.py              (builds to starfire)
 # └── static
 #     ├── assets
-#     │   └── icon.png          (optional; only for --install-desktop)
-#     └── starfire.css
+#     │   └── icon.png         (optional; only for --install-desktop)
+#     ├── campaign.html
+#     ├── starfire.css
+#     └── test.html
 #
 # Flags:
 #   (none)            Run only, don't build
@@ -106,7 +107,7 @@ if [ "$BUILD" -eq 1 ]; then
   fi
 
   missing=()
-  for f in starfire.py starfire.cpp jira_ticket.py static/starfire.css; do
+  for f in starfire.py static/starfire.css static/test.html static/campaign.html; do
     [ -f "$f" ] || missing+=("$f")
   done
   if [ "${#missing[@]}" -gt 0 ]; then
@@ -127,9 +128,11 @@ if [ "$BUILD" -eq 1 ]; then
     exit 1
   fi
 
-  if ! command -v g++ >/dev/null 2>&1; then
-    echo "ERROR: g++ not found (needed to build starfire-hw). Ubuntu: sudo apt install g++" >&2
-    exit 1
+  HW=1
+  if [ ! -f starfire.cpp ]; then
+    HW=0; HW_NOTE="starfire.cpp not found"
+  elif ! command -v g++ >/dev/null 2>&1; then
+    HW=0; HW_NOTE="g++ not found (Ubuntu: sudo apt install g++)"
   fi
 
   pip install --break-system-packages --quiet pyinstaller python-docx
@@ -145,7 +148,9 @@ if [ "$BUILD" -eq 1 ]; then
     --specpath "$WORKDIR" \
     starfire.py
 
-  g++ -O2 -Wall -Wextra -std=c++17 -o "$DIST/starfire-hw" starfire.cpp
+  if [ "$HW" -eq 1 ]; then
+    g++ -O2 -Wall -Wextra -std=c++17 -o "$DIST/starfire-hw" starfire.cpp
+  fi
 
   # Jira is optional: copied in only if you have a config next to starfi.sh.
   if [ -f jira_config.json ]; then
@@ -156,8 +161,13 @@ if [ "$BUILD" -eq 1 ]; then
   fi
 
   echo
-  echo "Built: $DIST/starfire, $DIST/starfire-hw ($JIRA_NOTE)"
-  echo "starfire finds starfire-hw next to itself, so keep the two together."
+  if [ "$HW" -eq 1 ]; then
+    echo "Built: $DIST/starfire, $DIST/starfire-hw ($JIRA_NOTE)"
+    echo "starfire finds starfire-hw next to itself, so keep the two together."
+  else
+    echo "Built: $DIST/starfire ($JIRA_NOTE)"
+    echo "Skipped starfire-hw: $HW_NOTE. Everything except Measure still works."
+  fi
 
   if [ "$INSTALL" -eq 1 ]; then
     BINARY="$(realpath "$DIST/starfire")"
