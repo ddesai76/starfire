@@ -1,4 +1,4 @@
-// starfire.cpp:   HARDWARE INTERFACE (builds to starfire-hw)
+// starfire.cpp:   HARDWARE INTERFACE 
 // AUTHOR:         DANIEL DESAI
 // UPDATED:        2026-10-11
 // VERSION:        0.2.0
