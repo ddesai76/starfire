@@ -262,6 +262,8 @@
   .report-fname { display: block; font-size: 12px; overflow-wrap: anywhere; }
   .btn.btn-plot { flex: none; padding: 1px 8px; font-size: 11px; }
   .btn.btn-plot.on { color: var(--nvg); border-color: var(--nvg); }
+  .report-cols { display: flex; flex-direction: column; gap: 2px; margin: 2px 0 6px 24px; font-size: 11px; }
+  .report-cols input { accent-color: var(--nvg); width: auto; margin: 0 4px 0 0; }
   .report-kind { display: block; font-size: 11px; }
   .report-kind.kind-csv { color: var(--nvg); }
   .report-kind.kind-image { color: var(--amb); }
@@ -318,8 +320,8 @@
 .report-doc .rp-file { margin: 8px 0; }
 .report-doc .rp-plot { display: block; width: 100%; max-width: 640px; border: 1px solid #d5dde3; background: #fff; }
 .report-doc .rp-plot line { stroke: #1a1a1a; }
-.report-doc .rp-plot polyline { fill: none; stroke: #0077C8; stroke-width: 2; }
-.report-doc .rp-plot circle { fill: #0077C8; }
+.report-doc .rp-plot polyline { fill: none; stroke: #007C28; stroke-width: 2; }
+.report-doc .rp-plot circle { fill: #007C28; }
 .report-doc .rp-plot text { font-size: 10px; fill: #1a1a1a; }
 .report-doc .rp-out { font-size: 8.5pt; white-space: pre-wrap; overflow-wrap: anywhere; background: #f3f5f7;
                       border: 1px solid #d5dde3; padding: 8px; margin: 4px 0; max-height: none; }
@@ -360,6 +362,13 @@
 .report-doc.preview .rp-plot line { stroke: var(--dim); }
 .report-doc.preview .rp-plot polyline { stroke: var(--nvg); }
 .report-doc.preview .rp-plot circle { fill: var(--nvg); }
+/* Several traces: green, blue, red, amber (green and amber darker on paper); PLOT_COLORS in campaign.html. */
+.report-doc .rp-plot polyline.s0 { stroke: #007C28; } .report-doc .rp-plot circle.s0, .report-doc .rp-plot tspan.s0 { fill: #007C28; }
+.report-doc .rp-plot polyline.s1 { stroke: #0077C8; } .report-doc .rp-plot circle.s1, .report-doc .rp-plot tspan.s1 { fill: #0077C8; }
+.report-doc .rp-plot polyline.s2 { stroke: #ff2800; } .report-doc .rp-plot circle.s2, .report-doc .rp-plot tspan.s2 { fill: #ff2800; }
+.report-doc .rp-plot polyline.s3 { stroke: #B37D00; } .report-doc .rp-plot circle.s3, .report-doc .rp-plot tspan.s3 { fill: #B37D00; }
+.report-doc.preview .rp-plot polyline.s0 { stroke: var(--nvg); } .report-doc.preview .rp-plot circle.s0, .report-doc.preview .rp-plot tspan.s0 { fill: var(--nvg); }
+.report-doc.preview .rp-plot polyline.s3 { stroke: var(--amb); } .report-doc.preview .rp-plot circle.s3, .report-doc.preview .rp-plot tspan.s3 { fill: var(--amb); }
 .report-doc.preview .rp-plot text { fill: var(--nw); }
 .report-doc.preview .rp-out { font-size: 11px; background: var(--panel); border-color: var(--stroke); color: var(--nw); }
 .report-doc .sr-part { margin-bottom: 16px; }
