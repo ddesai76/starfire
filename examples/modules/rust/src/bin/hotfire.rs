@@ -8,7 +8,7 @@
 // 
 // Usage:
 // 1. Build with cargo build --release.
-// 2. Copy the binary to the Starfire/dist folder (e.g. mv target/release/hotfire ../../../dist/hotfire). 
+// 2. Copy the binary to the Starfire/dist folder (e.g. mv target/release/hotfire <path>/dist/hotfire). 
 //    If there are other binaries with the same name (e.g. generated from hotfire.cpp, save with a different name).
 // 3. Add the hotfire module to the desired test point(s) in Starfire.
 // 4. Press ACTIVATE (lightning bolt) on a test point, select hotfire, and press RUN.
