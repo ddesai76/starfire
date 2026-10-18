@@ -66,7 +66,7 @@ A point owns the files attached to it, shown as chips under the point on the car
 
 | File | In the report |
 |:--|:--|
-| `.csv`, or a comma-separated `.txt` | Shown as raw text (capped at 4,096 lines). Press **plot** beside a ticked csv to plot it instead (the `value` column if there is one, else the last numeric column, against the first numeric column or the row number; `#` lines are ignored). The `.docx` lists the values in a table instead of a plot. |
+| `.csv` or a comma-separated `.txt` | Shown as raw text (capped at 4,096 lines). Press plot beside a ticked file to plot it instead, against the first numeric column (or the row number). The trace is the value column if there is one, else the next numeric column; when there are more columns, checkboxes under plot add up to four traces, in blue, red, green and amber. # lines are ignored. A `.docx` lists values in a table instead of a plot. |
 | `.png` `.jpg` `.gif` | Embedded image. |
 | `.txt` | Shown as text output (capped at 4,096 lines). |
 | anything else | Listed by name. |
@@ -90,7 +90,13 @@ Each test point has three tools in the button row. Each opens in its own column 
 |:--|:--|:--|
 | **Camera** | camera | Live preview and image capture (see above). |
 | **Measure** | gauge | Opens the measure column: a **USB port** (e.g. `/dev/usbtmc0`) and a **Command** box with a **send** button next to it. A query (contains `?`, e.g. `MEAS:VOLT:DC?`) is sent and its reply is added as a timestamped row in the point's measurement table. A command (e.g. `OUTP ON`) is sent and the status line shows `Sent OUTP ON at 14:03:22`; nothing is logged. The **download** icon saves the point's readings as `<campaign>-<card>-<point>.csv` (e.g. `SC-001-TC-001-20.csv`) in the working folder. Without `starfire-hw` the panel still works for manual entry and says nothing was sent. |
-| **Activate** | lightning | Opens the module column. Enter a module name, press **run**, and watch the status: `RUNNING`, then `COMPLETE`, `FAILED` or `BROKEN` with the exit code, run time, and the module's output. **break** stops a running module (and anything it started): it is sent SIGTERM, then SIGKILL after 3 seconds. The **download** icon under the output saves it as `<campaign>-<card>-<point>.txt`. A card outside a campaign uses `XX-000` as the campaign. |
+| **Activate** | lightning | Opens the module column. Enter a module name, press **run**, and watch the status: `RUNNING`, then `COMPLETE`, `FAILED` or `BROKEN` with the exit code, run time, and the module's output. **break** stops a running module (and anything it started): it is sent SIGTERM, then SIGKILL after 3 seconds.  ||
+
+### Test point exports: Download, Branch, Extend
+The **Download** icon under the output saves it as <campaign>-<card>-<point>.txt. If the run wrote a test card (a .test file in the project folder, or output that is a card’s JSON), the same icon also saves that card as <campaign>-<card>-<point>.test and attaches it to the point. A card outside a campaign uses XX-000 as the campaign.
+**Branch** and **Extend** (lower right of each point) use the last .test file attached to the point:
+* **Branch** makes a _new_ card (next free TC-nnn) identical up to and including the working point: metadata, sign-offs, photos and attached files, and adds the .test file’s points, numbered from the working point + 10. The new card is added to the Test Series and opened.
+*  **Extend** adds the new points to the _same_ card. It works only from the last point.
 
 ### Modules
 A **module** is a script or program placed in the `/dist` folder that Starfire runs. The module's own internal logic (UI, hardware interface, etc.) is transparent to Starfire.
