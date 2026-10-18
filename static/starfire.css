@@ -148,6 +148,7 @@
   .thumb-chip .btn.mini { padding: 0 4px; }
   .pt-cam-msg { font-size: 11px; color: var(--amb); margin-top: 4px; }
   .pt-cam-msg:empty { display: none; }
+  .pt-feed { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
   .btn { background: var(--panel); border: 1px solid var(--stroke-hi); color: var(--nw);
          font-family: var(--mono); font-size: 12px; padding: 5px 10px; border-radius: 6px;
          cursor: pointer; text-transform: uppercase; }
