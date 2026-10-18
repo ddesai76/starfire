@@ -205,6 +205,7 @@ window.addEventListener("focus", loadModuleFiles);
 // Test tabs (iframes) read the live list from here when they offer or run a module.
 window.getCampaignModules = () => camp.modules;
 window.getCampaignId = () => camp.id;
+window.getCampaignTestIds = () => camp.tests.concat(camp.ancillary_tests).map(t => t.test_id);
 
 // Google Material Symbols, embedded inline (not a file/CDN) so they work
 // fully offline; fill="currentColor" picks up each button's own hover color.
@@ -225,6 +226,13 @@ async function refreshStatuses() {
   renderAncillaryTests();
 }
 function statusFor(row) { return statusByTest[(row.test_id || "").trim()] || ""; }
+
+// A card just written by Create test or BRANCH: add it to the Test Series and save the campaign.
+function addTestRow(t) {
+  camp.tests.push({seq: nextSeqFor(camp.tests), test_id: t.id, title: t.title, author: t.author,
+                   requirements: t.requirements});
+  document.getElementById("saveCampBtn").click();
+}
 
 function nextSeqFor(list) {
   const max = list.reduce((m, t) => Math.max(m, +t.seq || 0), 0);
@@ -346,6 +354,9 @@ async function refreshFileList(selectId) {
   try {
     const res = await fetch("/list_files?ext=.test");
     const data = await res.json();
+    // Leave out .test files saved for a point (<campaign>-<card>-<point>.test): they aren't cards in the series.
+    const own = [camp.id, "XX-000"].map(s => String(s || "").trim().replace(/[^A-Za-z0-9._-]/g, "_") + "-");
+    data.files = (data.files || []).filter(f => !own.some(o => f.startsWith(o)));
     sel.innerHTML = '<option value="">Browse existing .test files...</option>' +
       (data.files || []).map(f => `<option value="${esc(f)}">${esc(f)}</option>`).join("");
     if ((data.files || []).includes(current)) sel.value = current;
@@ -747,6 +758,25 @@ function reportPlots(card) {
   return t.plot = t.plot || {};
 }
 
+// Y columns chosen per plotted csv: {seq: {name: [column indices]}}.
+function reportCols(card) {
+  const t = reportTicks(card);
+  return t.cols = t.cols || {};
+}
+
+const PLOT_COLORS = ["#39ff14", "#0077C8", "#ff2800", "#FFB300"];   // the preview's trace colors in starfire.css
+
+// Checkboxes for a plotted csv with more than one column to trace (x is always the first numeric column).
+function plotColsHtml(st, f, j) {
+  const pl = reportPlots(st.card)[st.active] || [];
+  if (!pl.includes(f.name) || (f.cols || []).length < 2) return "";
+  const sel = ((reportCols(st.card)[st.active] || {})[f.name] || [f.ydef]).slice().sort((a, b) => a - b);
+  return `<div class="report-cols">${f.cols.map(([i, label]) => {
+    const k = sel.indexOf(i), off = k < 0 && sel.length >= 4, last = k >= 0 && sel.length === 1;
+    return `<label${k >= 0 ? ` style="color:${PLOT_COLORS[k]}"` : ""}><input type="checkbox" data-rcol="${j}" value="${i}"${k >= 0 ? " checked" : ""}${off || last ? " disabled" : ""}> ${esc(label)}</label>`;
+  }).join("")}</div>`;
+}
+
 function reportPayload(key, preview) {
   const st = reportState[key];
   return {card: st.card, campaign: camp.id || "", files: reportTicks(st.card), preview};
@@ -786,12 +816,19 @@ function renderReportSide(key) {
   const list = panel.querySelector(".report-files");
   list.innerHTML = files.length ? files.map((f, j) => `
     <label class="report-file"><input type="checkbox" data-rfile="${j}"${ticked.includes(f.name) ? " checked" : ""}>
-      <span><span class="report-fname">${esc(f.name)}</span><span class="report-kind kind-${esc(f.kind)}">${REPORT_KINDS[f.kind] || ""}</span></span>${f.kind === "csv" && ticked.includes(f.name) ? `<button class="btn btn-plot${plotted.includes(f.name) ? " on" : ""}" data-rplot="${j}">plot</button>` : ""}</label>`).join("")
+      <span><span class="report-fname">${esc(f.name)}</span><span class="report-kind kind-${esc(f.kind)}">${REPORT_KINDS[f.kind] || ""}</span></span>${f.kind === "csv" && ticked.includes(f.name) ? `<button class="btn btn-plot${plotted.includes(f.name) ? " on" : ""}" data-rplot="${j}">plot</button>` : ""}</label>${plotColsHtml(st, f, j)}`).join("")
     : `<div class="report-hint">No files for this point yet.</div>`;
   list.querySelectorAll("input[data-rfile]").forEach(cb => cb.addEventListener("change", () => {
     const all = reportTicks(st.card), name = files[+cb.dataset.rfile].name;
     all[st.active] = (all[st.active] || []).filter(n => n !== name).concat(cb.checked ? [name] : []);
     if (!cb.checked) { const pl = reportPlots(st.card); pl[st.active] = (pl[st.active] || []).filter(n => n !== name); }
+    renderReportSide(key);
+    renderReportPreview(key);
+  }));
+  list.querySelectorAll("input[data-rcol]").forEach(cb => cb.addEventListener("change", () => {
+    const f = files[+cb.dataset.rcol], all = reportCols(st.card), mine = all[st.active] = all[st.active] || {};
+    const cur = mine[f.name] || [f.ydef], i = +cb.value;
+    mine[f.name] = cb.checked ? cur.concat([i]) : cur.filter(x => x !== i);
     renderReportSide(key);
     renderReportPreview(key);
   }));
@@ -948,9 +985,7 @@ async function generateVcrm() {
       const res = await fetch("/create_test", {method: "POST", body: JSON.stringify({campaign: camp, requirements: codes})});
       const t = await res.json();
       if (!res.ok) throw new Error(t.error || res.status);
-      camp.tests.push({seq: nextSeqFor(camp.tests), test_id: t.id, title: t.title, author: t.author,
-                       requirements: t.requirements});
-      document.getElementById("saveCampBtn").click();
+      addTestRow(t);
       await generateVcrm();
       openTestTab(t.id, t.title);
     } catch (err) {
