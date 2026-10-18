@@ -2,8 +2,8 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-16
-# VERSION:        0.2.0
+# UPDATED:        2026-10-18
+# VERSION:        0.2.1
 #
 
 """
@@ -398,6 +398,88 @@ def create_test(camp: Campaign, codes: list) -> dict:
     with open(os.path.join(os.getcwd(), test_filename(card.id)), "w", encoding="utf-8") as f:
         json.dump(card.to_dict(), f, indent=2)
     return {"id": card.id, "title": "", "author": card.author, "requirements": card.requirements}
+
+
+def card_text(text: str):
+    """Normalized .test JSON if text is a card (a JSON object with a points list), else None."""
+    try:
+        d = json.loads(text)
+        if not isinstance(d, dict) or not isinstance(d.get("points"), list):
+            return None
+        return json.dumps(TestCard.from_dict(d).to_dict(), indent=2)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
+
+
+def _seq_int(seq) -> int:
+    try:
+        return int(float(str(seq).strip()))
+    except ValueError:
+        raise ValueError(f"point number {seq!r} is not a number")
+
+
+def _new_points(extra: TestCard, seq) -> list:
+    # A module card's points, renumbered by 10s from seq + 10; their attachments stay behind.
+    start = _seq_int(seq)
+    return [TestPoint(**{**asdict(p), "seq": start + 10 * (k + 1), "files": []}) for k, p in enumerate(extra.points)]
+
+
+def _point_index(card: TestCard, seq) -> int:
+    for i, p in enumerate(card.points):
+        if str(p.seq).strip() == str(seq).strip():
+            return i
+    raise ValueError(f"no point {seq} on {card.id}")
+
+
+def extend_card(card: TestCard, seq, extra: TestCard) -> TestCard:
+    """The card with the module card's points added after point seq, which must be its last point."""
+    if _point_index(card, seq) != len(card.points) - 1:
+        raise ValueError("EXTEND works only on the last point")
+    return TestCard.from_dict({**card.to_dict(), "points": [asdict(p) for p in card.points + _new_points(extra, seq)]})
+
+
+def branch_card(card: TestCard, seq, extra: TestCard, new_id: str, campaign_id: str):
+    """(new card, [(old, new) file renames]): this card up to and including point seq, under new_id,
+    then the module card's points. Files named for the old card are renamed for the new one."""
+    old, new = _point_prefix(campaign_id, card.id) + "-", _point_prefix(campaign_id, new_id) + "-"
+    renames = []
+    kept = []
+    for p in card.points[:_point_index(card, seq) + 1]:
+        files = []
+        for n in p.files:
+            if n.startswith(old):
+                renames.append((n, new + n[len(old):]))
+                n = new + n[len(old):]
+            files.append(n)
+        kept.append(TestPoint(**{**asdict(p), "files": files}))
+    d = {**card.to_dict(), "id": new_id, "points": [asdict(p) for p in kept + _new_points(extra, seq)]}
+    return TestCard.from_dict(d), renames
+
+
+def feed_card(data: dict) -> dict:
+    """BRANCH or EXTEND a card from the module-written .test file attached to one of its points.
+    data: {"mode": "branch"|"extend", "card", "point", "file", "campaign", "used": [campaign test IDs]}."""
+    card = TestCard.from_dict(data["card"])
+    campaign_id = str(data.get("campaign") or "XX-000")
+    name = data.get("file")
+    if not (_own_file(campaign_id, card.id, name) and name.endswith(".test")):
+        raise ValueError(f"{name!r} is not a .test file saved for this card")
+    text = card_text(_read_text(_cwd_file(name), _POINT_FILE_MAX))
+    if text is None:
+        raise ValueError(f"{name} is not a test card")
+    extra = TestCard.from_dict(json.loads(text))
+    if data.get("mode") == "extend":
+        return {"card": extend_card(card, data["point"], extra).to_dict()}
+    if data.get("mode") != "branch":
+        raise ValueError("mode must be branch or extend")
+    branched, renames = branch_card(card, data["point"], extra, next_test_id(Campaign(tests=[CampaignTestRow(0, str(t)) for t in data.get("used") or []])), campaign_id)
+    for a, b in renames:
+        src, dst = _cwd_file(a), os.path.join(os.getcwd(), b)
+        if src and not os.path.exists(dst):
+            shutil.copy2(src, dst)
+    with open(os.path.join(os.getcwd(), test_filename(branched.id)), "w", encoding="utf-8") as f:
+        json.dump(branched.to_dict(), f, indent=2)
+    return {"id": branched.id, "title": branched.title, "author": branched.author, "requirements": branched.requirements}
 
 
 def test_filename(test_id: str) -> str:
@@ -909,7 +991,11 @@ def list_point_files(campaign_id: str, card_id: str, attached: dict = None) -> d
         for seq, names in attached.items():
             for n in names if isinstance(names, list) else []:
                 if _own_file(campaign_id, card_id, n):
-                    out.setdefault(str(seq), []).append({"name": n, "kind": _file_kind(n)})
+                    f = {"name": n, "kind": _file_kind(n)}
+                    if f["kind"] == "csv":
+                        f["cols"] = csv_y_columns(_cwd_file(n))
+                        f["ydef"] = csv_y_default(_cwd_file(n))
+                    out.setdefault(str(seq), []).append(f)
         return out
     pat = _point_file_pattern(campaign_id, card_id)
     try:
@@ -957,9 +1043,8 @@ def _num(s):
     return float(m.group(1)) if m else None
 
 
-def csv_series(path: str, limit: int = 5000):
-    """(x_label, y_label, xs, ys) from a csv: y is the "value" column if there is
-    one, else the last numeric column; x is the first column if numeric, else the row number."""
+def _csv_table(path: str, limit: int = 5000):
+    """(header, body rows, numeric column indices) of a csv; blank rows and # lines are skipped."""
     with open(path, newline="", encoding="utf-8", errors="replace") as f:
         rows = [r for r in csv.reader(f) if any(c.strip() for c in r) and not r[0].lstrip().startswith("#")][:limit + 1]
     if not rows:
@@ -967,11 +1052,28 @@ def csv_series(path: str, limit: int = 5000):
     header = rows[0] if any(_num(c) is None for c in rows[0]) else []
     body = rows[1:] if header else rows
     width = max(len(r) for r in body) if body else 0
-    numeric = [i for i in range(width) if any(i < len(r) and _num(r[i]) is not None for r in body)]
-    if not numeric:
-        return None
+    return header, body, [i for i in range(width) if any(i < len(r) and _num(r[i]) is not None for r in body)]
+
+
+def _default_y(header: list, numeric: list) -> int:
+    # The "value" column if there is one (measure readings), else the numeric column after x.
     names = [c.strip().lower() for c in header]
-    y = names.index("value") if "value" in names and names.index("value") in numeric else numeric[-1]
+    return names.index("value") if "value" in names and names.index("value") in numeric else numeric[min(1, len(numeric) - 1)]
+
+
+def _col_label(header: list, i: int, default: str) -> str:
+    return header[i] if header and i < len(header) and header[i].strip() else default
+
+
+def csv_series(path: str, limit: int = 5000, y: int = None):
+    """(x_label, y_label, xs, ys) from a csv: y is the given column, else the "value" column if there is
+    one, else the second numeric column; x is the first numeric column, else the row number."""
+    t = _csv_table(path, limit)
+    if not t or not t[2]:
+        return None
+    header, body, numeric = t
+    if y not in numeric:
+        y = _default_y(header, numeric)
     x = numeric[0] if numeric[0] != y else None
     pts = []
     for i, r in enumerate(body):
@@ -981,8 +1083,20 @@ def csv_series(path: str, limit: int = 5000):
             pts.append((xv, yv))
     if not pts:
         return None
-    label = lambda i, d: header[i] if header and i < len(header) and header[i].strip() else d
-    return (label(x, "x") if x is not None else "sample", label(y, "y"), [p[0] for p in pts], [p[1] for p in pts])
+    return (_col_label(header, x, "x") if x is not None else "sample", _col_label(header, y, "y"),
+            [p[0] for p in pts], [p[1] for p in pts])
+
+
+def csv_y_default(path: str):
+    # The column a plot traces when none is chosen.
+    t = _csv_table(path, 50) if path else None
+    return _default_y(t[0], t[2]) if t and t[2] else None
+
+
+def csv_y_columns(path: str) -> list:
+    # [[index, label]] of the columns a plot can trace: every numeric column after the first (x).
+    t = _csv_table(path, 50) if path else None
+    return [[i, _col_label(t[0], i, f"column {i + 1}")] for i in t[2][1:]] if t else []
 
 
 def _looks_csv(path) -> bool:
@@ -995,27 +1109,41 @@ def _looks_csv(path) -> bool:
     return bool(s) and len(s[2]) >= 2 and "," in first
 
 
-def csv_plot_svg(path: str) -> str:
-    s = csv_series(path)
-    if not s:
+def csv_plot_svg(path: str, cols: list = None) -> str:
+    """One trace (csv_series' default column), or up to four of csv_y_columns' (cols), against the
+    first numeric column; several traces get classes s0-s3 (colored in starfire.css) and a legend."""
+    ok = {i for i, _ in csv_y_columns(path)}
+    cols = sorted({c for c in (cols or []) if c in ok})[:4] or [None]
+    series = [s for s in (csv_series(path, y=c) for c in cols) if s]
+    if not series:
         return ""
-    xl, yl, xs, ys = s
-    x0, x1 = min(xs), max(xs)
-    lo, hi = min(ys), max(ys)
+    multi = len(series) > 1
+    allx = [v for s in series for v in s[2]]
+    ally = [v for s in series for v in s[3]]
+    x0, x1 = min(allx), max(allx)
+    lo, hi = min(ally), max(ally)
     pad = (hi - lo) * 0.1 or 1.0
     y0, y1 = lo - pad, hi + pad
     sx = lambda v: 56 + (v - x0) / ((x1 - x0) or 1) * 484
     sy = lambda v: 176 - (v - y0) / (y1 - y0) * 156
-    line = " ".join(f"{sx(a):.1f},{sy(b):.1f}" for a, b in zip(xs, ys))
-    dots = "".join(f'<circle cx="{sx(a):.1f}" cy="{sy(b):.1f}" r="3"/>' for a, b in zip(xs, ys)) if len(xs) <= 60 else ""
     g = lambda v: f"{v:.4g}"
-    return (f'<svg class="rp-plot" viewBox="0 0 560 210" role="img" aria-label="{_h(yl)} vs {_h(xl)}">'
+    traces = ""
+    for k, (_, _, xs, ys) in enumerate(series):
+        cls = f' class="s{k}"' if multi else ""
+        line = " ".join(f"{sx(a):.1f},{sy(b):.1f}" for a, b in zip(xs, ys))
+        dots = "".join(f'<circle{cls} cx="{sx(a):.1f}" cy="{sy(b):.1f}" r="3"/>' for a, b in zip(xs, ys)) if len(xs) <= 60 else ""
+        traces += f'<polyline{cls} points="{line}"/><g>{dots}</g>'
+    xl, yl = series[0][0], "" if multi else series[0][1]
+    legend = ('<text x="540" y="12" text-anchor="end">' + "".join(
+        f'<tspan class="s{k}"{' dx="12"' if k else ""}>{_h(s[1])}</tspan>' for k, s in enumerate(series)) + "</text>") if multi else ""
+    label = ", ".join(s[1] for s in series)
+    return (f'<svg class="rp-plot" viewBox="0 0 560 210" role="img" aria-label="{_h(label)} vs {_h(xl)}">'
             f'<line x1="56" y1="176" x2="540" y2="176"/><line x1="56" y1="20" x2="56" y2="176"/>'
             f'<text x="50" y="24" text-anchor="end">{g(y1)}</text><text x="50" y="176" text-anchor="end">{g(y0)}</text>'
             f'<text x="56" y="194">{g(x0)}</text><text x="540" y="194" text-anchor="end">{g(x1)}</text>'
             f'<text x="298" y="206" text-anchor="middle">{_h(xl)}</text>'
             f'<text x="12" y="98" transform="rotate(-90 12 98)" text-anchor="middle">{_h(yl)}</text>'
-            f'<polyline points="{line}"/><g>{dots}</g></svg>')
+            f'{legend}{traces}</svg>')
 
 
 def _meas_rows(p: TestPoint) -> list:
@@ -1061,12 +1189,19 @@ def _plotted(files: dict, seq) -> list:
     return p.get(str(seq), []) if isinstance(p, dict) else []
 
 
-def _point_file_html(name: str, plot: bool = False) -> str:
+def _plot_cols(files: dict, seq, name: str) -> list:
+    # Y columns chosen for a plotted csv; stored under files["cols"] as {seq: {name: [indices]}}.
+    c = ((files or {}).get("cols") or {}).get(str(seq)) or {}
+    v = c.get(name) if isinstance(c, dict) else None
+    return [i for i in v if isinstance(i, int)] if isinstance(v, list) else None
+
+
+def _point_file_html(name: str, plot: bool = False, cols: list = None) -> str:
     kind, path = _file_kind(name), _cwd_file(name)
     if kind == "csv" and not plot:
         return f'<div class="rp-file"><div class="rp-cap">{_h(name)}</div><pre class="rp-out">{_h(_cap_lines(_read_text(path)))}</pre></div>'
     if kind == "csv":
-        svg = csv_plot_svg(path)
+        svg = csv_plot_svg(path, cols)
         return f'<div class="rp-file"><div class="rp-cap">{_h(name)}</div>{svg or "<div class=rp-missing>no numeric data to plot</div>"}</div>'
     if kind == "image":
         return _img_tag(name)
@@ -1088,7 +1223,7 @@ def report_body(card: TestCard, campaign_id: str = "", files: dict = None) -> st
             + "".join(f"<tr><td>{_h(str(c))}</td><td>{_h(str(v))}</td><td>{_h(str(t))}</td></tr>" for c, v, t in meas)
             + "</table>")
         imgs = "".join(_img_tag(n) for n in p.images)
-        extra = "".join(_point_file_html(n, n in _plotted(files, p.seq)) for n in _ticked(files, card, campaign_id, p.seq))
+        extra = "".join(_point_file_html(n, n in _plotted(files, p.seq), _plot_cols(files, p.seq, n)) for n in _ticked(files, card, campaign_id, p.seq))
         q = (p.quality or "").upper()
         pts.append(f'''<section class="rp-point rp-b-{_h(q.lower()) or "none"}" data-seq="{p.seq}">
 <div class="rp-head"><span>{p.seq} &nbsp; {_h(p.action)}</span><span class="rp-right"><span class="rp-q rp-q-{_h(q.lower())}">{_h(q) or "&mdash;"}</span>{under}</span></div>
@@ -1485,6 +1620,29 @@ def _parse_args(text) -> list:
     return shlex.split(text)
 
 
+def _test_files_state() -> dict:
+    # {name: (mtime, size)} of the .test files in the working directory.
+    state = {}
+    try:
+        for n in os.listdir(os.getcwd()):
+            if n.endswith(".test") and os.path.isfile(n):
+                st = os.stat(n)
+                state[n] = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        pass
+    return state
+
+
+def _written_card(before: dict):
+    # The newest .test file changed since `before` that is a card, as .test JSON.
+    after = _test_files_state()
+    for n in sorted((n for n in after if before.get(n) != after[n]), key=lambda n: after[n][0], reverse=True):
+        text = card_text(_read_text(n, _POINT_FILE_MAX))
+        if text:
+            return text
+    return None
+
+
 def _point_files_state(campaign_id: str, card_id: str, point_seq) -> dict:
     # {name: (mtime, size)} of the files named for this point, to see what a run wrote.
     pat = _point_file_pattern(campaign_id, card_id)
@@ -1506,7 +1664,8 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     point this at anything else. The module runs in the working directory
     (where .test files live) with STARFIRE_CAMPAIGN, STARFIRE_CARD, STARFIRE_POINT
     and, if found, STARFIRE_HW (path to starfire-hw) in its environment.
-    The result's "files" lists the files named for this point that the run created or changed.
+    The result's "files" lists the files named for this point that the run created or changed;
+    "card" is a test card the run wrote (a .test file, else its whole output), as .test JSON.
     args is one command-line string, split into plain argv entries (no shell),
     so it reaches a module in any language the same way."""
     if name not in list_modules():
@@ -1526,6 +1685,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     key = (str(card_id), str(point_seq))
     started = time.monotonic()
     before = _point_files_state(campaign_id, card_id, point_seq)
+    tests_before = _test_files_state()
     with _RUNS_LOCK:
         if key in _RUNS:
             return {"status": "failed", "error": "a module is already running on this point"}
@@ -1560,6 +1720,9 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         "output": _cap_lines(out.decode("utf-8", "replace")),
         "files": sorted(n for n, st in _point_files_state(campaign_id, card_id, point_seq).items() if before.get(n) != st),
     }
+    card = _written_card(tests_before) or card_text(out.decode("utf-8", "replace"))
+    if card:
+        result["card"] = card
     if timed_out:
         result["error"] = f"timed out after {_MODULE_TIMEOUT_S} s"
     return result
@@ -1594,7 +1757,7 @@ def _fill_flags(html: str) -> str:
 _TEST_HTML = _fill_flags(_read_static("test.html"))
 _CAMPAIGN_HTML = _fill_flags(_read_static("campaign.html"))
 
-_POINT_FILE_EXTS = ("csv", "txt")
+_POINT_FILE_EXTS = ("csv", "txt", "test")
 _POINT_FILE_MAX = 5_000_000   # characters
 
 _DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -1825,7 +1988,7 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(200, break_module(payload.get("card", ""), payload.get("point", "")))
 
     def _handle_save_point_file(self, raw_body: bytes):
-        # {"campaign", "card", "point", "ext": "csv"|"txt", "content"} -> <campaign>-<card>-<point>.<ext>
+        # {"campaign", "card", "point", "ext": "csv"|"txt"|"test", "content"} -> <campaign>-<card>-<point>.<ext>
         payload = self._local_json_payload(raw_body)
         if payload is None:
             return
@@ -1833,6 +1996,9 @@ class _Handler(BaseHTTPRequestHandler):
         content = payload.get("content")
         if ext not in _POINT_FILE_EXTS or not isinstance(content, str) or len(content) > _POINT_FILE_MAX:
             self._send_json(400, {"saved": False, "error": "bad request"})
+            return
+        if ext == "test" and card_text(content) is None:
+            self._send_json(400, {"saved": False, "error": "not a test card"})
             return
         stem = "-".join(re.sub(r"[^A-Za-z0-9._-]", "_", str(payload.get(k) or d))
                         for k, d in (("campaign", "XX-000"), ("card", "TC"), ("point", "0")))
@@ -1898,6 +2064,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, campaign_statuses(camp))
             else:
                 self._send_json(200, compute_vcrm(camp))
+        # BRANCH / EXTEND: {"mode", "card", "point", "file", "campaign", "used"}
+        elif path == "/feed_card":
+            self._send_json(200, feed_card(data))
         # Create test: {"campaign": <the .camp dict>, "requirements": [codes]}
         elif path == "/create_test":
             self._send_json(200, create_test(Campaign.from_dict(data["campaign"]), data["requirements"]))
