@@ -7,6 +7,10 @@ description = "Rust modules for Starfire: each src/bin/*.rs builds to a binary t
 [dependencies]
 signal-hook = "0.4.5"
 eframe = { version = "0.36.2", default-features = false, features = ["glow", "default_fonts", "x11"] }
+egui_plot = "0.37.0"
+epaint_default_fonts = "0.36"
+image = { version = "0.25", default-features = false, features = ["png"] }
+plotters = { version = "0.3.7", default-features = false, features = ["bitmap_backend", "line_series", "ab_glyph"] }
 
 [profile.release]
 opt-level = 2
