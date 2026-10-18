@@ -3,7 +3,7 @@
 // UPDATED:        2026-10-13
 // VERSION:        0.1.0
 //
-// Rust version of hotfire.cpp with GUI. User-selected firing pattern (hex code),
+// Rust (demo) version of hotfire.cpp with GUI. User-selected firing pattern (hex code),
 // and burn time. Prints voltage/current/accel as CSV (simulated values).
 // 
 // Usage:
