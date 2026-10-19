@@ -148,13 +148,13 @@ Starfire/                    <- launch ./dist/starfire from here; modules run he
 * `/run_module` accepts only JSON requests addressed to `localhost`/`127.0.0.1` on Starfire's own port. A form post from another website, or a DNS-rebinding trick, is refused.
 * The scope rule is enforced by the page, not the server: the server knows which files are runnable, but not your campaign. Treat `dist/` as the trust boundary; anything executable you put there can be run from the UI.
 
-###Example Modules
+### Example Modules
 Several example modules are included here as a demonstration of the range of capabilities the module architecture offers.
 Source is in `examples/modules/`. Build or copy the result into `dist/`, then register it in the campaign's **Modules** table.
 
 | Module | Language | What it does |
 |---|---|---|
-| `hotfire.py` | Python | Demo electric propulsion hot fire. Prints simulated voltage, current and acceleration as CSV. If matplotlib is installed, it also saves `<campaign>-<card>-<point>-plot.png` to the working directory. |
+| `validate.py` | Python | Test point validation and metrics module. Compares output to user-entered limits (_e.g_ max @current < 450) and provides scalar or vector metrics (_e.g._ @voltage * @current). Writes `<campaign>-<card>-<point>-VAL.txt` |
 | `hotfire.cpp` | C++ | The same hot fire demo in C++. Energizes HV, checks fuel, fires, and prints the simulated readings as CSV. Build: `g++ -O2 -std=c++17 -o dist/hotfire hotfire.cpp`. |
 | `rust/src/bin/hotfire.rs` | Rust | The hot fire with an egui GUI. User-entered the firing pattern as a hex code (`FF` fires all 8 thrusters) and  burn time. Prints simulated CSV. `--sim` runs the burn quickly |
 | `rust/src/bin/tvac.rs` | Rust | Thermal vacuum profile editor and runner. User-entered time and temperature vectors by typing, interpolated to ramps and plateaus. `--sim` runs the profile in 30 s. EXPORT CSV and PNG write the profile. With `--sim`, EXPORT TEST writes a Starfire test card (`TV-001.test`) that can be added to a card with BRANCH or EXTEND. |
