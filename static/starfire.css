@@ -64,6 +64,7 @@
      .btn:hover's specificity exactly, so whichever rule sits later in
      the file silently wins regardless of which is "correct". */
   .btn.measure-toggle:hover, .btn.measure-toggle:active,
+  .btn.calc-toggle:hover, .btn.calc-toggle:active,
   .btn.module-toggle:hover, .btn.module-toggle:active {
     border-color: var(--magenta); color: var(--magenta);
   }
@@ -89,6 +90,16 @@
     background-position: right 9px center; background-size: 12px 8px;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 8' fill='none' stroke='%23b8ffd0' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5'/%3E%3C/svg%3E"); }
   /* A text input with its action button beside it: module name + run, command + send. */
+  /* Under the Module column: the right-hand third of the row. */
+  .pt-calc { margin: 20px 0 0 calc(2 * (100% - 32px) / 3 + 32px); }
+  .pt-calc label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
+  .calc-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .calc-chip { font-family: monospace; text-transform: none; }
+  .calc-row { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; margin-bottom: 10px; }
+  .calc-row input { width: 100%; box-sizing: border-box; font-family: monospace; font-size: 15px; }
+  .calc-out { font-family: monospace; font-size: 22px; color: var(--nvg); user-select: all; overflow-wrap: anywhere; }
+  .calc-out.arr { font-size: 14px; }
+  .calc-out.err { font-size: 13px; color: var(--rd); user-select: text; }
   .send-row { display: flex; gap: 6px; margin-bottom: 8px; }
   .send-row input { flex: 1; min-width: 0; }
   .mod-row { align-items: flex-end; }
@@ -325,6 +336,9 @@
 .report-doc .rp-plot text { font-size: 10px; fill: #1a1a1a; }
 .report-doc .rp-out { font-size: 8.5pt; white-space: pre-wrap; overflow-wrap: anywhere; background: #f3f5f7;
                       border: 1px solid #d5dde3; padding: 8px; margin: 4px 0; max-height: none; }
+/* validate.py output: a failed limit is amber, darker on paper. */
+.report-doc .rp-warn { font-size: 10pt; font-weight: 700; color: #B37D00; margin-bottom: 4px; }
+.report-doc .rp-fail { color: #B37D00; }
 /* On-screen preview uses the app's dark theme and the test card's type scale; print stays light. */
 .report-doc .rp-point { border: 1px solid #d5dde3; border-radius: 8px; padding: 10px; }
 .report-doc .rp-b-pass { border-color: #1d6b2b; }
@@ -371,6 +385,8 @@
 .report-doc.preview .rp-plot polyline.s3 { stroke: var(--amb); } .report-doc.preview .rp-plot circle.s3, .report-doc.preview .rp-plot tspan.s3 { fill: var(--amb); }
 .report-doc.preview .rp-plot text { fill: var(--nw); }
 .report-doc.preview .rp-out { font-size: 11px; background: var(--panel); border-color: var(--stroke); color: var(--nw); }
+.report-doc.preview .rp-warn { font-size: 13px; color: var(--amb); }
+.report-doc.preview .rp-fail { color: var(--amb); }
 .report-doc .sr-part { margin-bottom: 16px; }
 .report-doc.preview .sr-new { border-top: 1px solid var(--stroke); padding-top: 12px; margin-top: 24px; }
 .report-doc.preview .section-text { font-size: 13px; color: var(--nw); }
