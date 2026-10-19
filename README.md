@@ -31,7 +31,7 @@ bash starfi.sh --build --install-desktop   # also adds a menu entry (uses static
 `--new` needs `--build` or `--all` (alone it stops with "New dist requires build"), and `--clean` has no effect with it. `--clean` also deletes any modules already in the dist folder.
 
 ### Dependencies
-* **Runtime:** Python 3 standard library, plus `python-docx` for Word export.
+* **Runtime:** Python 3 standard library, `numpy`, and `python-docx` for Word export.
 * **SCPI interface (optional):** `g++` to build `starfire-hw` from `starfire.cpp` (standard library and POSIX headers only). `starfi.sh` skips it when `g++` or `starfire.cpp` is missing; everything but Measure's SEND button still works.
 * **Optional:**
   * `jira_config.json` in `dist/` next to the binary, or in the working directory, turns on Jira ticket creation (see `jira_config.example.json`).
@@ -62,7 +62,7 @@ There are two exports for a card:
 * **Test Card**, from the card tab ("generate card" for print/PDF, "export .docx"): the procedure only, for reference and manual operation. Observed results, quality, sign-offs, measurements, images and the article are left blank.
 * **Test Report**, from the **build test report** button in the card tab's sidebar. It opens a `TR-xxx` tab (`TC-001` gets `TR-001`) beside the campaign and card tabs, showing the card **as last saved** (save the card tab first; **refresh** re-reads it). The report always has the header (`TR-001 <test name> REV A`, then campaign, article, conductor, QA, date), the requirements covered, and each point's observed result, quality, measurements, captured images and sign-off. Exportable with **print / pdf** and **.docx**.
 
-A point owns the files attached to it, shown as chips under the point on the card tab (**x** detaches one, and the file stays on disk). A file is attached when added with the **+** button beside the bolt button (25 MB max; saved as `<campaign>-<card>-<point>-<its name>` in the project folder), when you save the readings or a module's output with the download icons, or when a module run creates or changes a file named for the point: `<campaign>-<card>-<point>[-anything].<ext>`, for example `SC-001-TC-001-20.csv` from the measure download, `SC-001-TC-001-20.txt` from the module output download, or `SC-001-TC-001-20-sweep.png` written by a module. Cards saved before this attached the files already named for their points the first time they're opened. Nothing is passed to a module: to run one on an added file, type its name in **Arguments**. Save the card, then click a point in the report to make it active; the left panel lists that point's attached files, and ticking one embeds it.
+A point owns the files attached to it, shown as chips under the point on the card tab (**x** detaches one, and the file stays on disk). A file is attached when added with the **+** button beside the bolt button (25 MB max; saved as `<campaign>-<card>-<point>-<its name>` in the project folder), when readings or a module's output are downloaded, or when a module run creates or changes a file named for the point: `<campaign>-<card>-<point>[-anything].<ext>`, for example `SC-001-TC-001-20.csv` from the measure download, `SC-001-TC-001-20.txt` from the module output download, or `SC-001-TC-001-20-sweep.png` written by a module. Save the card, then click a point in the report to make it active; the left panel lists that point's attached files, and ticking one embeds it.
 
 | File | In the report |
 |:--|:--|
