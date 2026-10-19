@@ -2,8 +2,8 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-18
-# VERSION:        0.2.1
+# UPDATED:        2026-10-19
+# VERSION:        0.2.2
 #
 
 """
@@ -1196,6 +1196,29 @@ def _plot_cols(files: dict, seq, name: str) -> list:
     return [i for i in v if isinstance(i, int)] if isinstance(v, list) else None
 
 
+def _validate_fails(path) -> "int | None":
+    # validate.py output (first line "# validate"): its FAIL line count; None for any other file.
+    try:
+        lines = [l for l in _read_text(path, None).splitlines() if l.strip()] if path else []
+    except OSError:
+        return None
+    return sum(l.startswith("FAIL ") for l in lines) if lines and lines[0].strip() == "# validate" else None
+
+
+def _validate_warning(name: str) -> str:
+    n = _validate_fails(_cwd_file(name))
+    return f"LIMIT EXCEEDED: {n} limit{'s' if n > 1 else ''} failed ({name})" if n else ""
+
+
+def _txt_pre(path) -> str:
+    # Text output; a validate.py file's FAIL lines are wrapped for the amber style.
+    text = _cap_lines(_read_text(path))
+    if _validate_fails(path) is None:
+        return f'<pre class="rp-out">{_h(text)}</pre>'
+    return '<pre class="rp-out">' + "\n".join(
+        f'<span class="rp-fail">{_h(l)}</span>' if l.startswith("FAIL ") else _h(l) for l in text.split("\n")) + "</pre>"
+
+
 def _point_file_html(name: str, plot: bool = False, cols: list = None) -> str:
     kind, path = _file_kind(name), _cwd_file(name)
     if kind == "csv" and not plot:
@@ -1206,7 +1229,7 @@ def _point_file_html(name: str, plot: bool = False, cols: list = None) -> str:
     if kind == "image":
         return _img_tag(name)
     if kind == "txt":
-        return f'<div class="rp-file"><div class="rp-cap">{_h(name)}</div><pre class="rp-out">{_h(_cap_lines(_read_text(path)))}</pre></div>'
+        return f'<div class="rp-file"><div class="rp-cap">{_h(name)}</div>{_txt_pre(path)}</div>'
     return f'<div class="rp-file rp-cap">Attached: {_h(name)}</div>'
 
 
@@ -1223,12 +1246,14 @@ def report_body(card: TestCard, campaign_id: str = "", files: dict = None) -> st
             + "".join(f"<tr><td>{_h(str(c))}</td><td>{_h(str(v))}</td><td>{_h(str(t))}</td></tr>" for c, v, t in meas)
             + "</table>")
         imgs = "".join(_img_tag(n) for n in p.images)
-        extra = "".join(_point_file_html(n, n in _plotted(files, p.seq), _plot_cols(files, p.seq, n)) for n in _ticked(files, card, campaign_id, p.seq))
+        ticked = _ticked(files, card, campaign_id, p.seq)
+        extra = "".join(_point_file_html(n, n in _plotted(files, p.seq), _plot_cols(files, p.seq, n)) for n in ticked)
+        warn = "".join(f'<div class="rp-warn">{_h(w)}</div>' for w in map(_validate_warning, ticked) if w)
         q = (p.quality or "").upper()
         pts.append(f'''<section class="rp-point rp-b-{_h(q.lower()) or "none"}" data-seq="{p.seq}">
 <div class="rp-head"><span>{p.seq} &nbsp; {_h(p.action)}</span><span class="rp-right"><span class="rp-q rp-q-{_h(q.lower())}">{_h(q) or "&mdash;"}</span>{under}</span></div>
 <div class="rp-line"><b>Expected:</b> {_h(p.expected)}</div>
-<div class="rp-line"><b>Observed:</b> {_h(p.observed) or "&mdash;"}</div>
+<div class="rp-line"><b>Observed:</b> {_h(p.observed) or "&mdash;"}</div>{warn}
 {meas_tbl}{imgs and f'<div class="rp-imgs">{imgs}</div>'}{extra}
 </section>''')
     head = report_head(card)
@@ -1313,6 +1338,9 @@ def _report_docx_body(doc, card: TestCard, campaign_id: str = "", files: dict = 
                 if s:
                     _add_table(doc, [s[0], s[1]], [(f"{a:g}", f"{b:g}") for a, b in list(zip(s[2], s[3]))[:50]])
             elif kind == "txt" and path:
+                if _validate_warning(n):
+                    w = doc.add_paragraph().add_run(_validate_warning(n))
+                    w.bold, w.font.color.rgb = True, RGBColor(0xB3, 0x7D, 0x00)
                 doc.add_paragraph(n).runs[0].font.size = Pt(8)
                 run = doc.add_paragraph().add_run(_cap_lines(_read_text(path), 200))
                 run.font.name, run.font.size = "Courier New", Pt(8)
@@ -1757,6 +1785,156 @@ def _fill_flags(html: str) -> str:
 _TEST_HTML = _fill_flags(_read_static("test.html"))
 _CAMPAIGN_HTML = _fill_flags(_read_static("campaign.html"))
 
+# Calculator: math and metrics on a point's csv columns, in validate.py's expression syntax
+# (@voltage, max @voltage, @voltage * @current) but no limits. Needs numpy, loaded on first use.
+_CALC_FUNCS = ("max", "min", "mean", "median", "sd", "rms", "range", "abs")
+_CALC_TOKEN = re.compile(r"\s*(?:(\d+\.?\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?)|@([A-Za-z_]\w*)|([()+\-*/])|([A-Za-z_]\w*))")
+
+
+class CalcError(Exception):
+    pass
+
+
+def _calc_resolve(name: str, headers: list) -> str:
+    n = name.lower()
+    hits = [h for h in headers if h.lower() == n] or [h for h in headers if h.lower().split("_")[0] == n]
+    if len(hits) == 1:
+        return hits[0]
+    raise CalcError(f"@{name} matches {', '.join(hits)}" if hits else f"no column @{name}")
+
+
+def _calc_tokens(expr: str) -> list:
+    toks, pos = [], 0
+    while expr[pos:].strip():
+        m = _CALC_TOKEN.match(expr, pos)
+        if not m:
+            c = expr[pos:].strip()[0]
+            raise CalcError("limits (< > == AND OR NOT) belong in validate.py" if c in "<>=!" else f"unexpected '{c}'")
+        num, ref, op, word = m.groups()
+        if word and word.lower() not in _CALC_FUNCS:
+            raise CalcError("limits (< > == AND OR NOT) belong in validate.py" if word.lower() in ("and", "or", "not", "any", "all")
+                            else f"unknown word '{word}'")
+        toks.append(("num", float(num)) if num else ("ref", ref) if ref else ("op", op) if op else ("fn", word.lower()))
+        pos = m.end()
+    return toks
+
+
+def _calc_eval(expr: str, table: dict, np):
+    # Recursive descent: + - > * / > unary minus, prefix function > atom. Prefix functions bind tightest.
+    toks, headers, i = _calc_tokens(expr), list(table), [0]
+    if not toks:
+        raise CalcError("empty")
+
+    def take(*vals):
+        t = toks[i[0]] if i[0] < len(toks) else None
+        if t and t[0] in ("op", "fn") and (not vals or t[1] in vals):
+            i[0] += 1
+            return t
+        return None
+
+    def add():
+        v = mul()
+        while (t := take("+", "-")):
+            v = v + mul() if t[1] == "+" else v - mul()
+        return v
+
+    def mul():
+        v = unary()
+        while (t := take("*", "/")):
+            r = unary()
+            if t[1] == "/" and np.any(r == 0):
+                raise CalcError("division by zero")
+            v = v * r if t[1] == "*" else v / r
+        return v
+
+    def unary():
+        if take("-"):
+            return -unary()
+        t = take(*_CALC_FUNCS)
+        if t:
+            v = unary()
+            f = {"max": np.max, "min": np.min, "mean": np.mean, "median": np.median, "sd": np.std, "range": np.ptp,
+                 "rms": lambda x: np.sqrt(np.mean(np.square(x))), "abs": np.abs}[t[1]]
+            return np.asarray(f(v))
+        return atom()
+
+    def atom():
+        if i[0] >= len(toks):
+            raise CalcError("expression ends early")
+        t = toks[i[0]]
+        i[0] += 1
+        if t[0] == "num":
+            return np.asarray(t[1])
+        if t[0] == "ref":
+            return table[_calc_resolve(t[1], headers)]
+        if t[1] == "(":
+            v = add()
+            if not take(")"):
+                raise CalcError("missing ')'")
+            return v
+        raise CalcError(f"unexpected '{t[1]}'")
+
+    with np.errstate(all="ignore"):
+        v = add()
+    if i[0] < len(toks):
+        raise CalcError(f"unexpected '{toks[i[0]][1]}'")
+    return v
+
+
+def _calc_table(path: str, np):
+    # {header: array} of the all-numeric columns of a csv or csv-like .txt (first row is the header
+    # unless it is all numbers; "#" lines ignored), read in full.
+    def isnum(s):
+        try:
+            return np.isfinite(float(s))
+        except ValueError:
+            return False
+    with open(path, encoding="utf-8", errors="replace") as f:
+        rows = [[c.strip() for c in ln.rstrip("\r\n").split(",")] for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    if not rows:
+        return {}
+    head = rows[0] if not all(isnum(c) for c in rows[0]) else None
+    data = rows[1:] if head else rows
+    out = {}
+    for i in range(max(len(r) for r in rows)):
+        h = head[i] if head and i < len(head) and head[i] else f"col{i + 1}"
+        cells = [r[i] if i < len(r) else "" for r in data]
+        if cells and all(isnum(c) for c in cells):
+            out[h] = np.array([float(c) for c in cells])
+    return out
+
+
+def calculate(campaign_id: str, card_id: str, name, exprs: list) -> dict:
+    """{"columns": [...], "results": [{"expr", "value"} or {"expr", "error"}]} for a point's csv file.
+    An array result shows its size and first values; a scalar shows 6 significant figures."""
+    try:
+        import numpy as np
+    except ImportError:
+        return {"error": "The calculator needs numpy: pip install numpy"}
+    if not _own_file(campaign_id, card_id, name):
+        return {"error": "file not found"}
+    try:
+        table = _calc_table(os.path.join(os.getcwd(), name), np)
+    except OSError as e:
+        return {"error": str(e)}
+    if not table:
+        return {"error": f"{name} has no numeric columns"}
+    results = []
+    for e in exprs if isinstance(exprs, list) else []:
+        e = str(e)
+        if not e.strip():
+            continue
+        try:
+            v = _calc_eval(e, table, np)
+            vals = np.atleast_1d(v)
+            g = lambda x: f"{float(x):.6g}"
+            results.append({"expr": e, "value": g(v) if v.ndim == 0
+                            else f"{vals.size} samples: " + ", ".join(g(x) for x in vals[:8]) + (" ..." if vals.size > 8 else "")})
+        except CalcError as err:
+            results.append({"expr": e, "error": str(err)})
+    return {"columns": list(table), "results": results}
+
+
 _POINT_FILE_EXTS = ("csv", "txt", "test")
 _POINT_FILE_MAX = 5_000_000   # characters
 
@@ -1987,6 +2165,14 @@ class _Handler(BaseHTTPRequestHandler):
             return
         self._send_json(200, break_module(payload.get("card", ""), payload.get("point", "")))
 
+    def _handle_calc(self, raw_body: bytes):
+        # {"campaign", "card", "file", "exprs": [...]} -> {"columns", "results"} (see calculate)
+        payload = self._local_json_payload(raw_body)
+        if payload is None:
+            return
+        self._send_json(200, calculate(str(payload.get("campaign") or ""), str(payload.get("card") or ""),
+                                       payload.get("file"), payload.get("exprs")))
+
     def _handle_save_point_file(self, raw_body: bytes):
         # {"campaign", "card", "point", "ext": "csv"|"txt"|"test", "content"} -> <campaign>-<card>-<point>.<ext>
         payload = self._local_json_payload(raw_body)
@@ -2002,6 +2188,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
         stem = "-".join(re.sub(r"[^A-Za-z0-9._-]", "_", str(payload.get(k) or d))
                         for k, d in (("campaign", "XX-000"), ("card", "TC"), ("point", "0")))
+        if ext == "txt" and content.split("\n", 1)[0].strip() == "# validate":
+            stem += "-VAL"    # validate.py output gets its own file; the point's module-output .txt stays
         filename = _safe_filename(stem, "." + ext)
         try:
             with open(os.path.join(os.getcwd(), filename), "w", encoding="utf-8", newline="") as f:
@@ -2026,6 +2214,8 @@ class _Handler(BaseHTTPRequestHandler):
             return self._handle_break_module(raw)
         if path == "/save_point_file":
             return self._handle_save_point_file(raw)
+        if path == "/calc":
+            return self._handle_calc(raw)
         if path == "/add_card_file":
             return self._handle_add_card_file(raw)
         try:
