@@ -15,7 +15,7 @@
 # ├── starfire.py              (builds to starfire)
 # └── static
 #     ├── assets
-#     │   └── icon.png         (optional; only for --install-desktop)
+#     │   └── icon.png          (optional; only for --install-desktop)
 #     ├── campaign.html
 #     ├── starfire.css
 #     └── test.html
@@ -135,7 +135,7 @@ if [ "$BUILD" -eq 1 ]; then
     HW=0; HW_NOTE="g++ not found (Ubuntu: sudo apt install g++)"
   fi
 
-  pip install --break-system-packages --quiet pyinstaller python-docx
+  pip install --break-system-packages --quiet pyinstaller python-docx numpy
 
   WORKDIR="$(mktemp -d)"
   trap 'rm -rf "$WORKDIR"' EXIT
