@@ -143,6 +143,7 @@ const ICON_PHOTO_CAMERA = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -9
 const ICON_ADD_A_PHOTO = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-440ZM120-120q-33 0-56.5-23.5T40-200v-480q0-33 23.5-56.5T120-760h126l74-80h240v80H355l-73 80H120v480h640v-360h80v360q0 33-23.5 56.5T760-120H120Zm640-560v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80ZM440-260q75 0 127.5-52.5T620-440q0-75-52.5-127.5T440-620q-75 0-127.5 52.5T260-440q0 75 52.5 127.5T440-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29Z"/></svg>';
 const ICON_SPEED = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-316.5q38-.5 56-27.5l224-336-336 224q-27 18-28.5 55t22.5 61q24 24 62 23.5Zm0-483.5q59 0 113.5 16.5T696-734l-76 48q-33-17-68.5-25.5T480-720q-133 0-226.5 93.5T160-400q0 42 11.5 83t32.5 77h552q23-38 33.5-79t10.5-85q0-36-8.5-70T766-540l48-76q30 47 47.5 100T880-406q1 57-13 109t-41 99q-11 18-30 28t-40 10H204q-21 0-40-10t-30-28q-26-45-40-95.5T80-400q0-83 31.5-155.5t86-127Q252-737 325-768.5T480-800Zm7 313Z"/></svg>';
 const ICON_DOWNLOAD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-320 280-520l56-58 104 104v-326h80v326l104-104 56 58-200 200ZM240-160q-33 0-56.5-23.5T160-240v-120h80v120h480v-120h80v120q0 33-23.5 56.5T720-160H240Z"/></svg>';
+const ICON_CALC = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm0-80h560v-560H200v560ZM250-660h160v40H250Zm40-40h40v120h-40ZM550-660h160v40H550ZM550-420h160v40H550ZM550-330h160v40H550ZM250-370h160v40H250Z"/></svg>';
 const ICON_BOLT = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m422-232 207-248H469l29-227-185 267h139l-30 208ZM320-80l40-280H160l360-520h80l-40 320h240L400-80h-80Zm151-390Z"/></svg>';
 // Crosshair: "sample this reading". Children set fill="none" explicitly, since
 // .btn-icon svg's CSS fill would otherwise paint them solid.
@@ -415,6 +416,96 @@ function bindModulePanel(i) {
 
 // Redraws just this point's module panel (not the whole list) so a run
 // finishing doesn't steal focus from whatever the person is typing elsewhere.
+// Calculator: math and metrics on one of the point's csv files (see calculate() in starfire.py).
+// Transient like the module panel: {open, file, exprs, results, columns, error}, keyed by the point.
+const calcState = new WeakMap();
+function calcIsOpen(p) { return !!(calcState.get(p) || {}).open; }
+
+function calcFiles(p) {
+  return (p.files || []).filter(n => /\.(csv|txt)$/i.test(n) && !/-VAL\.txt$/i.test(n));
+}
+
+function calcPanelHtml(i, p) {
+  const st = calcState.get(p), files = calcFiles(p);
+  if (!files.length) return `<div class="pt-cam-msg">No csv on this point. Run a module or add a file first.</div>`;
+  if (!st.file || !files.includes(st.file)) { st.file = files[0]; st.columns = null; }
+  const chips = (st.columns || []).map(c => `<button class="btn mini calc-chip" data-calccol="${i}" data-name="${esc(c)}" title="insert @${esc(c)}">@${esc(c)}</button>`).join("");
+  const rows = st.exprs.map((e, j) => `
+    <div class="calc-row">
+      <input data-calcexpr="${i}" data-j="${j}" value="${esc(e)}" spellcheck="false">
+      <div class="calc-out" id="pt-calcout-${i}-${j}"></div>
+    </div>`).join("");
+  return `
+    <div class="send-row mod-row">
+      <div><label>File</label>
+      <select data-calcfile="${i}">${files.map(n => `<option${n === st.file ? " selected" : ""}>${esc(n)}</option>`).join("")}</select></div>
+      <button class="btn mini" data-calcclear="${i}" title="clear all expressions and results">AC</button>
+    </div>
+    <div class="calc-chips">${chips}</div>
+    ${rows}
+    <div class="module-status failed" id="pt-calcmsg-${i}">${esc(st.error || "")}</div>`;
+}
+
+function showCalc(i) {
+  const st = calcState.get(card.points[i]);
+  const msg = document.getElementById("pt-calcmsg-" + i);
+  if (msg) msg.textContent = st.error || "";
+  st.exprs.forEach((_, j) => {
+    const out = document.getElementById(`pt-calcout-${i}-${j}`);
+    const r = (st.results || [])[j];
+    if (!out) return;
+    out.className = "calc-out" + (r && r.error ? " err" : r && r.value.includes("samples") ? " arr" : "");
+    out.textContent = r ? (r.error || r.value) : "";
+  });
+}
+
+// One request evaluates every non-empty row; /calc skips empty ones, so results are matched back by expression.
+async function runCalc(i) {
+  const p = card.points[i], st = calcState.get(p);
+  try {
+    const res = await fetch("/calc", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({campaign: pointCampaign() || "XX-000", card: card.id, file: st.file, exprs: st.exprs}),
+    });
+    const r = await res.json();
+    st.error = r.error || "";
+    if (r.error) st.results = [];
+    else {
+      const by = new Map(r.results.map(x => [x.expr, x]));
+      st.results = st.exprs.map(e => by.get(e));
+      if (!st.columns) { st.columns = r.columns; renderPoints(); return; }
+    }
+  } catch (err) {
+    st.error = `Calculator failed: ${err}`;
+  }
+  showCalc(i);
+}
+
+function bindCalcPanel(i) {
+  const root = document.getElementById("pt-calc-" + i);
+  const p = card.points[i], st = calcState.get(p);
+  if (!root || !st || !st.open || !root.firstElementChild || root.querySelector("select") === null) return;
+  let timer = null, last = null;
+  const later = () => { clearTimeout(timer); timer = setTimeout(() => runCalc(i), 250); };
+  root.querySelector("select").addEventListener("change", e => {
+    st.file = e.target.value; st.columns = null; st.results = null; renderPoints();
+  });
+  root.querySelector("[data-calcclear]").addEventListener("click", () => {
+    st.exprs = [""]; st.results = []; st.error = ""; renderPoints();
+  });
+  root.querySelectorAll("input[data-calcexpr]").forEach(inp => {
+    inp.addEventListener("input", () => { st.exprs[+inp.dataset.j] = inp.value; later(); });
+    inp.addEventListener("focus", () => { last = inp; });
+  });
+  root.querySelectorAll("[data-calccol]").forEach(btn => btn.addEventListener("click", () => {
+    const inp = last || root.querySelector("input[data-calcexpr]");
+    inp.value += (inp.value && !/[\s(]$/.test(inp.value) ? " " : "") + "@" + btn.dataset.name;
+    st.exprs[+inp.dataset.j] = inp.value; inp.focus(); later();
+  }));
+  if (!st.results) { runCalc(i); } else { showCalc(i); }
+}
+
 function moduleIsOpen(p) { return !!(moduleState.get(p) || {}).open; }
 
 function refreshModulePanel(p) {
@@ -646,6 +737,7 @@ function renderPoints() {
           <button class="btn mini btn-icon" data-act="capture" data-i="${i}" title="capture image">${ICON_ADD_A_PHOTO}</button>
           <button class="btn mini btn-icon measure-toggle" data-act="measure" data-i="${i}" title="measure">${ICON_SPEED}</button>
           <button class="btn mini btn-icon module-toggle" data-act="module" data-i="${i}" title="activate (run a module)">${ICON_BOLT}</button>
+          <button class="btn mini btn-icon calc-toggle" data-act="calc" data-i="${i}" title="calculator">${ICON_CALC}</button>
           <button class="btn mini btn-icon" data-act="addfile" data-i="${i}" title="add a file to this test card">${ICON_ADD}</button>
           ${showJiraBtn ? `<button class="btn mini btn-icon" data-act="jira" data-i="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
           <span class="pt-btn-gap"></span>
@@ -678,6 +770,7 @@ function renderPoints() {
         <div class="pt-measure" id="pt-measure-${i}">${(measureOpenIndices.has(i) || p.measurements.length > 0) ? measurePanelHtml(i, p) : ""}</div>
         <div class="pt-module" id="pt-module-${i}">${moduleIsOpen(p) ? modulePanelHtml(i, p) : ""}</div>
       </div>
+      <div class="pt-calc" id="pt-calc-${i}">${calcIsOpen(p) ? calcPanelHtml(i, p) : ""}</div>
       <div class="pt-images" id="pt-images-${i}">${imgChips}${fileChips}</div>
       <div class="pt-cam-msg" id="pt-cam-msg-${i}"></div>
       <div class="pt-cam-msg" id="pt-jira-msg-${i}"></div>
@@ -727,6 +820,11 @@ function renderPoints() {
         inp.click();
         return;
       }
+      if (act === "calc") {
+        const st = calcState.get(card.points[i]) || {exprs: [""]};
+        st.open = !st.open;
+        calcState.set(card.points[i], st);
+      }
       if (act === "module") {
         const st = moduleState.get(card.points[i]) || {};
         st.open = !st.open;
@@ -746,7 +844,7 @@ function renderPoints() {
   list.querySelectorAll("button[data-msend]").forEach(btn => {
     btn.addEventListener("click", () => sendMeasurement(+btn.dataset.msend));
   });
-  card.points.forEach((_, i) => bindModulePanel(i));
+  card.points.forEach((_, i) => { bindModulePanel(i); bindCalcPanel(i); });
   list.querySelectorAll("button[data-madd]").forEach(btn => {
     btn.addEventListener("click", () => {
       const i = +btn.dataset.madd;
