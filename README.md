@@ -155,7 +155,8 @@ Source is in `examples/modules/`. Build or copy the result into `dist/`, then re
 | Module | Language | What it does |
 |---|---|---|
 | `validate.py` | Python | Test point validation and metrics module. Compares output to user-entered limits (_e.g_ max @current < 450) and provides scalar or vector metrics (_e.g._ @voltage * @current). Writes `<campaign>-<card>-<point>-VAL.txt` |
-| `hotfire.cpp` | C++ | The same hot fire demo in C++. Energizes HV, checks fuel, fires, and prints the simulated readings as CSV. Build: `g++ -O2 -std=c++17 -o dist/hotfire hotfire.cpp`. |
+| `obd2.cpp` | C++ | Automotive On-Board Diagnostics (OBD2) scanner |
+| `hotfire.cpp` | C++ | Thruster hot fire demo in C++. Energizes HV, checks fuel, fires, and prints the simulated readings as CSV. Build: `g++ -O2 -std=c++17 -o dist/hotfire hotfire.cpp`. |
 | `rust/src/bin/hotfire.rs` | Rust | The hot fire with an egui GUI. User-entered the firing pattern as a hex code (`FF` fires all 8 thrusters) and  burn time. Prints simulated CSV. `--sim` runs the burn quickly |
 | `rust/src/bin/tvac.rs` | Rust | Thermal vacuum profile editor and runner. User-entered time and temperature vectors by typing, interpolated to ramps and plateaus. `--sim` runs the profile in 30 s. EXPORT CSV and PNG write the profile. With `--sim`, EXPORT TEST writes a Starfire test card (`TV-001.test`) that can be added to a card with BRANCH or EXTEND. |
 
