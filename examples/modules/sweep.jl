@@ -3,7 +3,7 @@
 # sweep.jl:       DEMO MODULE - LINEAR CHIRP WAVEFORM
 # AUTHOR:         DANIEL DESAI
 # UPDATED:        2026-10-24
-# VERSION:        3.9.0
+# VERSION:        4.0.0
 #
 # Writes a linear chirp to the "waveform" output port (<prefix>-sweep.waveform.sig).
 # Arguments: --f0 Hz  --f1 Hz  --duration s  --rate Hz  --amplitude  (all optional)
