@@ -2,7 +2,7 @@
 
 **Starfire** is a test campaign and test card designer for aerospace, automotive, and other engineering test programs. It runs on Linux, either as a Python 3 script (`python3 starfire.py`) or as a standalone binary, within a browser GUI, and provides two complementary workflows:
 * Documentation: campaigns (test plans), procedures (test cards), requirements matrices, and test reports, which can be combined into an overall campaign report.
-* Hardware integration: **Activate** runs _modules_, user-placed scripts or binaries in any language, which can drive instruments, and **Measure** shows the signals they write or read on a test point (**Calculator** works on a point's csv).
+* Hardware integration: **Activate** runs _modules_, user-placed scripts or binaries in any language, and **Measure** shows the signals they write or read on a test point.
 
 It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, `.docx`, and print/PDF.
 
