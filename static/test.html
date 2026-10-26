@@ -21,6 +21,7 @@
   <button class="btn" id="exportPrintBtn">generate card</button>
   <button class="btn" id="exportDocxBtn">export .docx</button>
   <button class="btn" id="buildReportBtn" style="display:none">build test report</button>
+  <button class="btn" id="buildSystemBtn" style="display:none">build system</button>
 </div>
 <div id="saveStatus" class="hint"></div>
 </div>
@@ -75,9 +76,8 @@
 // startup -- see the Jira section of starfire.py.
 const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
 
-// True only if the starfire-hw binary was found -- the Measure
-// panel opens either way, this just controls whether Sample/Activate send anything.
-const HARDWARE_AVAILABLE = __HARDWARE_AVAILABLE__;
+// True only if starfire was built with signet.py: the Signals box, live ticks and build system need it.
+const SIGNET_AVAILABLE = __SIGNET_AVAILABLE__;
 
 // Set by the campaign page right after this iframe loads (openTestTab());
 // `var` (not `let`) so that external write reaches this binding.
@@ -133,7 +133,8 @@ function duplicatePoint(i) {
   card.points.splice(i + 1, 0, {seq: duplicateSeq(card.points, i), action: src.action, expected: src.expected,
                      observed: "", reference: src.reference, responsible_party: src.responsible_party,
                      date: "", time: "", initial: "", quality: "", locked: false, flagged: false, images: [], files: [],
-                     usb_port: src.usb_port, measure_command: src.measure_command, measurements: []});
+                     parameters: (src.parameters || []).map(r => [...r]), signals: src.signals || "", runs: {},
+                     module: src.module || "", args: src.args || ""});
 }
 
 // Google Material Symbols, embedded inline (not a file/CDN) so they work
@@ -142,7 +143,6 @@ const ICON_FLAG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 9
 const ICON_PHOTO_CAMERA = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-260q75 0 127.5-52.5T660-440q0-75-52.5-127.5T480-620q-75 0-127.5 52.5T300-440q0 75 52.5 127.5T480-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29ZM160-120q-33 0-56.5-23.5T80-200v-480q0-33 23.5-56.5T160-760h126l74-80h240l74 80h126q33 0 56.5 23.5T880-680v480q0 33-23.5 56.5T800-120H160Zm0-80h640v-480H638l-73-80H395l-73 80H160v480Zm320-240Z"/></svg>';
 const ICON_ADD_A_PHOTO = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-440ZM120-120q-33 0-56.5-23.5T40-200v-480q0-33 23.5-56.5T120-760h126l74-80h240v80H355l-73 80H120v480h640v-360h80v360q0 33-23.5 56.5T760-120H120Zm640-560v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80ZM440-260q75 0 127.5-52.5T620-440q0-75-52.5-127.5T440-620q-75 0-127.5 52.5T260-440q0 75 52.5 127.5T440-260Zm0-80q-42 0-71-29t-29-71q0-42 29-71t71-29q42 0 71 29t29 71q0 42-29 71t-71 29Z"/></svg>';
 const ICON_SPEED = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-316.5q38-.5 56-27.5l224-336-336 224q-27 18-28.5 55t22.5 61q24 24 62 23.5Zm0-483.5q59 0 113.5 16.5T696-734l-76 48q-33-17-68.5-25.5T480-720q-133 0-226.5 93.5T160-400q0 42 11.5 83t32.5 77h552q23-38 33.5-79t10.5-85q0-36-8.5-70T766-540l48-76q30 47 47.5 100T880-406q1 57-13 109t-41 99q-11 18-30 28t-40 10H204q-21 0-40-10t-30-28q-26-45-40-95.5T80-400q0-83 31.5-155.5t86-127Q252-737 325-768.5T480-800Zm7 313Z"/></svg>';
-const ICON_DOWNLOAD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M480-320 280-520l56-58 104 104v-326h80v326l104-104 56 58-200 200ZM240-160q-33 0-56.5-23.5T160-240v-120h80v120h480v-120h80v120q0 33-23.5 56.5T720-160H240Z"/></svg>';
 const ICON_CALC = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h560q33 0 56.5 23.5T840-760v560q0 33-23.5 56.5T760-120H200Zm0-80h560v-560H200v560ZM250-660h160v40H250Zm40-40h40v120h-40ZM550-660h160v40H550ZM550-420h160v40H550ZM550-330h160v40H550ZM250-370h160v40H250Z"/></svg>';
 const ICON_BOLT = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m422-232 207-248H469l29-227-185 267h139l-30 208ZM320-80l40-280H160l360-520h80l-40 320h240L400-80h-80Zm151-390Z"/></svg>';
 // Crosshair: "sample this reading". Children set fill="none" explicitly, since
@@ -283,54 +283,85 @@ function togglePreview(i) {
   });
 }
 
-// Unlike the camera (one shared hardware stream, so only one point's
-// preview can be open at a time), Measure is just form fields -- any
-// number of points can have it open simultaneously.
-let measureOpenIndices = new Set();
+// Measure (gauge): a live view of the point's signals -- its modules' outputs and the
+// signals its Signet code connects in. Nothing is saved; each open reads them again.
+const measureState = new WeakMap();
+function measureIsOpen(p) { return !!(measureState.get(p) || {}).open; }
 
-// The gauge button opens/closes the panel (a point that already has readings keeps
-// its panel showing, so closing only hides an empty one).
 function toggleMeasure(i) {
-  if (!measureOpenIndices.delete(i)) {
-    measureOpenIndices.add(i);
-    // First open of a point with no readings -- seed one blank row so
-    // there's something to type into right away.
-    if (card.points[i].measurements.length === 0) {
-      card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
-    }
-  }
+  const p = card.points[i], st = measureState.get(p) || {};
+  st.open = !st.open;
+  measureState.set(p, st);
   renderPoints();
+  if (st.open) loadMeasure(i);
 }
 
-// SEND: the line in the Command box goes to the instrument. starfire-hw says
-// whether it was a query or a command: a query's reply is logged as a reading,
-// a command is just confirmed here.
-async function sendMeasurement(i) {
-  const p = card.points[i];
-  const msgEl = document.getElementById("pt-measure-msg-" + i);
-  const say = (cls, text) => { if (msgEl) { msgEl.className = "module-status " + cls; msgEl.textContent = text; } };
-  if (!HARDWARE_AVAILABLE) return say("failed", "starfire-hw not found -- nothing was sent.");
-  if (!p.usb_port || !p.measure_command) return say("failed", "Enter a USB port and a command first.");
-  say("running", "Sending...");
+async function loadMeasure(i) {
+  const p = card.points[i], st = measureState.get(p);
+  if (!st || !st.open || !SIGNET_AVAILABLE) return;
   try {
-    const res = await fetch("/measure", {
-      method: "POST",
-      body: JSON.stringify({port: p.usb_port, command: p.measure_command}),
-    });
-    const result = await res.json();
-    if (!result.success) return say("failed", result.error || "Send failed");
-    if (result.kind !== "query") {
-      return say("complete", `Sent ${p.measure_command} at ${new Date().toLocaleTimeString("en-GB")}`);
-    }
-    if (p.measurements.length >= 8) {
-      return say("failed", `Reply: ${result.value} (not logged: maximum 8 readings, delete a row first)`);
-    }
-    const ts = new Date().toISOString().slice(0, 16).replace("T", " ");
-    p.measurements.push({command: p.measure_command, value: result.value, timestamp: ts, auto: true});
-    renderPoints();
+    const res = await fetch("/point_signals", {method: "POST", body: JSON.stringify(
+      {card, campaign: pointCampaign() || "XX-000", point: p.seq, live: campaignLive()})});
+    const r = await res.json();
+    st.list = r.signals || [];
+    st.error = r.error || "";
   } catch (err) {
-    say("failed", `Send failed: ${err}`);
+    st.list = [];
+    st.error = String(err);
   }
+  if (!st.list.some(s => s.file === st.file)) st.file = (st.list[0] || {}).file || "";
+  await showMeasure(i);
+}
+
+async function showMeasure(i) {
+  const p = card.points[i], st = measureState.get(p);
+  st.value = null;
+  if (st.file) {
+    try {
+      st.value = await (await fetch("/signal_value?file=" + encodeURIComponent(st.file))).json();
+    } catch (err) {
+      st.value = {error: String(err)};
+    }
+  }
+  const el = document.getElementById("pt-measure-" + i);
+  if (el) { el.innerHTML = measurePanelHtml(i, p); bindMeasurePanel(i); }
+}
+
+function measurePanelHtml(i, p) {
+  const st = measureState.get(p) || {};
+  if (!st.open) return "";
+  if (!SIGNET_AVAILABLE) return `<div class="module-status failed">Signals are off: this Starfire was built without Signet.</div>`;
+  if (!st.list) return `<div class="hint">Reading signals...</div>`;
+  const v = st.value;
+  let body = "";
+  if (!st.list.length) body = `<div class="hint">No signals on this point yet: run a module, or connect one in the Signals box.</div>`;
+  else if (!v) body = "";
+  else if (v.error) body = `<div class="calc-out err">${esc(v.error)}</div>`;
+  else if (v.scalar) body = `<div class="calc-out">${esc(v.text)}</div>`;
+  else if (v.head) body = `<div class="calc-out arr">${v.head.map(esc).join("<br>")}${v.count > v.head.length ? `<br>... ${v.count} entries` : ""}</div>`;
+  else body = `<div class="calc-out arr">${esc(v.text)}</div>`;
+  const group = (role, title) => {
+    const opts = st.list.filter(s => s.role === role)
+      .map(s => `<option value="${esc(s.file)}"${s.file === st.file ? " selected" : ""}>${esc(s.label)}</option>`).join("");
+    return opts ? `<optgroup label="${title}">${opts}</optgroup>` : "";
+  };
+  return `
+    <label>Signal</label>
+    <div class="send-row">
+      <select data-measfile="${i}"${st.list.length ? "" : " disabled"}>${group("out", "Outputs")}${group("in", "Inputs")}</select>
+      <button class="btn mini" data-measrefresh="${i}" title="read the point's signals again">refresh</button>
+    </div>
+    ${v && v.type ? `<div class="hint">${esc(v.type)}${v.generated ? " | " + esc(v.generated) : ""}</div>` : ""}
+    ${body}
+    <div class="module-status failed">${esc(st.error || "")}</div>`;
+}
+
+function bindMeasurePanel(i) {
+  const root = document.getElementById("pt-measure-" + i);
+  if (!root) return;
+  const st = measureState.get(card.points[i]);
+  root.querySelector("select[data-measfile]")?.addEventListener("change", e => { st.file = e.target.value; showMeasure(i); });
+  root.querySelector("button[data-measrefresh]")?.addEventListener("click", () => loadMeasure(i));
 }
 
 // Modules (Activate / bolt): scripts or binaries in dist/ that the campaign's
@@ -354,6 +385,44 @@ function moduleInScope(m, cardId, seq) {
   return s === id || s === id + "-" + seq;
 }
 
+// The campaign's live list, [{card, point, file}], for Signet code.
+function campaignLive() {
+  try { return (window.parent !== window && window.parent.getCampaignLive) ? window.parent.getCampaignLive() : []; } catch (e) { return []; }
+}
+function canSetLive() {
+  try { return SIGNET_AVAILABLE && window.parent !== window && !!window.parent.setCampaignLive; } catch (e) { return false; }
+}
+function isLive(p, fn) {
+  return campaignLive().some(e => e.card === card.id && String(e.point) === String(p.seq) && e.file === fn);
+}
+function setLive(p, fn, on) {
+  if (!canSetLive()) return;
+  const rest = campaignLive().filter(e => !(e.card === card.id && String(e.point) === String(p.seq) && e.file === fn));
+  window.parent.setCampaignLive(on ? [...rest, {card: card.id, point: String(p.seq), file: fn}] : rest);
+}
+
+// Tick a file live: a .sig only if Starfire stamped it (a COMPLETE run, unedited since).
+async function tickLive(p, fn, on) {
+  const st = moduleState.get(p) || {};
+  moduleState.set(p, st);
+  st.fileMsg = "";
+  if (on && fn.endsWith(".sig")) {
+    try {
+      const r = await (await fetch("/signal_value?file=" + encodeURIComponent(fn))).json();
+      if (r.error) {
+        st.fileMsg = `${fn} can't be live: ${r.error.replace(fn + " ", "")}`;
+        st.open = true;
+        return renderPoints();
+      }
+    } catch (err) {
+      st.fileMsg = `Live failed: ${err}`;
+      return renderPoints();
+    }
+  }
+  setLive(p, fn, on);
+  renderPoints();
+}
+
 function modulesFor(p) {
   return campaignModules().filter(m => (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module);
 }
@@ -363,24 +432,111 @@ function modulePanelHtml(i, p) {
   const names = modulesFor(p);
   const none = names.length === 0
     ? `<div class="pt-cam-msg">No modules registered for this point. Add one in the campaign's Modules table.</div>` : "";
+  // Parameters: copied into Arguments by the down arrow; frozen on a locked point.
+  const pdis = p.locked ? " disabled" : "";
+  const prows = (p.parameters || []).map(([n, v], j) => `<tr>
+      <td><input data-pname="${j}" value="${esc(n)}" spellcheck="false"${pdis}></td>
+      <td><input data-pval="${j}" value="${esc(v)}" spellcheck="false"${pdis}></td>
+      <td class="actions-cell"><button class="btn mini btn-icon btn-x" data-pdel="${j}" title="delete parameter"${pdis}>${ICON_CLOSE}</button></td>
+    </tr>`).join("");
   return `
     <div class="send-row mod-row">
       <div><label>Module</label>
-      <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(st.name || "")}"></div>
+      <input list="pt-modlist-${i}" data-modname="${i}" value="${esc(p.module || "")}"${p.locked ? " readonly" : ""}></div>
       <datalist id="pt-modlist-${i}">${names.map(n => `<option value="${esc(n)}">`).join("")}</datalist>
-      <div><label>Arguments</label>
-      <input data-modargs="${i}" value="${esc(st.args || "")}"></div>
       <button class="btn mini" data-modrun="${i}"${st.status === "running" ? " disabled" : ""}>run</button>
-      <button class="btn mini break-btn" data-modbreak="${i}"${st.status === "running" ? "" : " disabled"}>break</button>
+      <button class="btn mini break-btn" data-modbreak="${i}"${["running", "waiting"].includes(st.status) ? "" : " disabled"}>break</button>
     </div>
+    <label>Parameters</label>
+    ${prows ? `<table class="measure-table"><colgroup><col class="pr-name"><col class="pr-val"><col class="mt-del"></colgroup><tr><th>Name</th><th>Value</th><th class="blank-th"></th></tr>${prows}</table>` : ""}
+    <div class="panel-actions">
+      ${p.locked ? "" : `<button class="btn mini btn-plus" data-padd="${i}" title="add parameter">+</button>`}
+      ${prows ? `<button class="btn mini btn-icon" data-pcopy="${i}" title="copy parameters into Arguments as --name value">${ICON_ARROW_DOWNWARD}</button>` : ""}
+    </div>
+    <div class="mod-args"><label>Arguments</label>
+    <textarea data-modargs="${i}" rows="${Math.min(10, Math.max(3, (p.args || "").split("\n").length))}" spellcheck="false" style="resize:vertical"${p.locked ? " readonly" : ""} title="one or more lines; # starts a comment line; \\ at end of line continues it">${esc(p.args || "")}</textarea></div>
+    ${SIGNET_AVAILABLE ? `<div class="mod-args"><label>Signals</label>
+    <div class="sig-wrap"><pre class="sig-hl" aria-hidden="true">${sigHtml(p.signals || "")}</pre>
+    <textarea data-modsig="${i}" rows="${Math.min(14, Math.max(3, (p.signals || "").split("\n").length))}" spellcheck="false" style="resize:vertical"${p.locked || !pointCampaign() ? " disabled" : ""} title="${pointCampaign() ? "Signet code, run before the module: connect(source, module.input); see README.md" : "Signals need a campaign"}">${esc(p.signals || "")}</textarea></div></div>` : ""}
     <div class="module-status failed">${esc(st.fileMsg || "")}</div>
     ${none}
     <div class="module-status ${esc(st.status || "")}">${esc(st.text || "")}</div>
+    ${st.question && st.status === "running" ? `<div class="send-row mod-row"><div><label>${esc(st.question.prompt)}${st.question.type ? ` [${esc(st.question.type)}]` : ""}</label>
+      <input data-seqans="${i}" spellcheck="false"></div><button class="btn mini" data-seqsend="${i}">answer</button></div>` : ""}
     ${st.output ? `<pre class="module-output">${esc(st.output)}</pre>` : ""}
-    ${st.output || st.card ? `<div class="panel-actions">
-      <button class="btn mini btn-icon btn-download" data-modsave="${i}" title="save ${[st.output ? "output as " + pointFileName(p, "txt") : "", st.card ? "card as " + pointFileName(p, "test") : ""].filter(Boolean).join(" and ")}" aria-label="save module output">${ICON_DOWNLOAD}</button>
-      <span class="module-status complete">${esc(st.saved || "")}</span>
-    </div>` : ""}`;
+`;
+}
+
+// Pinned modules (the campaign's Modules table): up to 4 in this point's scope, shown while the module column is open.
+const SOURCE_EXT = /^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i;   // sources Signet builds: shown as binaries
+function moduleKind(name) {
+  const dot = (name || "").lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot) : "";
+  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (SOURCE_EXT.test(ext) ? "bin" : "other");
+}
+function pinnedFor(p) {
+  return campaignModules().filter(m => m.pinned && (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module).slice(0, 4);
+}
+function pinsHtml(i, p) {
+  if (!moduleIsOpen(p)) return "";
+  const st = moduleState.get(p) || {}, busy = st.status === "running";
+  return pinnedFor(p).map(m => {
+    const label = m.replace(/\.[^.]*$/, "").slice(0, 3);
+    const on = st.active === m ? " active" : "";
+    return `<button class="btn mini pin-btn${on}" data-kind="${moduleKind(m)}" data-pinrun="${i}" data-mod="${esc(m)}"${busy ? " disabled" : ""} title="run ${esc(m)}">${esc(label.charAt(0).toUpperCase() + label.slice(1))}</button>`;
+  }).join("");
+}
+function refreshPins(p) {
+  const i = card.points.indexOf(p), box = document.getElementById("pt-pins-" + i);
+  if (!box) return;
+  box.innerHTML = pinsHtml(i, p);
+  box.querySelectorAll("button[data-pinrun]").forEach(b => b.addEventListener("click", () => runPinned(p, b.dataset.mod)));
+}
+function runPinned(p, mod) {
+  const st = moduleState.get(p) || {};
+  moduleState.set(p, st);
+  if ((p.module || "").trim()) {
+    Object.assign(st, {status: "failed", text: "Clear the Module name to run a pinned module."});
+    return refreshModulePanel(p);
+  }
+  st.active = mod;
+  runModule(p, mod);
+}
+
+// Signet syntax colours for the Signals box: a coloured copy of the text sits behind the (transparent) textarea.
+const SIG_COMMANDS = new Set(("let where connect if then else end break multiplex demultiplex echo output run when within by finish delay " +
+  "escape for next index route exit merge interchange complete failed broken running column function subprocess return map warp unity input Re Im abs arg conj power root").split(" "));
+const SIG_FILE = /\.(sig|csv|txt|tsv|json|png|jpe?g|gif)$/;   // a signal or file reference, not module.port or a parameter
+const SIG_TOKEN = new RegExp([
+  "(#.*)", "('[^'\\n]*'|\"[^\"\\n]*\")", "((?:[A-Za-z_]\\w*::)+)", "((?<=hex::)(?:0[xX])?[0-9A-Fa-f]+(?![A-Za-z0-9_]))",
+  "([A-Za-z0-9_-]+:\\$?[A-Za-z_][\\w.-]*)", "((?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?(?![A-Za-z0-9_.]))",
+  "([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*\\.[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*)", "(\\$[A-Za-z_]\\w*)", "([A-Za-z_]\\w*)"].join("|"), "g");
+function sigHtml(text) {
+  let out = "", at = 0;
+  const put = (s, cls) => { s = esc(s); out += cls ? `<span class="${cls}">${s}</span>` : s; };
+  for (const m of text.matchAll(SIG_TOKEN)) {
+    put(text.slice(at, m.index));
+    const w = m[0].toLowerCase();
+    put(m[0], m[1] ? "sg-c" : m[2] ? "sg-s" : m[3] ? "sg-t" : m[4] || m[6] ? "sg-n" : m[9] ? (w === "true" || w === "false" ? "sg-n"
+              : SIG_COMMANDS.has(w) ? "sg-k" : /^(and|or|not)$/.test(w) ? "" : "sg-v") : SIG_FILE.test(w) ? (w.endsWith(".sig") ? "sg-g" : "sg-f") : "sg-v");
+    at = m.index + m[0].length;
+  }
+  put(text.slice(at));
+  return out + "\n";
+}
+function sigSync(ta, hl) { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; }
+
+// Parameters -> Arguments: each becomes "--name value", replacing a --name line already there, else added at the top.
+function paramsToArgs(p, args) {
+  const q = v => /^[A-Za-z0-9_@%+=:,.\/-]+$/.test(v) ? v : "'" + v.replace(/'/g, "'\\''") + "'";
+  const lines = (args || "").split("\n"), added = [];
+  (p.parameters || []).filter(([n]) => (n || "").trim()).forEach(([n, v]) => {
+    const name = n.trim(), line = `--${name} ${q(v ?? "")}`;
+    const re = new RegExp("^\\s*--" + name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "(\\s|=|$)");
+    const at = lines.findIndex(l => re.test(l));
+    if (at >= 0) lines[at] = line; else added.push(line);
+  });
+  return [...added, ...lines].join("\n").replace(/\n+$/, "");
 }
 
 function bindModulePanel(i) {
@@ -388,30 +544,47 @@ function bindModulePanel(i) {
   if (!root) return;
   const p = card.points[i];
   const inp = root.querySelector("input[data-modname]");
-  if (inp) inp.addEventListener("input", () => {
-    const st = moduleState.get(p) || {};
-    st.name = inp.value;
-    moduleState.set(p, st);
-  });
-  const argsInp = root.querySelector("input[data-modargs]");
-  if (argsInp) argsInp.addEventListener("input", () => {
-    const st = moduleState.get(p) || {};
-    st.args = argsInp.value;
-    moduleState.set(p, st);
-  });
-  const btn = root.querySelector("button[data-modrun]");
-  if (btn) btn.addEventListener("click", () => runModule(p));
-  const brk = root.querySelector("button[data-modbreak]");
-  if (brk) brk.addEventListener("click", () => breakModule(p));
-  const sv = root.querySelector("button[data-modsave]");
-  if (sv) sv.addEventListener("click", async () => {
-    const st = moduleState.get(p);
-    const saved = [];
-    if (st.output) saved.push(await savePointFile(p, "txt", st.output));
-    if (st.card) saved.push(await savePointFile(p, "test", st.card));   // enables BRANCH / EXTEND
-    st.saved = saved.join("; ");
+  if (inp) inp.addEventListener("input", () => { if (!p.locked) p.module = inp.value; });
+  const argsInp = root.querySelector("textarea[data-modargs]");
+  if (argsInp) argsInp.addEventListener("input", () => { if (!p.locked) p.args = argsInp.value; });
+  const sigInp = root.querySelector("textarea[data-modsig]");
+  if (sigInp) {
+    const hl = sigInp.parentElement.querySelector(".sig-hl");
+    sigInp.addEventListener("input", () => { if (!p.locked) p.signals = sigInp.value; hl.innerHTML = sigHtml(sigInp.value); sigSync(sigInp, hl); });
+    sigInp.addEventListener("scroll", () => sigSync(sigInp, hl));
+    new ResizeObserver(() => sigSync(sigInp, hl)).observe(sigInp);
+  }
+  root.querySelectorAll("input[data-pname], input[data-pval]").forEach(el => el.addEventListener("input", () => {
+    const named = el.dataset.pname != null;
+    p.parameters[+(named ? el.dataset.pname : el.dataset.pval)][named ? 0 : 1] = el.value;
+  }));
+  const padd = root.querySelector("button[data-padd]");
+  if (padd) padd.addEventListener("click", () => { (p.parameters ||= []).push(["", ""]); refreshModulePanel(p); });
+  root.querySelectorAll("button[data-pdel]").forEach(b => b.addEventListener("click", () => {
+    if (p.locked) return;
+    p.parameters.splice(+b.dataset.pdel, 1);
+    refreshModulePanel(p);
+  }));
+  const pcopy = root.querySelector("button[data-pcopy]");
+  if (pcopy) pcopy.addEventListener("click", () => {
+    if (p.locked) return;
+    p.args = paramsToArgs(p, p.args);
     refreshModulePanel(p);
   });
+  const btn = root.querySelector("button[data-modrun]");
+  if (btn) btn.addEventListener("click", () => { (moduleState.get(p) || {}).active = ""; runModule(p); });
+  const brk = root.querySelector("button[data-modbreak]");
+  if (brk) brk.addEventListener("click", () => breakModule(p));
+  // input() in a sequence: send the answer
+  const ans = root.querySelector("input[data-seqans]"), send = root.querySelector("button[data-seqsend]");
+  const answer = async () => {
+    const st = moduleState.get(p) || {};
+    const r = await fetch("/seq_answer", {method: "POST", body: JSON.stringify({card: card.id, point: p.seq, answer: ans.value})});
+    if (r.ok) { st.question = null; refreshModulePanel(p); }
+    else { st.text = `answer refused: ${(await r.json()).error}`; refreshModulePanel(p); }
+  };
+  if (send) send.addEventListener("click", answer);
+  if (ans) ans.addEventListener("keydown", e => { if (e.key === "Enter") answer(); });
 }
 
 // Redraws just this point's module panel (not the whole list) so a run
@@ -512,8 +685,11 @@ function refreshModulePanel(p) {
   const i = card.points.indexOf(p);
   const root = document.getElementById("pt-module-" + i);
   if (!root || !moduleIsOpen(p)) return;
+  const ans = root.querySelector("input[data-seqans]");
+  if (ans && document.activeElement === ans && (moduleState.get(p) || {}).question) return;   // don't redraw under someone answering
   root.innerHTML = modulePanelHtml(i, p);
   bindModulePanel(i);
+  refreshPins(p);
 }
 
 // A point's files are the ones attached to it: they are what its Test Report offers.
@@ -549,10 +725,10 @@ async function addCardFile(p, file) {
   renderPoints();
 }
 
-async function runModule(p) {
+async function runModule(p, pinned) {
   const st = moduleState.get(p) || {};
   moduleState.set(p, st);
-  const name = (st.name || "").trim();
+  const name = pinned || (p.module || "").trim();
   if (!name) {
     Object.assign(st, {status: "failed", text: "Enter a module name.", output: ""});
     return refreshModulePanel(p);
@@ -568,20 +744,100 @@ async function runModule(p) {
     const res = await fetch("/run_module", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({module: name, card: card.id, point: p.seq, campaign: pointCampaign() || "XX-000", args: st.args || ""}),
+      body: JSON.stringify({module: name, card: card.id, point: p.seq, campaign: pointCampaign() || "XX-000", args: p.args || "",
+                            params: p.parameters || [],   // for STARFIRE_PARAM_<NAME> and $name
+                            signals: pointCampaign() ? (p.signals || "") : "", live: campaignLive(), modules: modulesFor(p),
+                            points: cardPoints()}),
     });
     const r = await res.json();
-    const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
-    st.status = ["complete", "broken"].includes(r.status) ? r.status : "failed";
-    st.text = `${st.status.toUpperCase()}${detail ? " (" + detail + ")" : ""}${r.error ? ": " + r.error : ""}`;
-    st.output = r.output || "";
-    st.card = r.card || "";   // a test card the run wrote
-    if ((r.files || []).map(n => attachFile(p, n)).includes(true)) renderPoints();   // files the run wrote for this point
+    if (r.status !== "running") return applyRunResult(p, name, r);
+    st.run = r.run;
+    watchRun(p);
   } catch (err) {
     Object.assign(st, {status: "failed", text: `FAILED: ${err}`, output: ""});
+    refreshModulePanel(p);
   }
-  refreshModulePanel(p);
 }
+
+// Every point of the card, for a sequence's run(n) and point parameters.
+function cardPoints() {
+  const out = {};
+  card.points.forEach(q => { out[q.seq] = {module: (q.module || "").trim(), args: q.args || "", params: q.parameters || [],
+    signals: pointCampaign() ? (q.signals || "") : "", modules: modulesFor(q)}; });
+  return out;
+}
+
+// Poll a point's run until it ends, showing its output as it comes.
+function watchRun(p) {
+  const st = moduleState.get(p);
+  if (!st || st.watching) return;
+  st.watching = true;
+  const tick = async () => {
+    try {
+      const r = await (await fetch(`/run_status?card=${encodeURIComponent(card.id)}&point=${encodeURIComponent(p.seq)}`)).json();
+      if (r.status === "running") {
+        const sq = r.sequence;
+        Object.assign(st, {status: "running", run: r.run, text: `Running ${r.module}... (${r.seconds} s)${sq && sq.reason ? " | " + sq.reason : ""}`,
+                           output: (r.output || "") + (sq && sq.log ? "\nSequence:\n" + sq.log : ""), question: (sq && sq.question) || null});
+        refreshModulePanel(p);
+        return setTimeout(tick, 1000);
+      }
+      st.watching = false;
+      if (r.result) applyRunResult(p, r.module, r.result);
+    } catch (err) {
+      setTimeout(tick, 2000);   // the server may be busy; keep trying
+    }
+  };
+  tick();
+}
+
+function applyRunResult(p, name, r) {
+  const st = moduleState.get(p) || {};
+  moduleState.set(p, st);
+  const detail = [r.exit_code != null ? `exit ${r.exit_code}` : "", r.seconds != null ? `${r.seconds} s` : ""].filter(Boolean).join(", ");
+  st.status = ["complete", "broken"].includes(r.status) ? r.status : "failed";
+  st.text = `${st.status.toUpperCase()}${detail ? " (" + detail + ")" : ""}${r.error ? ": " + r.error : ""}`;
+  st.output = r.output || "";
+  const sig = r.signals || {};
+  if ((sig.errors || []).length) st.output += (st.output ? "\n" : "") + "Signals:\n" + sig.errors.join("\n");
+  const gone = (sig.deleted || []).length > 0;
+  if (gone) {   // superseded: off the point and the live list
+    p.files = (p.files || []).filter(n => !sig.deleted.includes(n));
+    sig.deleted.forEach(n => setLive(p, n, false));
+  }
+  (p.runs ||= {})[name.replace(/\.[^.]*$/, "")] = st.status;
+  st.card = r.card || "";   // a test card the run printed: saved for BRANCH / EXTEND
+  if (st.card) savePointFile(p, "test", st.card).then(msg => { st.text += ` | ${msg}`; refreshModulePanel(p); });
+  if ((r.files || []).map(n => attachFile(p, n)).includes(true) || gone) renderPoints();   // files the run wrote for this point
+  refreshModulePanel(p);
+  if (measureIsOpen(p)) loadMeasure(card.points.indexOf(p));   // new outputs show in Measure
+}
+
+// Runs this page didn't start (a reload mid-run, another tab, a sequence): checked every few seconds.
+async function watchCardRuns() {
+  try {
+    const r = await (await fetch(`/run_status?card=${encodeURIComponent(card.id)}`)).json();
+    for (const [seq, j] of Object.entries(r.points || {})) {
+      const p = card.points.find(q => String(q.seq) === seq);
+      if (!p) continue;
+      const st = moduleState.get(p) || {};
+      moduleState.set(p, st);
+      if (j.status === "waiting" && st.status !== "waiting") {   // a sequence is holding this run until RUN is pressed
+        Object.assign(st, {status: "waiting", text: `Waiting for RUN (${j.module})`, output: ""});
+        st.open = true; renderPoints();
+      } else if (j.status === "running" && !st.watching) { st.open = true; renderPoints(); watchRun(p); }
+    }
+    for (const p of card.points) {   // no longer waiting: RUN was pressed, or the sequence ended
+      const st = moduleState.get(p);
+      if (st && st.status === "waiting" && (r.points || {})[String(p.seq)]?.status !== "waiting") {
+        Object.assign(st, {status: "", text: ""});
+        refreshModulePanel(p);
+      }
+    }
+  } catch (err) { /* try again next time */ }
+  setTimeout(watchCardRuns, 3000);
+}
+setTimeout(watchCardRuns, 500);
 
 // The .test file a point's BRANCH / EXTEND use: the last one attached.
 function feedFile(p) { return (p.files || []).filter(n => n.endsWith(".test")).pop() || ""; }
@@ -655,59 +911,6 @@ async function savePointFile(p, ext, content) {
   }
 }
 
-function measureCsv(p) {
-  const q = v => /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
-  const rows = p.measurements.filter(m => m.value).map(m => [m.auto ? m.command : "", m.value, m.timestamp].map(q).join(","));
-  return ["command,value,timestamp", ...rows].join("\n") + "\n";
-}
-
-function measurePanelHtml(i, p) {
-  const open = measureOpenIndices.has(i);
-  const rows = p.measurements.map((m, j) => {
-    if (m.auto) {
-      return `<tr>
-        <td>${esc(m.command)}</td><td>${esc(m.value)}</td><td>${esc(m.timestamp)}</td>
-        <td class="actions-cell"><button class="btn mini btn-icon btn-x" data-mdel="${j}" data-i="${i}" title="delete row">${ICON_CLOSE}</button></td>
-      </tr>`;
-    }
-    // Manual row: Command never applies (no instrument query was sent for
-    // a by-eye reading), Value is the one genuinely manual field,
-    // Timestamp is set via "now", never typed.
-    return `<tr>
-      <td>--</td>
-      <td><input data-mi="${i}" data-mj="${j}" data-mf="value" value="${esc(m.value)}"></td>
-      <td class="measure-ts-cell">
-        <span>${esc(m.timestamp)}</span>
-        <button class="btn mini" data-mnow="${j}" data-i="${i}" title="now">now</button>
-      </td>
-      <td class="actions-cell"><button class="btn mini btn-icon btn-x" data-mdel="${j}" data-i="${i}" title="delete row">${ICON_CLOSE}</button></td>
-    </tr>`;
-  }).join("");
-  const canAddRow = p.measurements.length < 8;
-  const fields = open ? `
-    <div class="measure-fields">
-      <div><label>USB Port</label><input data-i="${i}" data-f="usb_port" value="${esc(p.usb_port)}" placeholder="/dev/usbtmc0"></div>
-    </div>
-    <label>Command</label>
-    <div class="send-row">
-      <input data-i="${i}" data-f="measure_command" value="${esc(p.measure_command)}" placeholder="MEAS:VOLT:DC?  or  OUTP ON">
-      <button class="btn mini" data-msend="${i}">send</button>
-    </div>
-    <div class="module-status" id="pt-measure-msg-${i}"></div>` : "";
-  return `
-    ${fields}
-    <table class="measure-table">
-      <colgroup><col class="mt-cmd"><col class="mt-val"><col class="mt-ts"><col class="mt-del"></colgroup>
-      <tr><th>Command</th><th>Value</th><th>Timestamp</th><th class="blank-th"></th></tr>
-      ${rows}
-    </table>
-    <div class="panel-actions">
-      ${open && canAddRow ? `<button class="btn mini btn-plus" data-madd="${i}" title="add row">+</button>` : ""}
-      ${p.measurements.some(m => m.value) ? `<button class="btn mini btn-icon btn-download" data-msave="${i}" title="save readings as ${esc(pointFileName(p, "csv"))}" aria-label="save readings">${ICON_DOWNLOAD}</button>` : ""}
-      <span class="module-status complete" id="pt-measure-save-${i}"></span>
-    </div>`;
-}
-
 function renderPoints() {
   const list = document.getElementById("pointsList");
   list.innerHTML = "";
@@ -721,7 +924,7 @@ function renderPoints() {
       `<span class="thumb-chip">${ICON_IMAGE} ${esc(fn)} <button class="btn mini btn-x" data-rm-img="${esc(fn)}" data-i="${i}">x</button></span>`
     ).join("");
     const fileChips = (p.files || []).map(fn =>
-      `<span class="thumb-chip">${ICON_ATTACH} ${esc(fn)} <button class="btn mini btn-x" data-rm-file="${esc(fn)}" data-i="${i}">x</button></span>`
+      `<span class="thumb-chip">${ICON_ATTACH} ${esc(fn)}${canSetLive() ? ` <label class="live-tick" title="live: Signet code anywhere in the campaign can use it"><input type="checkbox" data-live="${esc(fn)}" data-i="${i}"${isLive(p, fn) ? " checked" : ""}>live</label>` : ""} <button class="btn mini btn-x" data-rm-file="${esc(fn)}" data-i="${i}">x</button></span>`
     ).join("");
     // Ticket is offered on CAUTION/FAIL (a verdict), not on flagged,
     // which is just a "pay attention here" highlight independent of pass/fail.
@@ -737,7 +940,7 @@ function renderPoints() {
           <button class="btn mini btn-icon" data-act="capture" data-i="${i}" title="capture image">${ICON_ADD_A_PHOTO}</button>
           <button class="btn mini btn-icon measure-toggle" data-act="measure" data-i="${i}" title="measure">${ICON_SPEED}</button>
           <button class="btn mini btn-icon module-toggle" data-act="module" data-i="${i}" title="activate (run a module)">${ICON_BOLT}</button>
-          <button class="btn mini btn-icon calc-toggle" data-act="calc" data-i="${i}" title="calculator">${ICON_CALC}</button>
+          <button class="btn mini btn-icon calc-toggle" data-act="calc" data-i="${i}" title="calculator (math and metrics on this point's csv)">${ICON_CALC}</button>
           <button class="btn mini btn-icon" data-act="addfile" data-i="${i}" title="add a file to this test card">${ICON_ADD}</button>
           ${showJiraBtn ? `<button class="btn mini btn-icon" data-act="jira" data-i="${i}" title="create Jira ticket">${ICON_BOOKMARK_ADD}</button>` : ""}
           <span class="pt-btn-gap"></span>
@@ -767,7 +970,7 @@ function renderPoints() {
       </div>
       <div class="pt-expand-row">
         <div class="pt-camera" id="pt-camera-${i}"></div>
-        <div class="pt-measure" id="pt-measure-${i}">${(measureOpenIndices.has(i) || p.measurements.length > 0) ? measurePanelHtml(i, p) : ""}</div>
+        <div class="pt-measure" id="pt-measure-${i}">${measurePanelHtml(i, p)}</div>
         <div class="pt-module" id="pt-module-${i}">${moduleIsOpen(p) ? modulePanelHtml(i, p) : ""}</div>
       </div>
       <div class="pt-calc" id="pt-calc-${i}">${calcIsOpen(p) ? calcPanelHtml(i, p) : ""}</div>
@@ -776,12 +979,14 @@ function renderPoints() {
       <div class="pt-cam-msg" id="pt-jira-msg-${i}"></div>
       <div class="pt-cam-msg" id="pt-feed-msg-${i}"></div>
       <div class="pt-feed">
+        <div class="pt-pins" id="pt-pins-${i}">${pinsHtml(i, p)}</div>
         <button class="btn mini btn-icon" data-act="branch" data-i="${i}" ${feed ? "" : "disabled"} title="branch: a new card up to this point, then the points of a module's .test file">${ICON_BRANCH}</button>
         <button class="btn mini btn-icon" data-act="extend" data-i="${i}" ${feed && last ? "" : "disabled"} title="extend: add the points of a module's .test file after this last point">${ICON_EXTEND}</button>
       </div>`;
     list.appendChild(div);
   });
   reattachPreviewIfOpen();
+  card.points.forEach(p => refreshPins(p));
   list.querySelectorAll("input[data-f], textarea[data-f], select[data-f]").forEach(el => {
     el.addEventListener("input", () => {
       card.points[+el.dataset.i][el.dataset.f] = el.value;
@@ -833,47 +1038,7 @@ function renderPoints() {
       renderPoints();
     });
   });
-  list.querySelectorAll("button[data-msave]").forEach(btn => {
-    btn.addEventListener("click", async () => {
-      const i = +btn.dataset.msave;
-      const msg = await savePointFile(card.points[i], "csv", measureCsv(card.points[i]));
-      const el = document.getElementById("pt-measure-save-" + i);
-      if (el) el.textContent = msg;
-    });
-  });
-  list.querySelectorAll("button[data-msend]").forEach(btn => {
-    btn.addEventListener("click", () => sendMeasurement(+btn.dataset.msend));
-  });
-  card.points.forEach((_, i) => { bindModulePanel(i); bindCalcPanel(i); });
-  list.querySelectorAll("button[data-madd]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.madd;
-      if (card.points[i].measurements.length < 8) {
-        card.points[i].measurements.push({command: "", value: "", timestamp: "", auto: false});
-        renderPoints();
-      }
-    });
-  });
-  list.querySelectorAll("button[data-mdel]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.i;
-      card.points[i].measurements.splice(+btn.dataset.mdel, 1);
-      renderPoints();
-    });
-  });
-  list.querySelectorAll("input[data-mi]").forEach(el => {
-    el.addEventListener("input", () => {
-      card.points[+el.dataset.mi].measurements[+el.dataset.mj][el.dataset.mf] = el.value;
-    });
-  });
-  list.querySelectorAll("button[data-mnow]").forEach(btn => {
-    btn.addEventListener("click", () => {
-      const i = +btn.dataset.i, j = +btn.dataset.mnow;
-      const now = new Date();
-      card.points[i].measurements[j].timestamp = now.toISOString().slice(0, 16).replace("T", " ");
-      renderPoints();
-    });
-  });
+  card.points.forEach((_, i) => { bindModulePanel(i); bindCalcPanel(i); bindMeasurePanel(i); });
   list.querySelectorAll("button[data-rm-img]").forEach(btn => {
     btn.addEventListener("click", () => {
       const i = +btn.dataset.i, fn = btn.dataset.rmImg;
@@ -888,8 +1053,12 @@ function renderPoints() {
       // Detaches the file from this point (and its report); it stays on disk.
       const i = +btn.dataset.i, fn = btn.dataset.rmFile;
       card.points[i].files = (card.points[i].files || []).filter(x => x !== fn);
+      setLive(card.points[i], fn, false);
       renderPoints();
     });
+  });
+  list.querySelectorAll("input[data-live]").forEach(box => {
+    box.addEventListener("change", () => tickLive(card.points[+box.dataset.i], box.dataset.live, box.checked));
   });
   list.querySelectorAll("button[data-now]").forEach(btn => {
     btn.addEventListener("click", () => {
@@ -901,13 +1070,13 @@ function renderPoints() {
   });
 }
 
-function esc(s) { return (s??"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
+function esc(s) { return (s??"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 
 document.getElementById("addPointBtn").addEventListener("click", () => {
   card.points.push({seq: nextSeq(), action:"", expected:"", observed:"", reference:"",
                      responsible_party:"", date:"", time:"", initial:"", quality:"",
                      locked: false, flagged: false, images: [], files: [],
-                     usb_port: "", measure_command: "", measurements: []});
+                     parameters: [], signals: "", runs: {}, module: "", args: ""});
   renderPoints();
 });
 
@@ -1080,9 +1249,13 @@ function normalizeCard(c) {
     if (!p.images) p.images = [];
     if (!p.files) p.files = [];
     if (!("observed" in p)) p.observed = "";
-    if (!("usb_port" in p)) p.usb_port = "";
-    if (!("measure_command" in p)) p.measure_command = "";
-    if (!p.measurements) p.measurements = [];
+    delete p.usb_port; delete p.measure_command; delete p.measurements;   // retired Measure fields
+    if (!p.parameters) p.parameters = [];
+    if (typeof p.signals !== "string") p.signals = "";
+    delete p.autorun;   // retired: sequences always wait for RUN
+    if (!p.runs || typeof p.runs !== "object") p.runs = {};   // module stem -> last run status
+    if (typeof p.module !== "string") p.module = "";
+    if (typeof p.args !== "string") p.args = "";
   });
   return c;
 }
@@ -1136,7 +1309,7 @@ bindMeta();
 card.points = [{seq:10, action:"", expected:"", observed:"", reference:"",
                 responsible_party:"", date:"", time:"", initial:"", quality:"",
                 locked:false, flagged:false, images:[], files:[],
-                usb_port:"", measure_command:"", measurements:[]}];
+                parameters:[], signals:"", runs:{}, module:"", args:""}];
 renderPoints();
 renderNomenclature();
 renderReferences();
@@ -1166,6 +1339,19 @@ async function attachExistingFiles() {
 // Lets an embedding page (the campaign tab bar) read the live editor
 // state, since `card` is a module-scope `let` otherwise unreachable from an iframe.
 window.getCard = () => card;
+
+// The card as it is now, for its System (system.html reads this from its opener or the campaign page).
+window.systemInput = () => ({card: JSON.parse(JSON.stringify(card)), campaign: pointCampaign() || "XX-000", live: campaignLive()});
+
+// Only inside a campaign: the card's System, in an SY tab if the campaign page has them, else its own window.
+if (pointCampaign() && SIGNET_AVAILABLE) {
+  const sysBtn = document.getElementById("buildSystemBtn");
+  sysBtn.style.display = "";
+  sysBtn.addEventListener("click", () => {
+    if (window.parent !== window && window.parent.openSystemTab) return window.parent.openSystemTab(card.id);
+    window.open(`/system?card=${encodeURIComponent(card.id)}&campaign=${encodeURIComponent(pointCampaign())}`, "_blank");
+  });
+}
 
 // Only inside a campaign tab: ask the campaign page to open this card's Test Report tab.
 if (window.self !== window.top && window.parent.openReportTab) {
