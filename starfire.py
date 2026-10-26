@@ -2,8 +2,8 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-19
-# VERSION:        0.2.2
+# UPDATED:        2026-10-24
+# VERSION:        4.0.0
 #
 
 """
@@ -37,9 +37,19 @@ import urllib.error
 import urllib.request
 import webbrowser
 from dataclasses import dataclass, field, fields, asdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+try:
+    import signet   # the Signet language and .sig files; optional, built into the binary when present
+except ImportError:
+    signet = None
+if signet is not None and getattr(signet, "API", None) != 2:
+    print(f"starfire: ignoring {signet.__file__} (API {getattr(signet, 'API', None)}, needs 2); Signals are off", file=sys.stderr)
+    signet = None
+SIGNET_AVAILABLE = signet is not None   # without it: no Signals box, live list, System Reports or stamping
+_NO_SIGNET = "Signet isn't available (no signet.py next to starfire.py when it was built), so Signals are off"
 
 from docx import Document
 from docx.shared import Inches, Pt, RGBColor
@@ -65,9 +75,11 @@ class TestPoint:
     flagged: bool = False
     images: list = field(default_factory=list)
     files: list = field(default_factory=list)      # uploaded with the + button
-    usb_port: str = ""
-    measure_command: str = ""
-    measurements: list = field(default_factory=list)
+    parameters: list = field(default_factory=list)  # [[name, value]], passed to modules
+    signals: str = ""                                # Signet code, run before a module
+    runs: dict = field(default_factory=dict)         # module stem -> last run status
+    module: str = ""                                 # the module the point runs, and its arguments
+    args: str = ""
 
 
 def _normalize_pair_list(items: list, width: int) -> list:
@@ -178,9 +190,27 @@ def export_csv(card: TestCard) -> str:
 def _h(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+def _point_params(p: TestPoint) -> tuple:
+    # (names, values), one per line, for a card's Parameter and Value columns.
+    rows = [(str(r[0]).strip(), str(r[1])) for r in (p.parameters or []) if len(r) > 1 and str(r[0]).strip()]
+    return "\n".join(n for n, _ in rows), "\n".join(v for _, v in rows)
+
+
+def _params_line(p: TestPoint) -> str:
+    # "voltage = 5, current = 1" for a Test Report; "" with no parameters.
+    return ", ".join(f"{str(r[0]).strip()} = {r[1]}" for r in (p.parameters or []) if len(r) > 1 and str(r[0]).strip())
+
+
 def export_print_html(card: TestCard, host: str = "localhost") -> str:
+    # Parameter and Value columns only when some point has parameters.
+    has_params = any(_point_params(p)[0] for p in card.points)
+    def pcells(p):
+        if not has_params:
+            return ""
+        names, values = _point_params(p)
+        return f"<td>{_h(names).replace(chr(10), '<br>')}</td><td>{_h(values).replace(chr(10), '<br>')}</td>"
     rows = "\n".join(
-        f"<tr><td>{p.seq}</td><td>{_h(p.action)}</td><td>{_h(p.expected)}</td>"
+        f"<tr><td>{p.seq}</td><td>{_h(p.action)}</td>{pcells(p)}<td>{_h(p.expected)}</td>"
         f"<td>{_h(p.observed)}</td><td>{_h(p.reference)}</td>"
         f"<td>{_h(p.responsible_party)}</td><td>{_h(p.date)}</td><td>{_h(p.time)}</td>"
         f"<td>{_h(p.initial)}</td><td>{_h(p.quality)}</td></tr>"
@@ -208,6 +238,9 @@ def export_print_html(card: TestCard, host: str = "localhost") -> str:
     warn_section = "" if not warnings else f"""<h2>Warnings</h2>
 {warn_bars}
 """
+    widths = ([4, 14, 8, 6, 14, 14, 8, 7, 7, 5, 5, 8] if has_params else [4, 16, 16, 16, 10, 8, 8, 6, 6, 10])
+    cols = "<colgroup>" + "".join(f'<col style="width:{w}%">' for w in widths) + "</colgroup>"
+    pheads = "<th>Parameter</th><th>Value</th>" if has_params else ""
     notes = [n for n, _locked in card.notes if n.strip()]
     note_bars = "\n".join(f'<div class="note-bar">\U0001f4dd {_h(n)}</div>' for n in notes)
     note_section = "" if not notes else f"""<h2>Notes</h2>
@@ -237,12 +270,8 @@ def export_print_html(card: TestCard, host: str = "localhost") -> str:
 </div>
 {warn_section}{note_section}{nom_section}{ref_section}<h2>Test Points</h2>
 <table class="test-points">
-<colgroup>
-<col style="width:4%"><col style="width:16%"><col style="width:16%"><col style="width:16%">
-<col style="width:10%"><col style="width:8%"><col style="width:8%"><col style="width:6%">
-<col style="width:6%"><col style="width:10%">
-</colgroup>
-<tr><th>#</th><th>Action</th><th>Expected Result</th><th>Observed Result</th><th>Reference</th>
+{cols}
+<tr><th>#</th><th>Action</th>{pheads}<th>Expected Result</th><th>Observed Result</th><th>Reference</th>
 <th>RP</th><th>Date</th><th>Time</th><th>Initial</th><th>Quality</th></tr>
 {rows}
 </table>
@@ -268,6 +297,7 @@ class CampaignModule:
     # "" = any test point; a card id (TC-001) = any point on that card;
     # card id + "-" + point number (TC-001-20) = that one point.
     scope: str = ""
+    pinned: bool = False    # shown as an icon in the module column of the points in scope (first 4)
 
 
 @dataclass
@@ -288,8 +318,9 @@ class Campaign:
     sections: list = field(default_factory=list)         # list[(header, text)]
     jira_epic_key: str = ""
     reports: dict = field(default_factory=dict)
-    # The campaign report (SR-xxx), once built: {"items": [section | vcrm | report, ...]}.
+    # The campaign report (SR-xxx), once built: {"items": [section | vcrm | report | system, ...]}.
     campaign_report: dict = None
+    live: list = field(default_factory=list)            # [{card, point, file}] Signet code can connect
 
     @staticmethod
     def from_dict(d: dict) -> "Campaign":
@@ -818,12 +849,13 @@ def export_test_docx(card: "TestCard") -> bytes:
         _add_table(doc, ["Reference", "Description"], refs)
 
     doc.add_heading("Test Points", level=1)
+    has_params = any(_point_params(p)[0] for p in card.points)
     _add_table(
         doc,
-        ["#", "Action", "Expected Result", "Observed Result", "Reference", "Responsible Party",
-         "Date", "Time", "Initial", "Quality"],
-        [(p.seq, p.action, p.expected, p.observed, p.reference, p.responsible_party,
-          p.date, p.time, p.initial, p.quality) for p in card.points],
+        ["#", "Action"] + (["Parameter", "Value"] if has_params else []) +
+        ["Expected Result", "Observed Result", "Reference", "Responsible Party", "Date", "Time", "Initial", "Quality"],
+        [(p.seq, p.action, *(_point_params(p) if has_params else ()), p.expected, p.observed, p.reference,
+          p.responsible_party, p.date, p.time, p.initial, p.quality) for p in card.points],
     )
 
     buf = io.BytesIO()
@@ -839,7 +871,7 @@ def procedure_only(card: TestCard) -> TestCard:
     for p in d["points"]:
         for k in ("observed", "responsible_party", "date", "time", "initial", "quality"):
             p[k] = ""
-        p["measurements"], p["images"], p["files"] = [], [], []
+        p["images"], p["files"] = [], []
     return TestCard.from_dict(d)
 
 
@@ -867,7 +899,7 @@ def sr_head(camp: Campaign) -> str:
 def _sr_items(camp: Campaign):
     # Yield (kind, payload) for each item that has something to show; a test with no saved .test file is skipped.
     items = (camp.campaign_report or {}).get("items", [])
-    for it in sorted(items, key=lambda x: x.get("type") == "report"):   # Test Reports always follow the rest
+    for it in sorted(items, key=lambda x: {"report": 1, "system": 2}.get(x.get("type"), 0)):   # then Test Reports, then Systems
         kind = it.get("type")
         if kind == "section":
             idx = it.get("idx")
@@ -878,7 +910,7 @@ def _sr_items(camp: Campaign):
                 yield kind, it
         elif kind == "vcrm":
             yield kind, compute_vcrm(camp)
-        elif kind == "report":
+        elif kind in ("report", "system"):
             path = os.path.join(os.getcwd(), test_filename(str(it.get("card") or "")))
             try:
                 with open(path, encoding="utf-8") as f:
@@ -895,8 +927,10 @@ def export_campaign_report_html(camp: Campaign, host: str = "localhost", preview
             parts.append(f'<div class="sr-part"><h2>{_h(v.get("header"))}</h2><div class="section-text">{_h(v.get("text"))}</div></div>')
         elif kind == "vcrm":
             parts.append(f'<div class="sr-part sr-new"><h2>Verification Cross-Reference Matrix</h2>{_vcrm_table_html(v)}</div>')
+        elif kind == "system":
+            parts.append(f'<div class="sr-part sr-new">{system_html(system_graph(v.to_dict(), camp.id, camp.live))}</div>')
         else:
-            parts.append(f'<div class="sr-part sr-new">{report_body(v, camp.id, (camp.reports or {}).get(v.id, {}))}</div>')
+            parts.append(f'<div class="sr-part sr-new">{report_body(v, camp.id, (camp.reports or {}).get(v.id, {}), camp.live)}</div>')
     body = f"""<h1>{_h(head)}</h1>
 <div class="meta">
   <span><b>Campaign:</b> {_h(camp.id)}</span>
@@ -950,6 +984,9 @@ def export_campaign_report_docx(camp: Campaign) -> bytes:
         if kind == "vcrm":
             doc.add_heading("Verification Cross-Reference Matrix", level=1)
             _vcrm_docx_table(doc, v)
+        elif kind == "system":
+            doc.add_heading(f"System {sy_id(v.id)}", level=1)
+            doc.add_paragraph("The System diagram is in the PDF export.")
         else:
             _report_docx_body(doc, v, camp.id, (camp.reports or {}).get(v.id, {}))
     buf = io.BytesIO()
@@ -979,7 +1016,7 @@ def _own_file(campaign_id: str, card_id: str, name) -> bool:
 
 
 def _point_file_pattern(campaign_id: str, card_id: str):
-    return re.compile(r"^" + re.escape(_point_prefix(campaign_id, card_id)) + r"-(\d+)(?:-[^/]*)?\.[A-Za-z0-9]+$")
+    return re.compile(r"^" + re.escape(_point_prefix(campaign_id, card_id)) + r"-(\d+)(?:-[^/]*)?\.(?!tmp\Z)[A-Za-z0-9]+$")   # not a .tmp: a helper's file before its rename
 
 
 def list_point_files(campaign_id: str, card_id: str, attached: dict = None) -> dict:
@@ -1056,7 +1093,7 @@ def _csv_table(path: str, limit: int = 5000):
 
 
 def _default_y(header: list, numeric: list) -> int:
-    # The "value" column if there is one (measure readings), else the numeric column after x.
+    # The "value" column if there is one, else the numeric column after x.
     names = [c.strip().lower() for c in header]
     return names.index("value") if "value" in names and names.index("value") in numeric else numeric[min(1, len(numeric) - 1)]
 
@@ -1114,7 +1151,11 @@ def csv_plot_svg(path: str, cols: list = None) -> str:
     first numeric column; several traces get classes s0-s3 (colored in starfire.css) and a legend."""
     ok = {i for i, _ in csv_y_columns(path)}
     cols = sorted({c for c in (cols or []) if c in ok})[:4] or [None]
-    series = [s for s in (csv_series(path, y=c) for c in cols) if s]
+    return _plot_svg([s for s in (csv_series(path, y=c) for c in cols) if s])
+
+
+def _plot_svg(series: list) -> str:
+    # Up to four (x_label, y_label, xs, ys) traces on one set of axes.
     if not series:
         return ""
     multi = len(series) > 1
@@ -1144,17 +1185,6 @@ def csv_plot_svg(path: str, cols: list = None) -> str:
             f'<text x="298" y="206" text-anchor="middle">{_h(xl)}</text>'
             f'<text x="12" y="98" transform="rotate(-90 12 98)" text-anchor="middle">{_h(yl)}</text>'
             f'{legend}{traces}</svg>')
-
-
-def _meas_rows(p: TestPoint) -> list:
-    # Saved rows are objects from the UI; older files may hold [command, value, timestamp, auto].
-    out = []
-    for m in p.measurements:
-        if isinstance(m, dict):
-            out.append((m.get("command", "") if m.get("auto") else "--", m.get("value", ""), m.get("timestamp", "")))
-        elif isinstance(m, (list, tuple)) and len(m) >= 3:
-            out.append((m[0] if (len(m) < 4 or m[3]) else "--", m[1], m[2]))
-    return [r for r in out if str(r[1]).strip()]
 
 
 def _cwd_file(name: str):
@@ -1233,18 +1263,13 @@ def _point_file_html(name: str, plot: bool = False, cols: list = None) -> str:
     return f'<div class="rp-file rp-cap">Attached: {_h(name)}</div>'
 
 
-def report_body(card: TestCard, campaign_id: str = "", files: dict = None) -> str:
-    # One Test Report as an HTML fragment (header through test points).
+def report_body(card: TestCard, campaign_id: str = "", files: dict = None, live=None) -> str:
+    # One Test Report as an HTML fragment (header through test points, then its System if added).
     pts = []
     for p in card.points:
         signed = _h(p.initial)
         when = _h(f"{p.date} {p.time}".strip())
         under = "".join(f'<span class="rp-when">{x}</span>' for x in (when, signed) if x)
-        meas = _meas_rows(p)
-        meas_tbl = "" if not meas else (
-            '<table class="rp-meas"><tr><th>Command</th><th>Value</th><th>Timestamp</th></tr>'
-            + "".join(f"<tr><td>{_h(str(c))}</td><td>{_h(str(v))}</td><td>{_h(str(t))}</td></tr>" for c, v, t in meas)
-            + "</table>")
         imgs = "".join(_img_tag(n) for n in p.images)
         ticked = _ticked(files, card, campaign_id, p.seq)
         extra = "".join(_point_file_html(n, n in _plotted(files, p.seq), _plot_cols(files, p.seq, n)) for n in ticked)
@@ -1253,8 +1278,8 @@ def report_body(card: TestCard, campaign_id: str = "", files: dict = None) -> st
         pts.append(f'''<section class="rp-point rp-b-{_h(q.lower()) or "none"}" data-seq="{p.seq}">
 <div class="rp-head"><span>{p.seq} &nbsp; {_h(p.action)}</span><span class="rp-right"><span class="rp-q rp-q-{_h(q.lower())}">{_h(q) or "&mdash;"}</span>{under}</span></div>
 <div class="rp-line"><b>Expected:</b> {_h(p.expected)}</div>
-<div class="rp-line"><b>Observed:</b> {_h(p.observed) or "&mdash;"}</div>{warn}
-{meas_tbl}{imgs and f'<div class="rp-imgs">{imgs}</div>'}{extra}
+<div class="rp-line"><b>Observed:</b> {_h(p.observed) or "&mdash;"}</div>{f'<div class="rp-line rp-params"><b>Parameters:</b> {_h(_params_line(p))}</div>' if _params_line(p) else ""}{warn}
+{imgs and f'<div class="rp-imgs">{imgs}</div>'}{extra}
 </section>''')
     head = report_head(card)
     nom = sorted_nomenclature(card)
@@ -1277,7 +1302,7 @@ def report_body(card: TestCard, campaign_id: str = "", files: dict = None) -> st
 <h2>Requirements covered</h2>
 <p>{_h(card.requirements) or "&mdash;"}</p>
 {nom_html}{ref_html}<h2>Test points</h2>
-{"".join(pts)}"""
+{"".join(pts)}{system_html(system_graph(card.to_dict(), campaign_id, live or [])) if (files or {}).get("system") else ""}"""
 
 
 def _report_page(title: str, body: str, host: str, preview: bool) -> str:
@@ -1295,8 +1320,8 @@ def _report_page(title: str, body: str, host: str, preview: bool) -> str:
 
 
 def export_report_html(card: TestCard, campaign_id: str = "", files: dict = None,
-                       host: str = "localhost", preview: bool = False) -> str:
-    return _report_page(report_head(card), report_body(card, campaign_id, files), host, preview)
+                       host: str = "localhost", preview: bool = False, live=None) -> str:
+    return _report_page(report_head(card), report_body(card, campaign_id, files, live), host, preview)
 
 
 def _report_docx_body(doc, card: TestCard, campaign_id: str = "", files: dict = None) -> None:
@@ -1320,9 +1345,9 @@ def _report_docx_body(doc, card: TestCard, campaign_id: str = "", files: dict = 
     for p in card.points:
         doc.add_heading(f"{p.seq}  {p.action}    [{(p.quality or '--').upper()}]", level=2)
         doc.add_paragraph(f"Expected: {p.expected}\nObserved: {p.observed or '--'}")
-        meas = _meas_rows(p)
-        if meas:
-            _add_table(doc, ["Command", "Value", "Timestamp"], meas)
+        params = _params_line(p)
+        if params:   # one line, cut like the PDF's two-line limit
+            doc.add_paragraph("Parameters: " + (params if len(params) <= 200 else params[:200] + "..."))
         for n in list(p.images) + _ticked(files, card, campaign_id, p.seq):
             path, kind = _cwd_file(n), _file_kind(n)
             if kind == "image" and path:
@@ -1349,6 +1374,9 @@ def _report_docx_body(doc, card: TestCard, campaign_id: str = "", files: dict = 
         sign = [x for x in (f"{p.date} {p.time}".strip(), p.initial) if x]
         if sign:
             doc.add_paragraph("    ".join(sign)).alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    if (files or {}).get("system"):
+        doc.add_heading(f"System {sy_id(card.id)}", level=1)
+        doc.add_paragraph("The System diagram is in the PDF export.")
 
 
 def export_report_docx(card: TestCard, campaign_id: str = "", files: dict = None) -> bytes:
@@ -1379,8 +1407,7 @@ def _safe_filename(stem: str, ext: str) -> str:
 
 
 
-# Optional integrations, each checked once at startup: jira_config.json turns Jira tickets on;
-# an executable `starfire-hw` (built from starfire.cpp) turns Sample / Activate on.
+# Optional integrations, each checked once at startup: jira_config.json turns Jira tickets on.
 
 
 def _program_dir() -> str:
@@ -1563,28 +1590,15 @@ def _read_static(name: str) -> str:
         return f.read()
 
 
-def _find_hardware_binary() -> str:
-    # Working directory first, then beside the program itself (and dist/ when run from source).
-    for d in (os.getcwd(), _program_dir(), _modules_dir()):
-        path = os.path.join(d, "starfire-hw")
-        if os.path.isfile(path) and os.access(path, os.X_OK):
-            return path
-    return os.path.join(os.getcwd(), "starfire-hw")   # Not found
-
-
-_HW_PATH = _find_hardware_binary()
-HARDWARE_AVAILABLE = os.path.isfile(_HW_PATH) and os.access(_HW_PATH, os.X_OK)
-
-
 # Modules: scripts/binaries the user drops into dist/ and registers in a
 # campaign's Modules table; a test point's Activate button runs one.
 
 # Starfire's own files live in dist/ too; none of them is a module.
-_RESERVED_MODULES = {"starfire", "starfire-hw"}
+_RESERVED_MODULES = {"starfire"}
 # A file with one of these extensions is run by its interpreter, so it needs
 # no execute bit or shebang. Anything else must be an executable file (a
 # compiled binary, or a script with a shebang and chmod +x) and is run directly.
-_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia"}
+_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia", ".signet": ""}   # .signet runs inside Starfire, no interpreter
 _MODULE_TIMEOUT_S = 3600      # a module may legitimately run a whole test
 _MODULE_OUTPUT_LINES = 4096   # output lines kept; a longer run keeps its first and last half
 _RUNS: dict = {}              # (card, point) -> running Popen, so BREAK can find it
@@ -1606,12 +1620,14 @@ def _is_module(d: str, name: str) -> bool:
     path = os.path.join(d, name)
     if name in _RESERVED_MODULES or name.startswith(".") or not os.path.isfile(path):
         return False
-    return os.path.splitext(name)[1] in _INTERPRETERS or os.access(path, os.X_OK)
+    ext = os.path.splitext(name)[1]
+    return ext in _INTERPRETERS or (signet and ext.lower() in signet.SOURCE_TYPES) or os.access(path, os.X_OK)
 
 
 def list_modules() -> list:
     """Names of runnable files in dist/: regular, not hidden, not Starfire's
-    own, and either an interpreted type (.py, .sh, .jl) or executable."""
+    own, and either an interpreted type (.py, .sh, .jl, .signet), a source Signet builds (.cpp, .rs, .adb, .f90)
+    or executable."""
     d = _modules_dir()
     try:
         names = os.listdir(d)
@@ -1620,11 +1636,17 @@ def list_modules() -> list:
     return sorted(n for n in names if _is_module(d, n))
 
 
-def _module_env(card_id, point_seq, campaign_id="") -> dict:
+def _module_env(card_id, point_seq, campaign_id="", params=(), stem="", inputs_path="") -> dict:
     env = dict(os.environ, STARFIRE_CAMPAIGN=str(campaign_id or "XX-000"),
                STARFIRE_CARD=str(card_id), STARFIRE_POINT=str(point_seq))
-    if HARDWARE_AVAILABLE:
-        env["STARFIRE_HW"] = _HW_PATH
+    # SIGNET_ and STARFIRE_ PREFIX (names files for this point), MODULE and SIGNALS_IN, and the helpers
+    prefix = f"{_point_prefix(campaign_id, card_id)}-{point_seq}"
+    if signet:
+        env = signet.module_env(env, prefix, stem, inputs_path)
+    else:
+        env.update(STARFIRE_PREFIX=prefix, STARFIRE_MODULE=stem)
+    for name, value in params:
+        env["STARFIRE_PARAM_" + name.upper()] = value
     if getattr(sys, "frozen", False):
         # The one-file bundle points LD_LIBRARY_PATH at its own libraries;
         # a system python3 or a compiled module inheriting that can crash on
@@ -1641,11 +1663,500 @@ _MODULE_ARGS_MAX = 4096
 
 def _parse_args(text) -> list:
     """Split a command-line string the way a POSIX shell would (quotes, backslashes),
-    without running one. Raises ValueError on bad quoting, NUL or an oversized line."""
+    without running one. Newlines are whitespace; lines starting with # are skipped.
+    Raises ValueError on bad quoting, NUL or an oversized line."""
     text = "" if text is None else str(text)
     if len(text) > _MODULE_ARGS_MAX or "\0" in text:
         raise ValueError("arguments too long or contain a NUL byte")
+    text = text.replace("\\\n", "")  # line continuation, as in a shell
+    text = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     return shlex.split(text)
+
+
+_PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _parse_params(rows) -> list:
+    """A point's parameters as [(name, value)]. Rows with a blank name are skipped.
+    Raises ValueError on a bad or repeated name (ignoring case), NUL or an oversized value."""
+    out, seen = [], set()
+    for row in rows or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            raise ValueError("expected [name, value] rows")
+        name, value = str(row[0] or "").strip(), "" if row[1] is None else str(row[1])
+        if not name:
+            continue
+        if not _PARAM_NAME.match(name):
+            raise ValueError(f"{name!r}: a name is letters, digits and _, not starting with a digit")
+        if name.lower() in seen:
+            raise ValueError(f"{name!r} is listed twice")
+        if len(value) > _MODULE_ARGS_MAX or "\0" in value:
+            raise ValueError(f"{name!r}: value too long or contains a NUL byte")
+        seen.add(name.lower())
+        out.append((name, value))
+    return out
+
+
+# Signals on points: the host Signet code runs against (see README.md, Signals and Signet; the language is in signet.py)
+def _live_index(campaign_id: str, live) -> list:
+    """The live list as [(card, point, file, display)], keeping files that exist and are named for their point."""
+    out = []
+    for e in live or []:
+        if not isinstance(e, dict):
+            continue
+        card, point, name = str(e.get("card", "")), str(e.get("point", "")), e.get("file")
+        if not isinstance(name, str) or name != os.path.basename(name) or not os.path.isfile(name):
+            continue
+        m = _point_file_pattern(campaign_id, card).match(name)
+        if not m or m.group(1) != point:
+            continue
+        head = f"{_point_prefix(campaign_id, card)}-{point}-"
+        out.append((card, point, name, name[len(head):] if name.startswith(head) else name))
+    return out
+
+
+def _live_match(text: str, card_id: str, index: list):
+    """The live entry (card, point, file, display) for [point:][module.]port.sig or [point:]file, or an error message."""
+    card = point = None
+    rest = text
+    if ":" in text:
+        head, rest = text.split(":", 1)
+        m = re.match(r"(?:(.+)-)?(\d+)\Z", head)
+        if not m:
+            return f"{head!r} isn't a point"
+        card, point = m.group(1) or card_id, m.group(2)
+    if rest.endswith(".sig"):
+        want = rest[:-4].split(".")
+        hit = lambda d: d.endswith(".sig") and len(d[:-4].split(".")) == 2 and d[:-4].split(".")[-len(want):] == want
+    else:
+        hit = lambda d: d == rest
+    found = [e for e in index if hit(e[3]) and (card is None or e[0].lower() == card.lower())
+             and (point is None or e[1] == point)]
+    if not found:
+        return f"nothing live matches {text}"
+    if len(found) > 1:
+        return f"{text} matches {len(found)} live signals: " + ", ".join(f"{c}-{p}:{d}" for c, p, _, d in found)
+    return found[0]
+
+
+class _PointHost:
+    """What Signet code on a point sees: the campaign's live list and the point's parameters."""
+
+    def __init__(self, card_id, campaign_id, live, params, pts=None):
+        self.card, self.index = str(card_id), _live_index(campaign_id, live)
+        self.params = {k.lower(): v for k, v in params}
+        self.pts = pts if isinstance(pts, dict) else {}   # the card's points, for a sequence box
+        self.lines = []    # echo output, shown above the module's own
+        self.point = None  # set for a module's own run, so input() can find the point's sequence
+
+    def ask(self, prompt, type_name):
+        # input(): only a sequence has someone to ask (its point's page); the point's own run shares its answers
+        with _RUNS_LOCK:
+            r = (_JOBS.get((self.card, self.point)) or {}).get("runner")   # the job's, so a sequence that ended still answers
+        if r is None:
+            raise LookupError("input needs a sequence: in Starfire, only a sequence asks, on its point's page")
+        return r.ask("run", prompt, type_name)
+
+    def resolve(self, text):
+        r = _live_match(text, self.card, self.index)
+        if isinstance(r, str):
+            raise LookupError(r)
+        c, p, name, disp = r
+        return signet.source_value(name, f"{c}-{p}:{disp}", text)
+
+    def param(self, name):
+        if name.lower() not in self.params:
+            raise LookupError(f"this point has no parameter {name}")
+        return self.params[name.lower()]
+
+    def point_param(self, point, name):
+        info = self.pts.get(str(point))
+        if not isinstance(info, dict):
+            raise LookupError(f"no point {point} on this card")
+        for row in info.get("params") or []:
+            if isinstance(row, (list, tuple)) and len(row) > 1 and str(row[0]).strip().lower() == name.lower():
+                return "" if row[1] is None else str(row[1])
+        raise LookupError(f"point {point} has no parameter {name}")
+
+    def autorun(self):
+        return False    # off in Starfire 4: run(n) always waits for RUN on the point
+
+    def echo(self, text):
+        self.lines.append(text)
+
+
+# Systems: a card's Signet code drawn as boxes and lines (see README.md, Systems)
+_SY_STATE = {"failed": 2, "ok": 1, "": 0}    # box outline: red, blue, dim blue
+
+
+def sy_id(card_id: str) -> str:
+    cid = (card_id or "").strip()
+    return "SY-" + cid[3:] if cid.upper().startswith("TC-") else "SY-" + (cid or "000")
+
+
+def _static_resolve(text: str, card_id: str, index: list):
+    """A ref's live entry (card, point, file, display) without reading it, or an error string."""
+    try:
+        return _live_match(text, card_id, index)
+    except re.error:
+        return f"can't read {text}"
+
+
+def system_graph(card: dict, campaign_id: str, live) -> dict:
+    """A card's System as it is now: boxes (modules on points, sources on other cards, live files,
+    multiplex buses) and one line per source of every connect() in its Signet code. A box is
+    outlined by its module's last run; a line is amber when its source has data. No signal values."""
+    card_id = str(card.get("id") or "")
+    if not signet:
+        return {"format": "starfire-system", "version": 1, "system": sy_id(card_id), "card": card_id,
+                "campaign": campaign_id or "XX-000", "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "boxes": [], "lines": [], "errors": [_NO_SIGNET]}
+    points = {str(p.get("seq")): p for p in card.get("points", []) if isinstance(p, dict)}
+    index = _live_index(campaign_id, live)
+    boxes, lines, errors = {}, [], []
+    other_cards = {}
+
+    def box(key, **kw):
+        if key not in boxes:
+            boxes[key] = dict(id=f"b{len(boxes)}", inputs=[], outputs=[], **kw)
+        return boxes[key]
+
+    def port(lst, name, **kw):
+        for p in lst:
+            if p["port"] == name:
+                return p
+        lst.append(dict(port=name, **kw))
+        return lst[-1]
+
+    def run_state(c, pt, stem):
+        # The module's last run on that point: "failed" (or broken), "ok", or "" (not run).
+        if c.lower() == card_id.lower():
+            p = points.get(pt) or {}
+        else:
+            if c not in other_cards:
+                oc = _read_card(c)
+                other_cards[c] = {str(q.seq): {"runs": q.runs} for q in oc.points} if oc else {}
+            p = other_cards[c].get(pt) or {}
+        run = (p.get("runs") or {}).get(stem)
+        return "failed" if run in ("failed", "broken") else "ok" if run == "complete" else ""
+
+    def mark(b, state):
+        if _SY_STATE[state] > _SY_STATE[b.get("state", "")]:
+            b["state"] = state
+
+    # Modules with current .sig outputs on this card's points
+    head = _point_prefix(campaign_id, card_id) + "-"
+    out_pat = re.compile(r"^" + re.escape(head) + r"(\d+)-([A-Za-z0-9_-]+)\.([A-Za-z_][A-Za-z0-9_]*)\.sig$")
+    try:
+        names_on_disk = sorted(os.listdir(os.getcwd()))
+    except OSError:
+        names_on_disk = []
+    for n in names_on_disk:
+        m = out_pat.match(n)
+        if m and m.group(1) in points:
+            b = box(("m", m.group(1), m.group(2)), kind="module", point=m.group(1), module=m.group(2),
+                    label=f"{m.group(1)}:{m.group(2)}")
+            port(b["outputs"], m.group(3), file=n)
+
+    for seq in sorted(points, key=lambda s: int(s) if s.isdigit() else 0):
+        code = points[seq].get("signals") or ""
+        if not code.strip():
+            continue
+        try:
+            conns = signet.connections(code)
+        except ValueError as e:
+            errors += [f"point {seq}: {ln}" for ln in str(e).splitlines()]
+            continue
+        def yield_connect(cn):
+            line_no, words, stem, inp = cn["line"], cn["types"], cn["module"], cn["port"]
+            dst = box(("m", seq, stem), kind="module", point=seq, module=stem, label=f"{seq}:{stem}")
+            refs, consts, buses = cn["refs"], cn["constants"], cn["buses"]
+            ip = port(dst["inputs"], inp)
+            if consts and not refs and not buses:
+                ip["const"] = ", ".join(consts)
+            def source_box(ref):
+                r = _static_resolve(ref, card_id, index)
+                if isinstance(r, str):
+                    errors.append(f"point {seq} line {line_no}: {r}")
+                    b = box(("x", ref), kind="missing", label=ref, dim=True)
+                    port(b["outputs"], ref)
+                    return b, ref, "dim", None, ref
+                c, pt, fname, disp = r
+                src = f"{c}-{pt}:{disp}"
+                if disp.endswith(".sig"):
+                    stem2, prt = disp[:-4].split(".")
+                    if c.lower() == card_id.lower() and pt in points:
+                        b = box(("m", pt, stem2), kind="module", point=pt, module=stem2, label=f"{pt}:{stem2}")
+                        port(b["outputs"], prt, file=fname)
+                    else:
+                        b = box(("e", c.upper(), pt), kind="external", label=f"{c}-{pt}", dim=True)
+                        mark(b, run_state(c, pt, stem2))
+                        prt = disp
+                        port(b["outputs"], prt, file=fname)
+                    try:
+                        signet.read_sig(fname)
+                        color = "amber"
+                    except ValueError:
+                        color = "dim"
+                    return b, prt, color, fname, src
+                b = box(("f", c.upper(), pt, disp), kind="file", label=f"{pt}:{disp}" if c.lower() == card_id.lower() else src,
+                        dim=c.lower() != card_id.lower())
+                port(b["outputs"], disp, file=fname)
+                return b, disp, "amber", fname, src
+            def add_line(frm, fport, color, fname, src, to, tport, bus=False):
+                lines.append({"from": frm["id"], "from_port": fport, "to": to["id"], "to_port": tport,
+                              "color": color, "bus": bus, "file": fname, "source": src,
+                              "type": "::".join(words), "point": seq, "line": line_no})
+            for ref in refs:
+                b, prt, color, fname, src = source_box(ref)
+                add_line(b, prt, color, fname, src, dst, inp)
+            for bundle in buses:
+                jb = box(("j", seq, line_no, inp), kind="bus", label="mux")
+                worst = "amber"
+                for fld, rs in bundle:
+                    port(jb["inputs"], fld)
+                    for ref in rs:
+                        b, prt, color, fname, src = source_box(ref)
+                        add_line(b, prt, color, fname, src, jb, fld)
+                        worst = "dim" if color == "dim" else worst
+                port(jb["outputs"], "bus")
+                add_line(jb, "bus", worst, None, "multiplex", dst, inp, bus=True)
+        for cn in conns:
+            yield_connect(cn)
+    for b in boxes.values():
+        if b["kind"] == "module":
+            mark(b, run_state(card_id, b["point"], b["module"]))
+
+    return {"format": "starfire-system", "version": 1, "system": sy_id(card_id), "card": card_id,
+            "campaign": campaign_id or "XX-000",
+            "generated": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "boxes": list(boxes.values()), "lines": lines, "errors": errors}
+
+
+def signal_value(name: str) -> dict:
+    """A live .sig's value for the System view: its type, the value as text if small, and a plot for a vector or series."""
+    name = os.path.basename(str(name or ""))
+    if not signet:
+        return {"error": _NO_SIGNET}
+    if not name.endswith(".sig") or not os.path.isfile(name):
+        return {"error": "not found"}
+    try:
+        obj = signet.read_sig(name)
+    except ValueError as e:
+        return {"error": f"{name} {e}"}
+    v, t = obj["value"], str(obj.get("type") or signet.infer_type(obj["value"]))
+    out = {"type": t, "origin": obj.get("origin", ""), "generated": obj.get("generated", "")}
+    series = []
+    s = signet.series_parts(v) if isinstance(v, dict) else None
+    if s:
+        vals = v["values"]
+        x = v["x"] if "x" in v else [v["start"] + i * v["step"] for i in range(len(vals["re"] if isinstance(vals, dict) else vals))]
+        xl = {"time": "time (s)", "frequency": "frequency (Hz)"}.get(s[0], s[0])
+        if isinstance(vals, dict):
+            series = [(xl, "re", x, vals["re"]), (xl, "im", x, vals["im"])]
+        else:
+            series = [(xl, "value", x, vals)]
+    elif isinstance(v, list) and v and all(isinstance(r, list) for r in v):
+        series = [("sample", f"row {k + 1}", list(range(1, len(r) + 1)), r) for k, r in enumerate(v)]
+    elif isinstance(v, list) and len(v) > 1:
+        series = [("sample", "value", list(range(1, len(v) + 1)), v)]
+    ok = lambda x, y: signet.is_num(x) and signet.is_num(y)
+    series = [(a, b, [x for x, y in zip(xs, ys) if ok(x, y)], [y for x, y in zip(xs, ys) if ok(x, y)]) for a, b, xs, ys in series]
+    series = [q for q in series if q[2]]
+    if series:
+        out["svg"] = _plot_svg(series[:4])
+    h = _head(v)
+    if h:
+        out["head"], out["count"] = h
+    text = json.dumps(v)
+    out["text"] = text if len(text) <= 400 else text[:400] + " ..."
+    out["scalar"] = not isinstance(v, (list, dict))
+    return out
+
+def _head(v, n: int = 5):
+    # The first few entries of a vector or series as text, and how many there are.
+    f = lambda q: f"{q:.6g}" if isinstance(q, float) else json.dumps(q)
+    s = signet.series_parts(v) if isinstance(v, dict) else None
+    if s:
+        vals = v["values"]
+        ys = [complex(a, b) for a, b in zip(vals["re"], vals["im"])] if isinstance(vals, dict) else vals
+        xs = v["x"] if "x" in v else [v["start"] + i * v["step"] for i in range(n)]
+        g = lambda q: f"{q.real:.6g}{q.imag:+.6g}i" if isinstance(q, complex) else f(q)
+        return [f"{f(x)}: {g(y)}" for x, y in zip(xs[:n], ys[:n])], len(ys)
+    if isinstance(v, list):
+        return [f(q) for q in v[:n]], len(v)
+    return None
+
+
+def point_signals(card: dict, campaign_id: str, seq, live) -> dict:
+    """The .sig files a point's Measure column can show: its modules' outputs, then the
+    signals its Signet code connects in. Unsaved code counts, as in a System."""
+    if not signet:
+        return {"signals": [], "error": _NO_SIGNET}
+    card_id, seq = str(card.get("id") or ""), str(seq)
+    out, seen = [], set()
+    pat = re.compile(r"^" + re.escape(f"{_point_prefix(campaign_id, card_id)}-{seq}-")
+                     + r"([A-Za-z0-9_-]+)\.([A-Za-z_][A-Za-z0-9_]*)\.sig$")
+    try:
+        names = sorted(os.listdir(os.getcwd()))
+    except OSError:
+        names = []
+    for n in names:
+        m = pat.match(n)
+        if m:
+            out.append({"file": n, "label": f"{m.group(1)}.{m.group(2)}", "role": "out"})
+            seen.add(n)
+    p = next((q for q in card.get("points", []) if isinstance(q, dict) and str(q.get("seq")) == seq), {})
+    code = p.get("signals") or ""
+    if not code.strip():
+        return {"signals": out}
+    try:
+        conns = signet.connections(code)
+    except ValueError as e:
+        return {"signals": out, "error": str(e).splitlines()[0]}
+    index = _live_index(campaign_id, live)
+    for cn in conns:
+        refs = list(cn["refs"]) + [ref for bundle in cn["buses"] for _, rs in bundle for ref in rs]
+        for ref in refs:
+            r = _static_resolve(ref, card_id, index)
+            if isinstance(r, str) or not r[2].endswith(".sig") or r[2] in seen:
+                continue
+            seen.add(r[2])
+            out.append({"file": r[2], "label": f'{cn["module"]}.{cn["port"]} ← {r[0]}-{r[1]}:{r[3]}', "role": "in"})
+    return {"signals": out}
+
+
+_SY_BW, _SY_BUSW, _SY_HEAD, _SY_ROW, _SY_GAPX, _SY_GAPY, _SY_PAD = 200, 70, 26, 18, 110, 28, 24
+
+
+def system_svg(g: dict) -> str:
+    """The System diagram as SVG. Columns follow the data: each box one column right of the
+    furthest box feeding it; a line that skips columns runs through a slot under each one."""
+    boxes = [dict(b) for b in g.get("boxes", [])]
+    by_id = {b["id"]: b for b in boxes}
+    lines = g.get("lines", [])
+    layer = {b["id"]: 0 for b in boxes}
+    for _ in range(len(boxes)):
+        moved = False
+        for ln in lines:
+            if ln["from"] != ln["to"] and layer[ln["to"]] < layer[ln["from"]] + 1:
+                layer[ln["to"]] = layer[ln["from"]] + 1
+                moved = True
+        if not moved:
+            break
+    cols = {}
+    for b in boxes:
+        b["w"] = _SY_BUSW if b["kind"] == "bus" else _SY_BW
+        b["h"] = _SY_HEAD + max(len(b["inputs"]), len(b["outputs"]), 1) * _SY_ROW + 8
+        cols.setdefault(layer[b["id"]], []).append(b)
+    vias = []
+    for ln in lines:
+        v = []
+        for c in range(layer[ln["from"]] + 1, layer[ln["to"]]):
+            slot = {"slot": True, "w": _SY_BW, "h": 10, "label": "", "kind": "slot"}
+            cols.setdefault(c, []).append(slot)
+            v.append(slot)
+        vias.append(v)
+    def key(b):
+        p = str(b.get("point") or "")
+        return (2 if b.get("slot") else 0 if b["kind"] == "module" else 1, int(p) if p.isdigit() else 0, b["label"])
+    width = height = 0
+    for c, col in cols.items():
+        col.sort(key=key)
+        y = _SY_PAD
+        for b in col:
+            b["x"], b["y"] = _SY_PAD + c * (_SY_BW + _SY_GAPX), y
+            y += b["h"] + _SY_GAPY
+        width = max(width, _SY_PAD + c * (_SY_BW + _SY_GAPX) + _SY_BW + _SY_PAD)
+        height = max(height, y + _SY_PAD)
+    width, height = max(width, 300), max(height, 120)
+
+    def port_y(b, lst, name):
+        i = next((k for k, p in enumerate(lst) if p["port"] == name), 0)
+        return b["y"] + _SY_HEAD + i * _SY_ROW + _SY_ROW / 2
+
+    out = []
+    for i, (ln, via) in enumerate(zip(lines, vias)):
+        a, b = by_id[ln["from"]], by_id[ln["to"]]
+        pts = [(a["x"] + a["w"], port_y(a, a["outputs"], ln["from_port"]))]
+        for v in via:
+            pts += [(v["x"], v["y"] + v["h"] / 2), (v["x"] + v["w"], v["y"] + v["h"] / 2)]
+        pts.append((b["x"], port_y(b, b["inputs"], ln["to_port"])))
+        d = f"M{pts[0][0]:.0f},{pts[0][1]:.0f}"
+        for k in range(1, len(pts)):
+            (ax, ay), (bx, by) = pts[k - 1], pts[k]
+            if k % 2 == 0 and via:      # straight across a slot
+                d += f" L{bx:.0f},{by:.0f}"
+                continue
+            dx = max(40, (bx - ax) / 2) if bx > ax else 90
+            d += f" C{ax + dx:.0f},{ay:.0f} {bx - dx:.0f},{by:.0f} {bx:.0f},{by:.0f}"
+        cls = "sy-line " + ln["color"] + (" bus" if ln.get("bus") else "")
+        tip = f'{ln["source"]} → {b["label"]}.{ln["to_port"]}' + (f' ({ln["type"]})' if ln.get("type") else "")
+        out.append(f'<g class="sy-link" data-line="{i}"><path class="sy-hit" d="{d}"/><path class="{cls}" d="{d}"/>'
+                   f'<title>{_h(tip)}</title></g>')
+    for b in by_id.values():
+        x, y, w = b["x"], b["y"], b["w"]
+        parts = [f'<g class="sy-box {b["kind"]}{" dim" if b.get("dim") else ""}{" " + b["state"] if b.get("state") else ""}">'
+                 f'<rect x="{x}" y="{y}" width="{w}" height="{b["h"]}" rx="5"/>'
+                 f'<text class="sy-label" x="{x + 8}" y="{y + 17}">{_h(b["label"])}</text>']
+        for k, p in enumerate(b["inputs"]):
+            py = y + _SY_HEAD + k * _SY_ROW + _SY_ROW / 2
+            const = f' <tspan class="sy-const">= {_h(p["const"])}</tspan>' if p.get("const") else ""
+            parts.append(f'<circle class="sy-port" cx="{x}" cy="{py:.0f}" r="3"/>'
+                         f'<text class="sy-port-name" x="{x + 8}" y="{py + 4:.0f}">{_h(p["port"])}{const}</text>')
+        if b["kind"] != "bus":
+            for k, p in enumerate(b["outputs"]):
+                py = y + _SY_HEAD + k * _SY_ROW + _SY_ROW / 2
+                parts.append(f'<circle class="sy-port" cx="{x + w}" cy="{py:.0f}" r="3"/>'
+                             f'<text class="sy-port-name" x="{x + w - 8}" y="{py + 4:.0f}" text-anchor="end">{_h(p["port"])}</text>')
+        out.append("".join(parts) + "</g>")
+    if not out:
+        out.append(f'<text class="sy-port-name" x="{_SY_PAD}" y="{_SY_PAD + 10}">No connections or signals on this card yet.</text>')
+    return (f'<svg class="sy-diagram" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+            f'width="{width}" height="{height}" role="img" aria-label="{_h(g.get("system", "System"))}">{"".join(out)}</svg>')
+
+
+def system_signals_html(g: dict) -> str:
+    """The expanded value of each vector or series a System connects: its type, plot and text.
+    A scalar's value is already in the connection table."""
+    out, seen = [], set()
+    for ln in g.get("lines", []):
+        f = str(ln.get("file") or "")
+        if not f.endswith(".sig") or f in seen:
+            continue
+        seen.add(f)
+        v = signal_value(f)
+        if "error" in v or v.get("scalar"):
+            continue
+        out.append(f'<div class="sy-sig"><div class="sy-sig-head">{_h(ln["source"])} '
+                   f'<span>{_h(v["type"])} | {_h(v.get("generated", ""))}</span></div>'
+                   f'{v.get("svg", "")}<pre>{_h(v["text"])}</pre></div>')
+    return f'<h3>Signals</h3>{"".join(out)}' if out else ""
+
+
+def system_html(g: dict) -> str:
+    """A System for a report: heading, diagram, the connection table (each source's type, as
+    connected else as stored, and value: a scalar's, else [...]) and the expanded signals."""
+    by_id = {b["id"]: b for b in g.get("boxes", [])}
+    rows = []
+    for ln in g.get("lines", []):
+        typ, val = ln.get("type", ""), ""
+        if ln.get("file", "") and str(ln["file"]).endswith(".sig"):
+            v = signal_value(ln["file"])
+            if "error" not in v:
+                typ, val = typ or v.get("type", ""), v.get("text", "") if v.get("scalar") else "[...]"
+        rows.append((ln["source"], f'{by_id[ln["to"]]["label"]}.{ln["to_port"]}', typ, val, ln["color"]))
+    for b in g.get("boxes", []):
+        rows += [(p["const"], f'{b["label"]}.{p["port"]}', "", "", "") for p in b["inputs"] if p.get("const")]
+    cells = []
+    for src, inp, typ, val, color in rows:
+        swatch = f'<i class="sy-swatch {color}"></i>' if color else ""
+        cells.append(f"<tr><td>{swatch}{_h(src)}</td><td>{_h(inp)}</td><td>{_h(typ)}</td><td>{_h(val)}</td></tr>")
+    table = "" if not rows else ('<table class="sy-table"><tr><th>Source</th><th>Input</th><th>Type</th><th>Value</th></tr>'
+                                 + "".join(cells) + "</table>")
+    errs = "".join(f'<div class="sy-errors">{_h(e)}</div>' for e in g.get("errors", []))
+    return (f'<div class="sy-report"><h2>System {_h(g.get("system", ""))}</h2>{errs}'
+            f'<div class="sy-canvas">{system_svg(g)}</div>{table}{system_signals_html(g)}</div>')
 
 
 def _test_files_state() -> dict:
@@ -1686,23 +2197,34 @@ def _point_files_state(campaign_id: str, card_id: str, point_seq) -> dict:
     return state
 
 
-def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: str = "", args="") -> dict:
+def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: str = "", args="", params=None,
+               signals="", live=None, modules=None, held=None, points=None) -> dict:
     """Run one module from dist/ and wait for it. The name must be a bare
     filename that list_modules() reports -- never a path, so the browser can't
     point this at anything else. The module runs in the working directory
-    (where .test files live) with STARFIRE_CAMPAIGN, STARFIRE_CARD, STARFIRE_POINT
-    and, if found, STARFIRE_HW (path to starfire-hw) in its environment.
+    (where .test files live) with STARFIRE_CAMPAIGN, STARFIRE_CARD and STARFIRE_POINT in its environment.
     The result's "files" lists the files named for this point that the run created or changed;
     "card" is a test card the run wrote (a .test file, else its whole output), as .test JSON.
     args is one command-line string, split into plain argv entries (no shell),
-    so it reaches a module in any language the same way."""
+    so it reaches a module in any language the same way. params are the point's
+    [[name, value]] rows, set as STARFIRE_PARAM_<NAME> (the page copies them into args).
+    signals is the point's Signet code, run first against the campaign's live list
+    ([{card, point, file}]); modules are the point's registered modules, for its checks.
+    held is {port: {value, type, source}} a sequence holds for this module, merged with the point's own."""
     if name not in list_modules():
         return {"status": "failed", "error": f"{name!r} is not a runnable file in dist/"}
     try:
         extra = _parse_args(args)
     except ValueError as e:
         return {"status": "failed", "error": f"bad arguments: {e}"}
+    try:
+        param_items = _parse_params(params)
+    except ValueError as e:
+        return {"status": "failed", "error": f"bad parameters: {e}"}
     argv = [os.path.join(_modules_dir(), name)]
+    in_signet = name.endswith(".signet")
+    if in_signet and not signet:
+        return {"status": "failed", "error": f"{_NO_SIGNET} (needed to run {name})"}
     interpreter = _INTERPRETERS.get(os.path.splitext(name)[1])
     if interpreter:
         found = shutil.which(interpreter)
@@ -1710,33 +2232,86 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
             return {"status": "failed", "error": f"{interpreter} not found on PATH (needed to run {name})"}
         argv.insert(0, found)
     argv += extra
+    stem = os.path.splitext(name)[0]
+    if str(signals or "").strip() and not signet:
+        return {"status": "failed", "error": f"{_NO_SIGNET}; clear the Signals box to run without it", "output": "", "files": []}
+    host = _PointHost(card_id, campaign_id, live, param_items, points)
+    host.point = str(point_seq)
+    try:
+        inputs = signet.evaluate(signals, stem, host, modules) if str(signals or "").strip() else {}
+        for port in held or {}:
+            if port in inputs:
+                raise ValueError(f"{port} is set by both the sequence and this point's own Signals")
+        inputs.update(held or {})
+    except (signet.Break if signet else ()) as e:
+        return {"status": "broken", "error": str(e), "output": "".join(ln + "\n" for ln in host.lines), "files": []}
+    except ValueError as e:
+        return {"status": "failed", "error": f"Signet:\n{e}", "output": "".join(ln + "\n" for ln in host.lines), "files": []}
+    inputs_path = f"{_point_prefix(campaign_id, card_id)}-{point_seq}-{stem}.inputs.json"
+    env = _module_env(card_id, point_seq, campaign_id, param_items, stem,
+                      os.path.join(os.getcwd(), inputs_path) if inputs else "")
+    env["PYTHONUNBUFFERED"] = "1"   # so a Python module's output reaches its file as it prints
+    out_path = _output_path(campaign_id, card_id, point_seq, name)
     key = (str(card_id), str(point_seq))
     started = time.monotonic()
     before = _point_files_state(campaign_id, card_id, point_seq)
     tests_before = _test_files_state()
+    code_out, code_rc = [], 0
+    if signet and os.path.splitext(name)[1].lower() in signet.SOURCE_TYPES:
+        # C++, Rust, Ada or Fortran source: Signet builds it (once per change, cached) and gives the program to run
+        try:
+            argv = signet.build_module(argv[0], log=lambda t: host.lines.append("signet: " + t)) + extra
+        except (LookupError, RuntimeError, OSError) as e:
+            return {"status": "failed", "error": str(e), "output": "".join(ln + "\n" for ln in host.lines), "files": []}
+    if in_signet:
+        # A module written in Signet runs here, not in a process: it is bounded and holds no files open.
+        try:
+            with open(argv[0], encoding="utf-8") as f:
+                signet.run_module_code(f.read(), inputs, f"{_point_prefix(campaign_id, card_id)}-{point_seq}-{stem}.",
+                                       code_out.append)
+        except signet.Break as e:
+            code_rc = 1
+            code_out.append(f"BREAK: {e}")
+        except (ValueError, OSError) as e:
+            code_rc = 1
+            code_out.append(str(e))
     with _RUNS_LOCK:
         if key in _RUNS:
             return {"status": "failed", "error": "a module is already running on this point"}
         try:
-            # Own session, so a timeout or BREAK can take down the module's children too.
-            proc = subprocess.Popen(argv, cwd=os.getcwd(), env=_module_env(card_id, point_seq, campaign_id),
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                    stdin=subprocess.DEVNULL, start_new_session=True)
+            if signet:
+                signet.write_inputs(inputs_path, inputs)
+            out_file = open(out_path, "w", encoding="utf-8")   # the run's output, written as it goes
+            out_file.write("".join(ln + "\n" for ln in host.lines + code_out))
+            out_file.flush()
         except OSError as e:
-            return {"status": "failed", "error": f"could not start {name}: {e}"}
-        _RUNS[key] = proc
+            return {"status": "failed", "error": f"can't write {e.filename}: {e.strerror}"}
+        if in_signet:
+            proc = _Finished(code_rc)
+        else:
+            try:
+                # Own session, so a timeout or BREAK can take down the module's children too.
+                proc = subprocess.Popen(argv, cwd=os.getcwd(), env=env, stdout=out_file, stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL, start_new_session=True)
+            except OSError as e:
+                out_file.close()
+                return {"status": "failed", "error": f"could not start {name}: {e}"}
+            _RUNS[key] = proc
     timed_out = False
     try:
-        out, _ = proc.communicate(timeout=_MODULE_TIMEOUT_S)
+        proc.wait(timeout=_MODULE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         timed_out = True
         os.killpg(proc.pid, signal.SIGKILL)
-        out, _ = proc.communicate()
+        proc.wait()
     finally:
+        out_file.close()
         with _RUNS_LOCK:
             _RUNS.pop(key, None)
             broken = key in _BROKEN
             _BROKEN.discard(key)
+    with open(out_path, encoding="utf-8", errors="replace") as f:
+        out = f.read()
     if proc.returncode == 0 and not timed_out:
         status = "complete"
     else:
@@ -1745,17 +2320,369 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         "status": status,
         "exit_code": proc.returncode,
         "seconds": round(time.monotonic() - started, 1),
-        "output": _cap_lines(out.decode("utf-8", "replace")),
+        "output": _cap_lines(out),
         "files": sorted(n for n, st in _point_files_state(campaign_id, card_id, point_seq).items() if before.get(n) != st),
     }
-    card = _written_card(tests_before) or card_text(out.decode("utf-8", "replace"))
+    if status == "complete" and signet and signet.STEM.match(stem):
+        sig = signet.stamp(f"{_point_prefix(campaign_id, card_id)}-{point_seq}", stem, result["files"],
+                           f"{campaign_id or 'XX-000'}:{card_id}-{point_seq}:")
+        if any(sig.values()):
+            result["signals"] = sig
+            result["files"] = sorted(set(result["files"]) - set(sig["deleted"]))
+    card = _written_card(tests_before) or card_text(out)
     if card:
         result["card"] = card
     if timed_out:
         result["error"] = f"timed out after {_MODULE_TIMEOUT_S} s"
     return result
 
-def break_module(card_id, point_seq, grace: float = 3.0) -> dict:
+class _Finished:
+    """The stand-in for a process when a module ran inside Starfire (a .signet): already over."""
+
+    def __init__(self, returncode):
+        self.returncode = returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _output_path(campaign_id, card_id, point_seq, name) -> str:
+    # <prefix>-<point>-<module>.txt: a point file, so Signet code and reports can use it.
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.splitext(str(name))[0]) or "module"
+    return f"{_point_prefix(campaign_id, card_id)}-{point_seq}-{stem}.txt"
+
+
+# Runs started from the page run in the background: (card, point) -> the latest job there.
+# job["status"] is what the point shows; job["state"] is its module's own run. They differ while a sequence outlives it.
+_JOBS: dict = {}
+_JOB_IDS = iter(range(1, 1 << 62))
+_SEQS: dict = {}      # (card, point) -> _SeqRunner, while that point's sequence is going
+_WAITING: dict = {}   # (card, point) -> {module, inputs, seq, state}: a run a sequence asked for, held until RUN is pressed
+
+
+def _wake(card_id):
+    # a run on this card ended or RUN was pressed: its sequences step now
+    with _RUNS_LOCK:
+        runners = [r for k, r in _SEQS.items() if k[0] == str(card_id)]
+    for r in runners:
+        r.wake.set()
+
+
+def _seq_line(ev, when) -> str:
+    extra = []
+    for k, v in ev.items():
+        if k in ("t", "event", "line"):
+            continue
+        if k == "inputs":
+            v = ", ".join(f"{p}={i['value']} ({i['type']})" for p, i in v.items()) or "none"
+        extra.append(str(v) if k == "text" else f"{k}={v}")
+    where = f"line {ev['line']}" if ev.get("line") else ""
+    return f"{when:%Y-%m-%d %H:%M:%S.%f}"[:-3] + f"  {ev['t']:9.3f} s  {ev['event']:<11}  {where:<9} {'  '.join(extra)}".rstrip()
+
+
+class _SeqHost(_PointHost):
+    """What a sequence sees (Signet API 2): the card's points, and the run table."""
+
+    def __init__(self, runner, campaign_id, live, params, pts):
+        super().__init__(runner.key[0], campaign_id, live, params, pts)
+        self.runner, self.campaign, self.live = runner, campaign_id, live
+        self.started = set()
+
+    def ask(self, prompt, type_name):
+        answer = self.runner.ask("seq", prompt, type_name)
+        self.runner.seq.event("input", None, text=f"{prompt} = {answer}")    # into the as-run log, in order
+        return answer
+
+    def echo(self, text):
+        pass    # it is in the log already
+
+    def resolve(self, text):
+        try:
+            return super().resolve(text)
+        except LookupError:
+            # a file still being written isn't ticked live: [card-]point:file is <prefix>-<point>-file
+            m = re.match(r"(?:(.+)-)?(\d+):([A-Za-z0-9._-]+)\Z", text)
+            if m and not m.group(3).endswith(".sig"):
+                card, point, rest = m.group(1) or self.card, m.group(2), m.group(3)
+                path = f"{_point_prefix(self.campaign, card)}-{point}-{rest}"
+                if os.path.isfile(path):
+                    return signet.source_value(path, f"{card}-{point}:{rest}", text)
+            raise
+
+    def run(self, point, inputs):
+        point = str(point)
+        info = self.pts.get(point)
+        if not isinstance(info, dict):
+            raise LookupError(f"no point {point} on this card")
+        name = str(info.get("module") or "").strip()
+        if not name:
+            raise LookupError(f"point {point} has no module")
+        if name not in (info.get("modules") or []) or name not in list_modules():
+            raise LookupError(f"{name} isn't registered for point {point}")
+        code, stem = str(info.get("signals") or ""), os.path.splitext(name)[0]
+        if code.strip():
+            if signet.is_sequence(code):
+                raise RuntimeError(f"point {point} has a sequence of its own")
+            try:
+                own = {c["port"] for c in signet.connections(code) if c["module"] == stem}
+            except ValueError as e:
+                raise RuntimeError(f"point {point}'s Signals: {e}")
+            for port in sorted(own & set(inputs)):
+                raise RuntimeError(f"{port} is set by both this sequence and point {point}'s own Signals")
+        key = (self.card, point)
+        with _RUNS_LOCK:
+            job = _JOBS.get(key)
+            if key in _WAITING or (job and job["status"] == "running"):
+                raise RuntimeError(f"point {point} is already running")
+            _WAITING[key] = {"module": name, "inputs": inputs, "seq": self.runner, "state": "waiting"}   # until RUN
+        self.started.add(point)
+
+    def state(self, point):
+        key = (self.card, str(point))
+        with _RUNS_LOCK:
+            w = _WAITING.get(key)
+            if w and w["seq"] is self.runner:
+                return w["state"]
+            job = _JOBS.get(key)
+            if job and job["started"] >= self.runner.t0:
+                return job["state"]
+        return "none"
+
+    def break_runs(self):
+        with _RUNS_LOCK:
+            for k in [k for k, w in _WAITING.items() if w["seq"] is self.runner]:
+                del _WAITING[k]
+            ours = [p for p in self.started | {self.runner.key[1]}
+                    if (_JOBS.get((self.card, p)) or {}).get("started", -1) >= self.runner.t0]
+        for p in ours:
+            _break_process(self.card, p)
+
+
+class _SeqRunner:
+    """One sequence going: Signet's Sequence, stepped by a thread about every second and whenever a run on
+    the card ends or RUN is pressed on a waiting point. Its events are written to the as-run log."""
+
+    def __init__(self, code, key, stem, campaign_id, live, params, pts):
+        self.key, self.code, self.campaign = key, code, campaign_id
+        self.wake, self.done, self.lock = threading.Event(), threading.Event(), threading.Lock()
+        self.t0 = time.monotonic()
+        self.host = _SeqHost(self, campaign_id, live, params, pts)
+        self.seq = signet.Sequence(code, str(key[1]), self.host, module=stem, now=self.t0)   # ValueError: bad code
+        self.points = self.seq.points
+        self.status = signet.Status("waiting", "", "", None, [])
+        self.log_name = f"{_point_prefix(campaign_id, key[0])}-{key[1]}-sequence.log"
+        # input(): one question at a time, shown on the point's page. The point's own run reads the same top-level
+        # lines as the sequence, so each asker takes answers in order and an answer given once serves both.
+        self.question, self.answers, self.asked, self.stopping = None, [], {"run": 0, "seq": 0}, ""
+        self.asking = threading.Condition()
+
+    def begin(self):
+        stamp = datetime.now(timezone.utc)
+        head = [f"# Signet sequence on point {self.key[1]} of {self.key[0]} (campaign {self.campaign or 'XX-000'}), started {stamp:%Y-%m-%d %H:%M:%S} UTC",
+                *("#   " + ln for ln in self.code.splitlines()), "#"]
+        self._write(head, "w")
+
+    def _write(self, lines, mode="a"):
+        try:
+            with open(self.log_name, mode, encoding="utf-8") as f:
+                f.write("".join(ln + "\n" for ln in lines))
+        except OSError:
+            pass
+
+    def record(self, st):
+        with self.lock:
+            if self.done.is_set():
+                return
+            when = datetime.now(timezone.utc)
+            self._write([_seq_line(ev, when) for ev in st.events])
+            self.status = st
+            if st.state != "waiting":
+                with _RUNS_LOCK:
+                    if _SEQS.get(self.key) is self:
+                        del _SEQS[self.key]
+                    for k in [k for k, w in _WAITING.items() if w["seq"] is self]:
+                        del _WAITING[k]
+                self.done.set()
+
+    def loop(self):
+        while True:
+            st = self.seq.step(time.monotonic())
+            self.record(st)
+            if st.state != "waiting":
+                return
+            self.wake.wait(1.0)
+            self.wake.clear()
+
+    def ask(self, who, prompt, type_name):
+        with self.asking:
+            n = self.asked[who]
+            while True:
+                if self.stopping:
+                    raise LookupError(self.stopping)
+                if n < len(self.answers) and self.answers[n][:2] == (prompt, type_name):
+                    self.asked[who] = n + 1
+                    return self.answers[n][2]
+                if self.question is None:
+                    n = len(self.answers)
+                    self.question = {"prompt": prompt, "type": type_name}
+                self.asking.wait(1.0)
+
+    def answer(self, text) -> bool:
+        with self.asking:
+            q = self.question
+            if q is None:
+                return False
+            self.answers.append((q["prompt"], q["type"], text))
+            self.question = None
+            self.asking.notify_all()
+        self.wake.set()
+        return True
+
+    def stop(self, reason="broken by operator"):
+        with self.asking:               # a wait on input() ends, so the step can finish
+            self.stopping = reason
+            self.asking.notify_all()
+        self.record(self.seq.break_(time.monotonic(), reason))
+        self.wake.set()
+
+    def log_text(self, tail=60) -> str:
+        try:
+            with open(self.log_name, encoding="utf-8", errors="replace") as f:
+                return "".join([ln for ln in f.readlines() if not ln.startswith("#")][-tail:])
+        except OSError:
+            return ""
+
+    def finish(self, r) -> dict:
+        """The module's result, with how the sequence ended; waits for the sequence to end."""
+        self.done.wait()
+        st, r = self.status, dict(r)
+        r["sequence"] = {"state": st.state, "kind": st.kind, "reason": st.reason, "log": self.log_name}
+        r["files"] = sorted(set(r.get("files") or []) | {self.log_name})
+        if st.state == "broken":
+            if r.get("status") == "complete":
+                r["status"] = "broken"
+            r["error"] = r.get("error") or st.reason
+        r["output"] = (r.get("output") or "") + "\nSequence:\n" + self.log_text(200)
+        return r
+
+
+def stop_sequences():
+    with _RUNS_LOCK:
+        runners = list(_SEQS.values())
+    for r in runners:
+        r.stop("Starfire shut down")
+
+
+def start_run(name, card_id="", point_seq="", campaign_id="", args="", params=None, signals="", live=None, modules=None,
+              extra=None, points=None) -> dict:
+    """Start run_module in the background and return at once: {"status": "running", "run": id}.
+    run_status() reports progress and, once it ends, the result. A point whose Signals box is a sequence
+    also starts the sequence (points: every point of the card, for its run() and point parameters).
+    `extra` is the connections a sequence held for the module, given when RUN is pressed on it."""
+    key = (str(card_id), str(point_seq))
+    code, runner = str(signals or ""), None
+    fail = lambda msg: {"status": "failed", "error": msg, "output": "", "files": []}
+    if signet and code.strip() and key not in _WAITING and signet.is_sequence(code):
+        if name not in list_modules():
+            return fail(f"{name!r} is not a runnable file in dist/")
+        try:
+            runner = _SeqRunner(code, key, os.path.splitext(str(name))[0], campaign_id, live,
+                                _parse_params(params), points if isinstance(points, dict) else {})
+        except ValueError as e:
+            return fail(f"Signet:\n{e}")
+    with _RUNS_LOCK:
+        job = _JOBS.get(key)
+        if job and job["status"] == "running":
+            return fail("a module is already running on this point")
+        held = _WAITING.get(key)    # a run a sequence asked for: this RUN starts it
+        if held and held["state"] != "waiting":
+            return fail(f"this run was {held['state']}")
+        if not held:
+            for k, r in _SEQS.items():
+                if k[0] == key[0] and key[1] in r.points:
+                    return fail(f"point {k[1]}'s sequence uses this point")
+        if runner:
+            for k, r in _SEQS.items():
+                if k[0] == key[0] and set(r.points) & set(runner.points):
+                    return fail(f"point {k[1]}'s sequence is going and uses points {', '.join(sorted(set(r.points) & set(runner.points)))}")
+            for p in runner.points:
+                busy = _JOBS.get((key[0], p))
+                if p != key[1] and (busy and busy["status"] == "running" or (key[0], p) in _WAITING):
+                    return fail(f"point {p} is running, and the sequence uses it")
+            _SEQS[key] = runner
+        if held:
+            extra = held["inputs"]
+            del _WAITING[key]
+        job = {"run": next(_JOB_IDS), "status": "running", "state": "running", "module": str(name), "started": time.monotonic(),
+               "output_file": _output_path(campaign_id, card_id, point_seq, name), "result": None, "runner": runner}
+        _JOBS[key] = job
+    if held:
+        _wake(card_id)
+
+    def work():
+        try:
+            r = run_module(name, card_id, point_seq, campaign_id, args, params, signals, live, modules, extra, points)
+        except Exception as e:   # keep the job from hanging in "running"
+            r = {"status": "failed", "error": f"internal error: {e}", "output": "", "files": []}
+        state = r.get("status") or "failed"
+        with _RUNS_LOCK:
+            job["state"] = state
+            if not runner:
+                job.update(status=state, result=r)
+        _wake(card_id)
+        if runner:
+            r = runner.finish(r)
+            with _RUNS_LOCK:
+                job.update(status=r.get("status") or "failed", result=r)
+    threading.Thread(target=work, daemon=True).start()
+    if runner:
+        runner.begin()
+        threading.Thread(target=runner.loop, daemon=True).start()
+    return {"status": "running", "run": job["run"]}
+
+
+def run_status(card_id, point_seq=None, tail: int = 200) -> dict:
+    """One point's latest run: {run, status, module, seconds, output so far | result}; or, with no point,
+    {"points": {point: {run, status, module}}} for every point of the card that has run since starfire started.
+    A run a sequence is holding for RUN is "waiting"; a point with a sequence going also has "sequence"."""
+    card = str(card_id)
+    with _RUNS_LOCK:
+        jobs = {k: dict(v) for k, v in _JOBS.items() if k[0] == card}
+        waits = {k[1]: dict(w) for k, w in _WAITING.items() if k[0] == card}
+        seqs = {k[1]: r for k, r in _SEQS.items() if k[0] == card}
+    seq_info = lambda r: {"state": r.status.state, "reason": r.status.reason, "kind": r.status.kind, "log": r.log_text(40),
+                          "question": r.question}
+    if point_seq is None:
+        pts = {k[1]: {"run": j["run"], "status": j["status"], "module": j["module"]} for k, j in jobs.items()}
+        for p, w in waits.items():
+            pts[p] = {"status": w["state"], "module": w["module"]}
+        for p, r in seqs.items():
+            pts.setdefault(p, {})["sequence"] = {"state": r.status.state, "reason": r.status.reason}
+        return {"points": pts}
+    p = str(point_seq)
+    j = jobs.get((card, p))
+    if p in waits and not (j and j["status"] == "running"):
+        return {"status": waits[p]["state"], "module": waits[p]["module"], "seconds": 0}
+    if not j:
+        return {"status": "none"}
+    out = {"run": j["run"], "status": j["status"], "module": j["module"],
+           "seconds": round(time.monotonic() - j["started"], 1)}
+    if j["status"] == "running":
+        try:
+            with open(j["output_file"], encoding="utf-8", errors="replace") as f:
+                out["output"] = "".join(f.readlines()[-tail:])
+        except OSError:
+            out["output"] = ""
+        if p in seqs:
+            out["sequence"] = seq_info(seqs[p])
+        elif j.get("runner"):
+            out["sequence"] = seq_info(j["runner"])
+    else:
+        out["result"] = j["result"]
+    return out
+
+
+def _break_process(card_id, point_seq, grace: float = 3.0) -> dict:
     # SIGTERM the module running on this point; SIGKILL if it is still alive after `grace` s.
     key = (str(card_id), str(point_seq))
     with _RUNS_LOCK:
@@ -1778,12 +2705,30 @@ def break_module(card_id, point_seq, grace: float = 3.0) -> dict:
     return {"success": True}
 
 
+def break_module(card_id, point_seq, grace: float = 3.0) -> dict:
+    """BREAK on a point: stops its sequence (and the runs it started), or the run a sequence is holding
+    for RUN (its sequence breaks on its next step), or the module running there."""
+    key = (str(card_id), str(point_seq))
+    with _RUNS_LOCK:
+        runner, held = _SEQS.get(key), _WAITING.get(key)
+        if held and not runner and key not in _RUNS:
+            held["state"] = "broken"
+    if runner:
+        runner.stop("broken by operator")
+        return {"success": True}
+    if held and held["state"] == "broken":
+        held["seq"].wake.set()
+        return {"success": True}
+    return _break_process(card_id, point_seq, grace)
+
+
 def _fill_flags(html: str) -> str:
     return (html.replace("__JIRA_AVAILABLE__", "true" if JIRA_AVAILABLE else "false")
-                .replace("__HARDWARE_AVAILABLE__", "true" if HARDWARE_AVAILABLE else "false"))
+                .replace("__SIGNET_AVAILABLE__", "true" if SIGNET_AVAILABLE else "false"))
 
 _TEST_HTML = _fill_flags(_read_static("test.html"))
 _CAMPAIGN_HTML = _fill_flags(_read_static("campaign.html"))
+_SYSTEM_HTML = _read_static("system.html")
 
 # Calculator: math and metrics on a point's csv columns, in validate.py's expression syntax
 # (@voltage, max @voltage, @voltage * @current) but no limits. Needs numpy, loaded on first use.
@@ -1980,6 +2925,17 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send(200, "application/json", f.read().encode())
             except OSError as e:
                 self._send_json(500, {"error": str(e)})
+        elif path == "/system":
+            # ?card=<id> draws that card's System; the card and live list come from the opening page.
+            self._send(200, "text/html", _SYSTEM_HTML.encode())
+        elif path == "/run_status":
+            # ?card=&point= for one point's latest run, or ?card= alone for every point of the card
+            qs = parse_qs(parsed.query)
+            point = (qs.get("point") or [None])[0]
+            self._send_json(200, run_status((qs.get("card") or [""])[0], point))
+        elif path == "/signal_value":
+            qs = parse_qs(parsed.query)
+            self._send_json(200, signal_value((qs.get("file") or [""])[0]))
         elif path == "/list_modules":
             self._send_json(200, {"modules": list_modules()})
         elif path == "/point_files":
@@ -2080,43 +3036,6 @@ class _Handler(BaseHTTPRequestHandler):
             result = {"success": False, "error": f"Jira ticket creation raised: {e}"}
         self._send_json(200, result)
 
-    def _handle_hardware(self, raw_body: bytes):
-        # {"port": "/dev/usbtmc0", "command": "MEAS:VOLT:DC?"}. starfire-hw
-        # answers with one JSON line. A missing binary is a "not available".
-        if not HARDWARE_AVAILABLE:
-            self._send_json(404, {"success": False, "error": "starfire-hw not available"})
-            return
-        try:
-            payload = json.loads(raw_body)
-        except json.JSONDecodeError as e:
-            self._send_json(400, {"success": False, "error": f"bad request: {e}"})
-            return
-        port = (payload.get("port") or "").strip()
-        command = (payload.get("command") or "").strip()
-        if not port or not command:
-            self._send_json(400, {"success": False, "error": "port and command are both required"})
-            return
-        try:
-            # The binary enforces its own 5 s limit; this is an outer ceiling.
-            proc = subprocess.run([_HW_PATH, "send", port, command],
-                                   capture_output=True, text=True, timeout=10)
-        except subprocess.TimeoutExpired:
-            self._send_json(200, {"success": False, "error": "starfire-hw timed out"})
-            return
-        except Exception as e:
-            self._send_json(200, {"success": False, "error": f"starfire-hw raised: {e}"})
-            return
-        try:
-            line = json.loads(proc.stdout.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError):
-            # Usage errors (exit 2) and crashes have no JSON line, only stderr.
-            self._send_json(200, {"success": False, "error": proc.stderr.strip() or "unknown error"})
-            return
-        if line.get("ok"):
-            self._send_json(200, {"success": True, "value": line.get("reply", ""), "kind": line.get("kind", "")})
-        else:
-            self._send_json(200, {"success": False, "error": line.get("error", "unknown error")})
-
     def _local_json_payload(self, raw_body: bytes):
         """For routes that run or write: only accept a request a web page on
         another site couldn't have sent, a JSON content type (which forces a CORS
@@ -2141,9 +3060,11 @@ class _Handler(BaseHTTPRequestHandler):
         payload = self._local_json_payload(raw_body)
         if payload is None:
             return
-        self._send_json(200, run_module(str(payload.get("module") or ""), payload.get("card", ""),
+        self._send_json(200, start_run(str(payload.get("module") or ""), payload.get("card", ""),
                                         payload.get("point", ""), payload.get("campaign", ""),
-                                        payload.get("args", "")))
+                                        payload.get("args", ""), payload.get("params"),
+                                        payload.get("signals", ""), payload.get("live"), payload.get("modules"),
+                                        points=payload.get("points")))
 
     def _handle_add_card_file(self, raw_body: bytes):
         # {"campaign", "card", "point", "name", "data": base64} -> <campaign>-<card>-<point>-<name>
@@ -2206,12 +3127,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._handle_capture_image(raw)
         if path == "/create_jira_ticket":
             return self._handle_create_jira_ticket(raw)
-        if path == "/measure":
-            return self._handle_hardware(raw)
         if path == "/run_module":
             return self._handle_run_module(raw)
         if path == "/break_module":
             return self._handle_break_module(raw)
+        if path == "/seq_answer":
+            return self._handle_seq_answer(raw)
         if path == "/save_point_file":
             return self._handle_save_point_file(raw)
         if path == "/calc":
@@ -2227,6 +3148,20 @@ class _Handler(BaseHTTPRequestHandler):
             self._route_json(path, data)
         except (TypeError, KeyError, AttributeError, ValueError) as e:
             self._send_json(400, {"error": str(e)})
+
+    def _handle_seq_answer(self, raw) -> None:
+        # input() in a sequence: {"card", "point", "answer"} for the sequence asking on that point
+        try:
+            data = json.loads(raw)
+            key = (str(data["card"]), str(data["point"]))
+            answer = str(data["answer"])
+        except (ValueError, KeyError, TypeError) as e:
+            return self._send_json(400, {"error": f"bad answer: {e}"})
+        with _RUNS_LOCK:
+            r = _SEQS.get(key)
+        if not r or not r.answer(answer):
+            return self._send_json(409, {"error": "no question is waiting on this point"})
+        self._send_json(200, {"ok": True})
 
     def _route_json(self, path: str, data) -> None:
         host = self.headers.get("Host", "localhost")
@@ -2254,6 +3189,25 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json(200, campaign_statuses(camp))
             else:
                 self._send_json(200, compute_vcrm(camp))
+        # System graph: {"card": <the .test dict>, "campaign", "live": [{card, point, file}]}
+        # Measure column: {"card", "campaign", "point", "live"}
+        elif path == "/point_signals":
+            self._send_json(200, point_signals(data.get("card") or {}, str(data.get("campaign") or ""),
+                                               data.get("point"), data.get("live") or []))
+        elif path == "/system_graph":
+            g = system_graph(data.get("card") or {}, str(data.get("campaign") or ""), data.get("live") or [])
+            self._send_json(200, dict(g, svg=system_svg(g), signals=system_signals_html(g)))
+        # A saved .sys redrawn: the System graph as exported (no svg, no signals)
+        elif path == "/system_view":
+            if (data.get("format") != "starfire-system" or not isinstance(data.get("boxes"), list)
+                    or not isinstance(data.get("lines"), list)):
+                self._send_json(400, {"error": "not a Starfire .sys file"})
+            else:
+                g = dict(data, errors=[str(e) for e in data.get("errors") or []])
+                try:
+                    self._send_json(200, dict(g, svg=system_svg(g), signals=""))
+                except (KeyError, TypeError, ValueError, AttributeError) as e:
+                    self._send_json(400, {"error": f"bad .sys file ({type(e).__name__}: {e})"})
         # BRANCH / EXTEND: {"mode", "card", "point", "file", "campaign", "used"}
         elif path == "/feed_card":
             self._send_json(200, feed_card(data))
@@ -2265,7 +3219,7 @@ class _Handler(BaseHTTPRequestHandler):
             card = TestCard.from_dict(data["card"])
             camp_id, files = str(data.get("campaign") or ""), data.get("files") or {}
             if path == "/export/report/print":
-                html = export_report_html(card, camp_id, files, host, preview=bool(data.get("preview")))
+                html = export_report_html(card, camp_id, files, host, preview=bool(data.get("preview")), live=data.get("live"))
                 self._send(200, "text/html", html.encode())
             else:
                 self._send(200, _DOCX_MIME, export_report_docx(card, camp_id, files))
@@ -2323,6 +3277,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print()
         print("Shutting down")
+    stop_sequences()
     return 0
 
 
