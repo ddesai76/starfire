@@ -22,6 +22,8 @@
         <button class="btn" id="docxCampBtn">export .docx</button>
         <button class="btn" id="genVcrmBtn">generate VCRM</button>
         <button class="btn" id="buildSrBtn">build campaign report</button>
+        <button class="btn" id="loadSysBtn">import system file (.sys)</button>
+        <input type="file" id="loadSysFile" accept=".sys,application/json" style="display:none">
       </div>
       <div id="saveStatus" class="hint"></div>
     </div>
@@ -48,7 +50,7 @@
 
     <h2 class="no-rule">Modules</h2>
     <table class="datatable" id="modTable">
-      <colgroup><col style="width:28%"><col><col style="width:16%"><col style="width:60px"></colgroup>
+      <colgroup><col style="width:28%"><col><col style="width:16%"><col style="width:84px"></colgroup>
       <tr><th>Module</th><th>Description</th><th>Scope</th><th class="blank-th"></th></tr>
     </table>
     <div class="row"><button class="btn btn-plus" id="addModBtn" title="add module">+</button></div>
@@ -97,11 +99,13 @@ let camp = {
   id: "SC-001", title: "Untitled Campaign", revision: "A", author: "",
   date: new Date().toISOString().slice(0,10), project: "", test_lead: "",
   quality_assurance: "", jira_epic_key: "",
-  requirements: [], modules: [], tests: [], ancillary_tests: [], sections: [], reports: {}
+  requirements: [], modules: [], tests: [], ancillary_tests: [], sections: [], reports: {}, live: []
 };
 
 // True only if jira_config.json was found in the working directory at startup.
 const JIRA_AVAILABLE = __JIRA_AVAILABLE__;
+// True only if starfire was built with signet.py: System Reports need it.
+const SIGNET_AVAILABLE = __SIGNET_AVAILABLE__;
 if (JIRA_AVAILABLE) document.getElementById("jira-epic-field").style.visibility = "";
 
 function esc(s) { return (s??"").toString().replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
@@ -157,7 +161,7 @@ function moduleKind(name) {
   if (!name) return "";
   const dot = name.lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot) : "";
-  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh"})[ext] || "other";
+  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (/^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i.test(ext) ? "bin" : "other");
 }
 function renderModules() {
   const t = document.getElementById("modTable");
@@ -173,9 +177,14 @@ function renderModules() {
       <td><select class="mod-${moduleKind(m.module)}" data-i="${i}" data-f="module">${opts.join("")}</select></td>
       <td><input value="${esc(m.description)}" data-i="${i}" data-f="description" placeholder="optional"></td>
       <td><input value="${esc(m.scope)}" data-i="${i}" data-f="scope" placeholder="any test point"></td>
-      <td><button class="btn mini btn-x" data-del="${i}">x</button></td>`;
+      <td class="actions-cell"><button class="btn mini btn-icon pin-toggle${m.pinned ? " on" : ""}" data-pin="${i}" title="${m.pinned ? "unpin from" : "pin to"} test points: an icon in the module column runs it">${ICON_PUSH_PIN}</button><button class="btn mini btn-x" data-del="${i}">x</button></td>`;
     t.appendChild(tr);
   });
+  t.querySelectorAll("button[data-pin]").forEach(btn => btn.addEventListener("click", () => {
+    const m = camp.modules[+btn.dataset.pin];
+    m.pinned = !m.pinned;
+    renderModules();
+  }));
   t.querySelectorAll("input[data-i], select[data-i]").forEach(el => {
     el.addEventListener("input", () => {
       camp.modules[+el.dataset.i][el.dataset.f] = el.value;
@@ -185,8 +194,9 @@ function renderModules() {
   t.querySelectorAll("button[data-del]").forEach(btn => {
     btn.addEventListener("click", () => { camp.modules.splice(+btn.dataset.del, 1); renderModules(); });
   });
-  document.getElementById("modHint").textContent = moduleFiles.length
-    ? "" : "No runnable files found. Put programs (chmod +x) or .py / .sh / .jl scripts in the dist/ folder next to starfire.";
+  document.getElementById("modHint").textContent = !moduleFiles.length
+    ? "No runnable files found. Put programs (chmod +x) or .py / .sh / .jl / .signet scripts, or .cpp / .rs / .adb / .f90 sources in the dist/ folder next to starfire."
+    : camp.modules.filter(m => m.pinned).length > 4 ? "More than 4 modules pinned: a test point shows the first 4 in its scope." : "";
 }
 async function loadModuleFiles() {
   try {
@@ -206,6 +216,9 @@ window.addEventListener("focus", loadModuleFiles);
 window.getCampaignModules = () => camp.modules;
 window.getCampaignId = () => camp.id;
 window.getCampaignTestIds = () => camp.tests.concat(camp.ancillary_tests).map(t => t.test_id);
+// The live list, [{card, point, file}]: point files that Signet code anywhere in the campaign can connect.
+window.getCampaignLive = () => camp.live || [];
+window.setCampaignLive = list => { camp.live = list; };
 
 // Google Material Symbols, embedded inline (not a file/CDN) so they work
 // fully offline; fill="currentColor" picks up each button's own hover color.
@@ -213,6 +226,7 @@ const ICON_ARROW_UPWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -9
 const ICON_ARROW_DOWNWARD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M440-800v487L216-537l-56 57 320 320 320-320-56-57-224 224v-487h-80Z"/></svg>';
 const ICON_OPEN_IN_NEW = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z"/></svg>';
 const ICON_CLOSE = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/></svg>';
+const ICON_PUSH_PIN = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="m640-480 80 80v80H520v240l-40 40-40-40v-240H240v-80l80-80v-280h-40v-80h400v80h-40v280Zm-286 80h252l-46-46v-314H400v314l-46 46Zm126 0Z"/></svg>';
 const ICON_BOOKMARK_ADD = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960" fill="currentColor"><path d="M200-120v-640q0-33 23.5-56.5T280-840h240v80H280v518l200-86 200 86v-278h80v400L480-240 200-120Zm80-640h240-240Zm400 160v-80h-80v-80h80v-80h80v80h80v80h-80v80h-80Z"/></svg>';
 
 // Computed on the server from each test card's point sign-offs; never typed.
@@ -456,6 +470,7 @@ document.getElementById("loadCampFile").addEventListener("change", (e) => {
     if (!camp.ancillary_tests) camp.ancillary_tests = [];
     if (!camp.sections) camp.sections = [];
     if (!camp.jira_epic_key) camp.jira_epic_key = "";
+    if (!Array.isArray(camp.live)) camp.live = [];
     bindMeta(); renderRequirements(); renderModules(); renderSections(); refreshStatuses();
   });
 });
@@ -514,6 +529,7 @@ function renderTabBar() {
 function updateAppendButtons() {
   const on = openTabs.some(t => t.key === SR_KEY);
   document.querySelectorAll("[data-rappend], #appendVcrmBtn").forEach(b => { b.style.display = on ? "" : "none"; });
+  document.querySelectorAll("iframe.sy-frame").forEach(f => { try { f.contentWindow.setAppendVisible(on); } catch (e) {} });
 }
 
 function switchTab(key) {
@@ -565,14 +581,15 @@ function srHead() {
 function srItemLabel(it) {
   if (it.type === "vcrm") return "VCRM";
   if (it.type === "report") return reportIdFor(it.card);
+  if (it.type === "system") return systemIdFor(it.card);
   const sec = it.idx !== undefined ? camp.sections[it.idx] : null;
   return (sec ? sec[0] : it.header) || "(untitled section)";
 }
 
-// The VCRM and Sections always come first; Test Reports follow (each group keeps its own order).
-const srIsReport = it => it.type === "report";
+// The VCRM and Sections always come first; Test Reports follow, then Systems (each group keeps its own order).
+const srRank = it => ({report: 1, system: 2})[it.type] || 0;
 function srOrder() {
-  camp.campaign_report.items.sort((a, b) => srIsReport(a) - srIsReport(b));
+  camp.campaign_report.items.sort((a, b) => srRank(a) - srRank(b));
 }
 
 // Sections stay live: every non-empty one the user hasn't removed from the report is in it.
@@ -597,7 +614,7 @@ function srSectionDeleted(i) {
   rep.items.forEach(it => { if (it.type === "section" && it.idx !== undefined) it.idx = shift(it.idx); });
   rep.dismissed = (rep.dismissed || []).filter(n => n !== i).map(shift);
 }
-const SR_KINDS = {section: "section", vcrm: "matrix", report: "test report"};
+const SR_KINDS = {section: "section", vcrm: "matrix", report: "test report", system: "system report"};
 
 function srAppend(item) {
   if (!camp.campaign_report) return "No campaign report yet.";
@@ -624,7 +641,7 @@ function openSrTab() {
         <div class="report-box">
           <div class="report-label">Contents</div>
           <div class="sr-items"></div>
-          <div class="report-hint">Open the VCRM or a Test Report and press + append to add it here.</div>
+          <div class="report-hint">Open the VCRM, a Test Report or a System Report and press + append to add it here.</div>
         </div>
         <div class="report-btns">
           <button class="btn" data-srrefresh>refresh</button>
@@ -650,8 +667,8 @@ function renderSrSide() {
   list.innerHTML = items.length ? items.map((it, i) => `
     <div class="sr-item">
       <span class="sr-label"><span class="report-fname">${esc(srItemLabel(it))}</span><span class="report-kind">${SR_KINDS[it.type] || ""}</span></span>
-      <button class="btn mini btn-icon" data-srup="${i}" title="move up"${i === 0 || srIsReport(items[i - 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_UPWARD}</button>
-      <button class="btn mini btn-icon" data-srdown="${i}" title="move down"${i === items.length - 1 || srIsReport(items[i + 1]) !== srIsReport(it) ? " disabled" : ""}>${ICON_ARROW_DOWNWARD}</button>
+      <button class="btn mini btn-icon" data-srup="${i}" title="move up"${i === 0 || srRank(items[i - 1]) !== srRank(it) ? " disabled" : ""}>${ICON_ARROW_UPWARD}</button>
+      <button class="btn mini btn-icon" data-srdown="${i}" title="move down"${i === items.length - 1 || srRank(items[i + 1]) !== srRank(it) ? " disabled" : ""}>${ICON_ARROW_DOWNWARD}</button>
       <button class="btn mini btn-icon btn-x" data-srdel="${i}" title="remove">${ICON_CLOSE}</button>
     </div>`).join("") : `<div class="report-hint">Nothing added yet.</div>`;
   const edit = (name, fn) => list.querySelectorAll(`button[data-${name}]`).forEach(b => b.addEventListener("click", () => {
@@ -702,6 +719,63 @@ async function docxSr() {
   }
 }
 document.getElementById("buildSrBtn").addEventListener("click", openSrTab);
+// For a System Report tab (system.html in an iframe): whether the SR tab is open, and appending to it.
+window.srIsOpen = () => openTabs.some(t => t.key === SR_KEY);
+window.srAppend = srAppend;
+
+// ---- System Report (SY) tabs: one card's Signals drawn as a diagram (system.html) ----
+function systemIdFor(testId) {
+  const id = String(testId || "").trim();
+  return /^tc-/i.test(id) ? "SY-" + id.slice(3) : "SY-" + (id || "000");
+}
+function openSystemTab(testId) {
+  const key = "system-" + testId.replace(/[^A-Za-z0-9._-]/g, "_");
+  if (!openTabs.some(t => t.key === key)) {
+    openTabs.push({key, label: systemIdFor(testId)});
+    const panel = document.createElement("div");
+    panel.className = "test-panel";
+    panel.id = "panel-" + key;
+    panel.innerHTML = `<iframe class="sy-frame" src="/system?card=${encodeURIComponent(testId)}&campaign=${encodeURIComponent(camp.id || "")}"></iframe>`;
+    document.getElementById("panels").appendChild(panel);
+  }
+  switchTab(key);
+}
+window.openSystemTab = openSystemTab;
+// A saved .sys opened as an SY tab: a snapshot of the diagram as exported, not redrawn from the card.
+const importedSystems = {};   // tab key -> the graph from the file
+window.getImportedSystem = key => importedSystems[key] || null;
+document.getElementById("loadSysBtn").addEventListener("click", () => document.getElementById("loadSysFile").click());
+document.getElementById("loadSysFile").addEventListener("change", async e => {
+  const f = e.target.files[0]; e.target.value = "";
+  if (!f) return;
+  const status = document.getElementById("saveStatus");
+  try {
+    const g = JSON.parse(await f.text());
+    if (!g || g.format !== "starfire-system" || !Array.isArray(g.boxes) || !Array.isArray(g.lines)) throw new Error("not a Starfire .sys file");
+    const key = "sysfile-" + (g.system || f.name).replace(/[^A-Za-z0-9._-]/g, "_");
+    importedSystems[key] = g;
+    if (!openTabs.some(t => t.key === key)) {
+      openTabs.push({key, label: g.system || f.name});
+      const panel = document.createElement("div");
+      panel.className = "test-panel";
+      panel.id = "panel-" + key;
+      panel.innerHTML = `<iframe class="sy-frame" src="/system?import=${encodeURIComponent(key)}"></iframe>`;
+      document.getElementById("panels").appendChild(panel);
+    } else {
+      const fr = document.querySelector(`#panel-${CSS.escape(key)} iframe`);
+      try { fr.contentWindow.refresh(); } catch (err) {}
+    }
+    status.textContent = "";
+    switchTab(key);
+  } catch (err) {
+    status.textContent = `Can't open ${f.name}: ${err.message || err}`;
+  }
+});
+// The card as it is in its open tab (unsaved edits included); null if it isn't open, so the System loads the saved file.
+window.getSystemInput = testId => {
+  const frame = document.querySelector(`#panel-${CSS.escape(testId.replace(/[^A-Za-z0-9._-]/g, "_") + ".test")} iframe`);
+  try { return frame && frame.contentWindow.systemInput ? frame.contentWindow.systemInput() : null; } catch (e) { return null; }
+};
 
 // ---- Test Report (TR) tabs: one card's saved .test file, rendered by the server ----
 function reportIdFor(testId) {
@@ -731,6 +805,7 @@ function openReportTab(testId) {
           <button class="btn" data-rrefresh>refresh</button>
           <button class="btn" data-rprint>print / pdf</button>
           <button class="btn" data-rdocx>.docx</button>
+          <button class="btn" data-rsystem title="add this card's System after the test points"${SIGNET_AVAILABLE ? "" : ' style="display:none"'}>+ system</button>
           <button class="btn" data-rappend style="display:none">+ append</button>
         </div>
         <div class="report-hint report-status"></div>
@@ -740,6 +815,14 @@ function openReportTab(testId) {
     panel.querySelector("[data-rrefresh]").addEventListener("click", () => loadReport(key, key.slice(7)));
     panel.querySelector("[data-rprint]").addEventListener("click", () => printReport(key));
     panel.querySelector("[data-rdocx]").addEventListener("click", () => docxReport(key));
+    panel.querySelector("[data-rsystem]").addEventListener("click", () => {
+      const st = reportState[key];
+      if (!st || !st.card) return;
+      const t = reportTicks(st.card);
+      t.system = !t.system;
+      renderReportSide(key);
+      renderReportPreview(key);
+    });
     panel.querySelector("[data-rappend]").addEventListener("click", () => {
       const st = reportState[key];
       if (st && st.card) panel.querySelector(".report-status").textContent = srAppend({type: "report", card: st.card.id});
@@ -779,7 +862,7 @@ function plotColsHtml(st, f, j) {
 
 function reportPayload(key, preview) {
   const st = reportState[key];
-  return {card: st.card, campaign: camp.id || "", files: reportTicks(st.card), preview};
+  return {card: st.card, campaign: camp.id || "", files: reportTicks(st.card), live: camp.live || [], preview};
 }
 
 async function loadReport(key, filename) {
@@ -810,6 +893,9 @@ function renderReportSide(key) {
   if (!st || !st.card || !panel) return;
   panel.querySelector(".report-for").textContent = [reportIdFor(st.card.id), st.card.title, st.card.revision ? "REV " + st.card.revision.toUpperCase() : ""].filter(Boolean).join(" ");
   panel.querySelector(".report-files-title").textContent = "Files for point " + (st.active ?? "");
+  const sysBtn = panel.querySelector("[data-rsystem]");
+  sysBtn.textContent = reportTicks(st.card).system ? "- system" : "+ system";
+  sysBtn.classList.toggle("on", !!reportTicks(st.card).system);
   panel.querySelector(".report-prefix").textContent = `${camp.id || "XX-000"}-${st.card.id}-${st.active}`;
   const files = st.files[st.active] || [];
   const ticked = reportTicks(st.card)[st.active] || [], plotted = reportPlots(st.card)[st.active] || [];
