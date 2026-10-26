@@ -1,14 +1,21 @@
 // tvac.rs:        THERMAL VACUUM PROFILE
 // AUTHOR:         DANIEL DESAI
 // UPDATED:        2026-10-17
-// VERSION:        0.1.0
+// VERSION:        0.2.0
 //
 // Thermal profile visualization and editing tool. Time and temperature vectors, linearly
 // interpolated to represent ramps/plateaus. An accelerated simulation mode (--sim) runs the
 // profile in 30 s.
 //
+// Works on its own or as a Signet module. Run from Signet/Starfire, the optional inputs `time`
+// and `temp` (vector::float, s and C), `baseline` (C), `vacuum` and `ambient` (torr) fill the
+// fields (you still ARM and START), and when the run ends the outputs `time`, `temp` and
+// `pressure` (the setpoint log, vector::float) are written as signals. Run on its own, no
+// signals are read or written.
+//
 // Usage:
-// 1. Build with cargo build --release.
+// 1. Build with cargo build --release. Lives in src/bin/ with signet.rs (the signal helper);
+//    Cargo.toml lists the programs.
 // 2. Copy the binary to the Starfire/dist folder (e.g. mv target/release/tvac ../../../dist/tvac).
 // 3. Run as ./dist/tvac (realtime mode) or ./dist/tvac --sim (accelerated simulation mode),
 //    or as a Starfire module.
@@ -32,6 +39,15 @@
 //    Note pump down/vent are not included in the thermal profile, CSV or PNG.
 
 
+
+#[path = "signet.rs"]
+#[allow(dead_code)] // the helper has more than this module uses
+mod signet; // Signet's signal helper, in src/bin/ beside this file
+
+// Run from Signet or Starfire (outputs are written only then)
+fn under_signet() -> bool {
+    std::env::var_os("SIGNET_MODULE").or_else(|| std::env::var_os("STARFIRE_MODULE")).is_some()
+}
 
 use eframe::egui::{self, Align, Color32, FontId, RichText, Stroke, Vec2};
 use egui_plot::{HLine, HoverPosition, Line, Plot, PlotPoint, PlotPoints, Text, VLine};
@@ -175,6 +191,7 @@ struct App {
     term: Arc<AtomicBool>,
     sim: bool,
     trace: Vec<[f64; 2]>,    // [time_s, temp_C] run so far
+    vac_torr: f64,           // vacuum level of the armed run, for the pressure output
 }
 
 impl App {
@@ -364,6 +381,7 @@ impl App {
         self.trace.clear();
         self.next = Instant::now();
         self.k = Some(0);
+        self.vac_torr = to_torr(p.vac, p.pa);
         println!("# profile t_s={:?} temp_C={:?} vacuum={:.3e} {} ambient={:.3e} {}",
                  p.t, p.temp, p.vac, p.unit(), p.amb, unit_name(p.amb_pa));
         println!("time_s,temp_C,pressure_{}", p.unit());
@@ -378,6 +396,14 @@ impl App {
         set_sp(self.applied.as_ref().map_or(BASELINE, |p| p.temp[0])); // back to baseline
         self.k = None;
         println!("{}", if aborted { "# STOPPED" } else { "# DONE" });
+        if under_signet() && !self.trace.is_empty() {
+            let time: Vec<f64> = self.trace.iter().map(|r| r[0]).collect();
+            let temp: Vec<f64> = self.trace.iter().map(|r| r[1]).collect();
+            let pressure = vec![self.vac_torr; time.len()];
+            signet::put("time", &time, "vector::float");
+            signet::put("temp", &temp, "vector::float");
+            signet::put("pressure", &pressure, "vector::float");
+        }
         EXIT.store(if aborted { 1 } else { 0 }, Ordering::SeqCst);
         self.say(if aborted { "STOPPED" } else { "DONE" }, if aborted { RED } else { GRN });
     }
@@ -592,7 +618,11 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if ui.ctx().input(|i| i.viewport().close_requested()) {
-            self.end(true); // no-op after DONE/STOPPED
+            if self.k.is_none() && !self.over {
+                EXIT.store(0, Ordering::SeqCst); // closed without a run: not an error
+            } else {
+                self.end(true); // no-op after DONE/STOPPED
+            }
         }
         let dropped = ui.ctx().input(|i| i.raw.dropped_files.first().map(|f| f.path().to_path_buf()));
         if let Some(path) = dropped {
@@ -770,16 +800,23 @@ fn main() {
         visuals.window_fill = BG;
         visuals.window_stroke = Stroke::new(1.0, DIM);
         cc.egui_ctx.set_visuals(visuals);
+        // Signet inputs, if connected; any not connected keep the defaults. A wrong type ends the module (exit 2).
+        let num = |n: &str, d: &str| if signet::has(n) { format!("{:e}", signet::get_f64(n)) } else { d.to_string() };
+        let (times, temps) = if signet::has("time") && signet::has("temp") {
+            (join(&signet::get_vec_f64("time")), join(&signet::get_vec_f64("temp")))
+        } else {
+            ("0 6000 24400".into(), "20 40 40".into())
+        };
         Ok(Box::new(App {
-            times: "0 6000 24400".into(),
-            temps: "20 40 40".into(),
+            times,
+            temps,
             add_t: String::new(),
             add_temp: String::new(),
             csv: String::new(),
-            base: "20".into(),
-            vac: "1e-5".into(),
+            base: if signet::has("baseline") { format!("{}", signet::get_f64("baseline")) } else { "20".into() },
+            vac: num("vacuum", "1e-5"),
             pa: false,
-            amb: "760".into(),
+            amb: num("ambient", "760"),
             amb_pa: false,
             applied: None,
             k: None,
@@ -791,6 +828,7 @@ fn main() {
             term,
             sim: std::env::args().any(|a| a == "--sim"),
             trace: Vec::new(),
+            vac_torr: 0.0,
         }))
     }));
     if let Err(e) = result {
