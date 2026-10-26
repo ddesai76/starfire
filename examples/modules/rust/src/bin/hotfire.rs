@@ -1,14 +1,20 @@
 // hotfire.rs:     EXAMPLE TEST MODULE (ELECTRIC PROPULSION HOT FIRE)
 // AUTHOR:         DANIEL DESAI
 // UPDATED:        2026-10-13
-// VERSION:        0.1.0
+// VERSION:        0.2.0
 //
-// Rust (demo) version of hotfire.cpp with GUI. User-selected firing pattern (hex code),
+// Rust version of hotfire.cpp with GUI. User-selected firing pattern (hex code),
 // and burn time. Prints voltage/current/accel as CSV (simulated values).
-// 
+//
+// Works on its own or as a Signet module. Run from Signet/Starfire, the inputs `pattern` (hex)
+// and `burn_time` (s) fill the fields (you still ARM and FIRE), and when the burn ends the
+// outputs `time`, `voltage`, `current` and `accel` are written as vector::float signals.
+// Run on its own, no signals are read or written.
+//
 // Usage:
-// 1. Build with cargo build --release.
-// 2. Copy the binary to the Starfire/dist folder (e.g. mv target/release/hotfire <path>/dist/hotfire). 
+// 1. Build with cargo build --release. Lives in src/bin/ with signet.rs (the signal helper);
+//    Cargo.toml lists the programs.
+// 2. Copy the binary to the Starfire/dist folder (e.g. mv target/release/hotfire ../../../dist/hotfire). 
 //    If there are other binaries with the same name (e.g. generated from hotfire.cpp, save with a different name).
 // 3. Add the hotfire module to the desired test point(s) in Starfire.
 // 4. Press ACTIVATE (lightning bolt) on a test point, select hotfire, and press RUN.
@@ -19,8 +25,17 @@
 // 9. Return to the Starfire test point, and press the download icon below the output.
 // 10. Save the test card.
 // 11. Press BUILD TEST REPORT. Select the .txt output for the test point and press PLOT to add it to the test point.
-// 
+//
 
+
+#[path = "signet.rs"]
+#[allow(dead_code)] // the helper has more than this module uses
+mod signet; // Signet's signal helper, in src/bin/ beside this file
+
+// Run from Signet or Starfire (outputs are written only then)
+fn under_signet() -> bool {
+    std::env::var_os("SIGNET_MODULE").or_else(|| std::env::var_os("STARFIRE_MODULE")).is_some()
+}
 
 use eframe::egui::{self, Align, Color32, Pos2, RichText, Stroke, Vec2};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, Ordering};
@@ -113,6 +128,7 @@ struct App {
     rng: Rng,
     sim: bool,
     hold: Option<Instant>,
+    log: Vec<[f64; 4]>, // time_s, voltage_V, current_uA, accel_um_s2
 }
 
 impl App {
@@ -151,6 +167,7 @@ impl App {
         let i = n * (50.0 + 1.0 * self.rng.jitter()); // random: ~50 uA per thruster, +/-1 uA
         let a = n * (20.0 + 0.5 * self.rng.jitter()); // random: ~20 um/s^2 per thruster, +/-0.5
         println!("{:.1},{:.1},{:.2},{:.2}", k as f64 * SAMPLE_TIME, v, i, a);
+        self.log.push([k as f64 * SAMPLE_TIME, v as f64, i as f64, a as f64]);
         self.say(&format!("FIRING {} / {} s", k + 1, samples), RED);
         self.k = Some(k + 1);
         if k + 1 >= samples {
@@ -176,6 +193,7 @@ impl App {
         };
         set_reg(vals.0); // Device register write
         self.k = Some(0);
+        self.log.clear();
         println!("# fire=0x{:02X} burn_time={:.0} s", vals.0, vals.1);
         println!("time_s,voltage_V,current_uA,accel_um_s2");
         self.tick();
@@ -193,6 +211,12 @@ impl App {
         set_reg(0);
         self.k = None;
         println!("{}", if aborted { "# STOPPED" } else { "# DONE" });
+        if under_signet() && !self.log.is_empty() {
+            for (n, name) in ["time", "voltage", "current", "accel"].iter().enumerate() {
+                let col: Vec<f64> = self.log.iter().map(|r| r[n]).collect();
+                signet::put(name, &col, "vector::float");
+            }
+        }
         EXIT.store(if aborted { 1 } else { 0 }, Ordering::SeqCst);
         self.say(if aborted { "STOPPED" } else { "DONE" }, if aborted { RED } else { GRN });
         self.close_at = Some(Instant::now() + Duration::from_millis(1500));
@@ -328,10 +352,23 @@ fn main() {
         visuals.text_cursor.stroke = Stroke::new(2.0, AMB);
         visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, FG);
         cc.egui_ctx.set_visuals(visuals);
+        // Signet inputs, if connected: pattern (hex 01-FF), burn_time (s). A wrong type ends the module (exit 2).
+        let sel = if signet::has("pattern") {
+            match u8::try_from(signet::get_i64("pattern")) {
+                Ok(v) if v != 0 => v,
+                _ => {
+                    eprintln!("signet: input pattern must be hex::01 to hex::FF");
+                    std::process::exit(2)
+                }
+            }
+        } else {
+            0xFF
+        };
+        let burn = signet::has("burn_time").then(|| signet::get_f64("burn_time"));
         Ok(Box::new(App {
-            code: "0xFF".into(),
-            secs: "300".into(),
-            sel: 0xFF,
+            code: format!("0x{sel:02X}"),
+            secs: burn.map_or("300".into(), |b| format!("{b}")),
+            sel,
             applied: None,
             k: None,
             next: Instant::now(),
@@ -342,6 +379,7 @@ fn main() {
             rng: Rng::new(),
             sim: std::env::args().any(|a| a == "--sim"),
             hold: None,
+            log: Vec::new(),
         }))
     }));
     if let Err(e) = result {
