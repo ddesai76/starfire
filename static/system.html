@@ -1,0 +1,211 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Starfire -- system</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/starfire.css">
+</head>
+<body class="editor-doc system-doc">
+<div id="panels"><div class="panel active split">
+<div class="report-side">
+<div class="side-title"><h1>STARFIRE</h1><div class="sub">System Report</div></div>
+<div class="side-btns">
+  <button class="btn" id="refreshBtn">refresh</button>
+  <button class="btn" id="printBtn">print / pdf</button>
+  <button class="btn" id="pngBtn">export .png</button>
+  <button class="btn" id="sysBtn">export .sys</button>
+  <button class="btn" id="appendBtn" style="display:none">+ append</button>
+</div>
+<div class="sy-legend">
+  <div><i class="box"></i>module not run</div>
+  <div><i class="box ok"></i>last run COMPLETE</div>
+  <div><i class="box failed"></i>last run FAILED or BROKEN</div>
+  <div><i class="amber"></i>signal has data</div>
+  <div><i class="dim"></i>no data yet</div>
+</div>
+<div id="status" class="hint"></div>
+</div>
+<div class="side-main"><div class="side-inner">
+  <div class="side-head" id="title">SYSTEM</div>
+  <div class="side-meta" id="meta"></div>
+  <div id="errors" class="sy-errors"></div>
+  <div class="sy-canvas" id="canvas"></div>
+  <div id="value" class="sy-value" hidden></div>
+  <h2>Connections</h2>
+  <table class="sy-table" id="table"></table>
+  <div id="sigs" class="sy-sigs"></div>
+</div></div>
+</div></div>
+<script>
+const params = new URLSearchParams(location.search);
+let graph = null, values = {};
+
+function esc(s) {
+  return String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// The card as it is in its editor now, and the campaign's live list.
+async function input() {
+  const id = params.get("card") || "";
+  try { if (window.opener && window.opener.systemInput) return window.opener.systemInput(); } catch (e) {}
+  let live = [];
+  try {
+    if (window.parent !== window && window.parent.getSystemInput) {
+      const r = window.parent.getSystemInput(id);
+      if (r) return r;
+      live = window.parent.getCampaignLive();
+    }
+  } catch (e) {}
+  // The card isn't open: the System of its saved file.
+  const res = await fetch("/load?file=" + encodeURIComponent(id.replace(/[^A-Za-z0-9._-]/g, "_") + ".test"));
+  if (!res.ok) throw new Error(`can't open ${id}.test`);
+  return {card: await res.json(), campaign: params.get("campaign") || "", live};
+}
+
+// A System opened from a saved .sys file: the graph as exported, redrawn by the server. Not live.
+const imported = params.get("import");
+
+async function refresh() {
+  const st = document.getElementById("status");
+  st.textContent = "";
+  try {
+    if (imported) {
+      const saved = window.parent.getImportedSystem(imported);
+      if (!saved) throw new Error("the file is no longer open");
+      const res = await fetch("/system_view", {method: "POST", body: JSON.stringify(saved)});
+      graph = await res.json();
+      if (!res.ok) throw new Error(graph.error || res.status);
+      values = {};
+      draw();
+      st.textContent = "Opened from a .sys file: the diagram as it was exported, not updated by later runs.";
+      return;
+    }
+    const inp = await input();
+    const res = await fetch("/system_graph", {method: "POST", body: JSON.stringify(inp)});
+    graph = await res.json();
+    if (!res.ok) throw new Error(graph.error || res.status);
+    values = {};
+    draw();
+    await loadScalars();
+  } catch (err) {
+    st.textContent = `Can't draw the system: ${err.message || err}`;
+  }
+}
+
+function draw() {
+  const g = graph;
+  document.getElementById("title").textContent = `${g.system} | ${g.card}`;
+  document.getElementById("meta").innerHTML =
+    `<span>Campaign <b>${esc(g.campaign)}</b></span><span>Generated <b>${esc(g.generated)}</b></span>`;
+  document.getElementById("errors").innerHTML = g.errors.map(e => `<div>${esc(e)}</div>`).join("");
+  const canvas = document.getElementById("canvas");
+  canvas.innerHTML = g.svg;   // drawn by the server, so reports print the same picture
+  document.getElementById("sigs").innerHTML = g.signals || "";   // the expanded signals, for print
+  canvas.querySelectorAll(".sy-link").forEach(el => el.addEventListener("click", () => showValue(+el.dataset.line)));
+  drawTable();
+}
+
+function drawTable() {
+  const g = graph, byId = Object.fromEntries(g.boxes.map(b => [b.id, b]));
+  const rows = g.lines.map((l, i) => {
+    const to = byId[l.to];
+    const v = values[i] || {};
+    return `<tr data-line="${i}"><td><i class="sy-swatch ${l.color}"></i>${esc(l.source)}</td><td>${esc(to.label)}.${esc(l.to_port)}</td>` +
+           `<td>${esc(l.type || v.type || "")}</td><td>${esc(v.value || "")}</td></tr>`;
+  });
+  const consts = g.boxes.flatMap(b => b.inputs.filter(p => p.const).map(p =>
+    `<tr><td>${esc(p.const)}</td><td>${esc(b.label)}.${esc(p.port)}</td><td></td><td></td></tr>`));
+  document.getElementById("table").innerHTML = rows.length + consts.length
+    ? `<tr><th>Source</th><th>Input</th><th>Type</th><th>Value</th></tr>${rows.join("")}${consts.join("")}` : "";
+  document.querySelectorAll("#table tr[data-line]").forEach(tr => tr.addEventListener("click", () => showValue(+tr.dataset.line)));
+}
+
+// Each .sig source's stored type and value (a scalar's, else [...]), for the table.
+async function loadScalars() {
+  await Promise.all(graph.lines.map(async (l, i) => {
+    if (!l.file || !l.file.endsWith(".sig")) return;
+    try {
+      const r = await (await fetch("/signal_value?file=" + encodeURIComponent(l.file))).json();
+      if (!r.error) values[i] = {type: r.type, value: r.scalar ? r.text : "[...]"};
+    } catch (e) {}
+  }));
+  drawTable();
+}
+
+async function showValue(i) {
+  const l = graph.lines[i], box = document.getElementById("value");
+  document.querySelectorAll(".sy-link.sel").forEach(el => el.classList.remove("sel"));
+  document.querySelector(`.sy-link[data-line="${i}"]`)?.classList.add("sel");
+  box.hidden = false;
+  if (imported) { box.innerHTML = `<div class="sy-value-head">${esc(l.source)}</div><div class="hint">A .sys file holds no values.</div>`; return; }
+  if (!l.file) { box.innerHTML = `<div class="sy-value-head">${esc(l.source)}</div><div class="hint">No value to show.</div>`; return; }
+  if (!l.file.endsWith(".sig")) { box.innerHTML = `<div class="sy-value-head">${esc(l.source)}</div><div>File: ${esc(l.file)}</div>`; return; }
+  try {
+    const r = await (await fetch("/signal_value?file=" + encodeURIComponent(l.file))).json();
+    if (r.error) throw new Error(r.error);
+    box.innerHTML = `<div class="sy-value-head">${esc(l.source)} <span class="hint">${esc(r.type)} | ${esc(r.generated)}</span></div>` +
+                    (r.svg || "") + `<pre>${esc(r.text)}</pre>`;
+  } catch (err) {
+    box.innerHTML = `<div class="sy-value-head">${esc(l.source)}</div><div class="hint">${esc(err.message || err)}</div>`;
+  }
+}
+
+function fileName(ext) { return `${graph.campaign}-${graph.system}.${ext}`; }
+
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// The diagram as a .png: computed styles copied inline, so the picture matches the screen.
+function exportPng() {
+  const svg = document.querySelector("#canvas svg");
+  const copy = svg.cloneNode(true);
+  const src = svg.querySelectorAll("*"), dst = copy.querySelectorAll("*");
+  src.forEach((el, k) => {
+    const cs = getComputedStyle(el);
+    for (const p of ["fill", "stroke", "stroke-width", "stroke-dasharray", "stroke-opacity", "opacity", "font-family", "font-size", "font-weight"]) {
+      dst[k].style.setProperty(p, cs.getPropertyValue(p));
+    }
+  });
+  copy.querySelectorAll(".sy-hit, title").forEach(el => el.remove());
+  const w = +svg.getAttribute("width"), h = +svg.getAttribute("height");
+  const bg = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+  bg.setAttribute("width", w); bg.setAttribute("height", h);
+  bg.setAttribute("fill", getComputedStyle(document.body).backgroundColor);
+  copy.insertBefore(bg, copy.firstChild);
+  const img = new Image();
+  img.onload = () => {
+    const c = document.createElement("canvas");
+    c.width = w * 2; c.height = h * 2;
+    const ctx = c.getContext("2d");
+    ctx.scale(2, 2);
+    ctx.drawImage(img, 0, 0);
+    c.toBlob(b => download(b, fileName("png")), "image/png");
+  };
+  img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(new XMLSerializer().serializeToString(copy));
+}
+
+document.getElementById("refreshBtn").addEventListener("click", refresh);
+document.getElementById("printBtn").addEventListener("click", () => window.print());
+document.getElementById("pngBtn").addEventListener("click", () => graph && exportPng());
+document.getElementById("sysBtn").addEventListener("click", () =>
+  graph && download(new Blob([JSON.stringify(graph, (k, v) => k === "svg" || k === "signals" ? undefined : v, 1) + "\n"],
+                            {type: "application/json"}), fileName("sys")));
+// In a campaign's SY tab: + append adds this System to the campaign report, while its SR tab is open.
+window.setAppendVisible = on => { document.getElementById("appendBtn").style.display = on && !imported ? "" : "none"; };
+try { window.setAppendVisible(!imported && window.parent !== window && window.parent.srIsOpen && window.parent.srIsOpen()); } catch (e) {}
+if (imported) document.getElementById("refreshBtn").style.display = "none";
+document.getElementById("appendBtn").addEventListener("click", () => {
+  if (graph) document.getElementById("status").textContent = window.parent.srAppend({type: "system", card: graph.card});
+});
+refresh();
+</script>
+</body>
+</html>
