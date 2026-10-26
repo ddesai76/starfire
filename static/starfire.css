@@ -1,7 +1,7 @@
 :root {
     --bg:#080908; --panel:#0c0e0c; --hi:#101310;
     --stroke:#243520; --stroke-hi:#405a3a;
-    --nw:#b8ffd0; --yl:#e8c000; --rd:#ff2800; --bl:#0077C8; --ebl:#00A3E0; --amb:#FFB300; --nvg:#39ff14; --magenta:#FD3DB5;
+    --nw:#b8ffd0; --yl:#e8c000; --rd:#ff2800; --bl:#0077C8; --ebl:#00A3E0; --amb:#FFB300; --nvg:#39ff14; --magenta:#FD3DB5; --pu:#B388FF; --ind:#6B7BFF; --gar:#D6455D;
     --dim:#618a6b; --faint:#2e4432;
     --mono: 'B612 Mono', 'SF Mono', Menlo, Consolas, monospace;
   }
@@ -78,11 +78,12 @@
   .pt-measure, .pt-module { margin-top: 20px; box-sizing: border-box; }
   .pt-module label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
   /* A module's text color is its language: green = binary, amber = .py, blue = .jl,
-     white = .sh, red = anything else. Two classes, to beat .editor-doc select/option. */
+     white = .sh, purple = .signet, red = anything else. Two classes, to beat .editor-doc select/option. */
   .editor-doc .mod-bin { color: var(--nvg); }
   .editor-doc .mod-py { color: var(--amb); }
   .editor-doc .mod-jl { color: var(--bl); }
   .editor-doc .mod-sh { color: var(--nw); }
+  .editor-doc .mod-sg { color: var(--pu); }
   .editor-doc .mod-other { color: var(--rd); }
   /* The native dropdown arrow takes the select's text color, so the arrow is
      drawn separately in the normal text color (--nw, #b8ffd0) and only the name is tinted. */
@@ -101,24 +102,37 @@
   .calc-out.arr { font-size: 14px; }
   .calc-out.err { font-size: 13px; color: var(--rd); user-select: text; }
   .send-row { display: flex; gap: 6px; margin-bottom: 8px; }
-  .send-row input { flex: 1; min-width: 0; }
+  .send-row input, .send-row select { flex: 1; min-width: 0; }
   .mod-row { align-items: flex-end; }
   .mod-row > div { flex: 1; min-width: 0; }
   .mod-row input { width: 100%; box-sizing: border-box; }
+  .mod-args { margin: 8px 0; }
+  /* Signals box: coloured copy (.sig-hl) behind a transparent textarea; both must lay text out identically. */
+  .sig-wrap { position: relative; background: var(--panel); border-radius: 6px; }
+  .sig-hl, .editor-doc .sig-wrap textarea { display: block; width: 100%; margin: 0; padding: 5px 7px; border: 1px solid transparent;
+    box-sizing: border-box; font: 13px/normal var(--mono); letter-spacing: normal; tab-size: 8; white-space: pre-wrap;
+    overflow-wrap: break-word; word-break: normal; scrollbar-gutter: stable; }
+  .sig-hl { position: absolute; inset: 0; overflow: hidden; pointer-events: none; color: var(--nw); }
+  .editor-doc .sig-wrap textarea { position: relative; z-index: 1; background: transparent; color: transparent;
+    caret-color: var(--nw); border-color: var(--stroke-hi); }
+  .editor-doc .sig-wrap textarea:focus { border-color: var(--bl); }
+  .sig-wrap textarea::selection { background: rgba(0, 163, 224, .35); }
+  .sig-wrap:has(textarea:disabled) .sig-hl { opacity: .55; }
+  .sg-c { color: var(--dim); } .sg-k { color: var(--pu); } .sg-t { color: var(--ind); }
+  .sg-v { color: var(--ebl); } .sg-g { color: var(--magenta); } .sg-f { color: var(--gar); } .sg-n { color: var(--amb); } .sg-s { color: var(--nvg); }
+  .btn.mini.btn-icon[data-pcopy] { padding: 1px 6px; }
+  .btn[data-pcopy] svg { width: 14px; height: 14px; }
   .send-row .btn.mini { padding: 3px 12px; }
   .panel-actions { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
   .panel-actions .module-status { margin: 0; }
-  .module-status { font-size: 12px; margin-bottom: 6px; overflow-wrap: anywhere; }
-  .module-status.running { color: var(--amb); }
+  .module-status { font-size: 12px; margin-bottom: 6px; overflow-wrap: anywhere; white-space: pre-line; }
+  .module-status.running, .module-status.waiting { color: var(--amb); }
   .module-status.complete { color: var(--nvg); }
   .module-status.failed { color: var(--rd); }
   .module-status.broken { color: var(--nw); }
   .module-output { margin: 0; padding: 6px 8px; max-height: 160px; overflow: auto; font-size: 11px;
                    white-space: pre-wrap; overflow-wrap: anywhere; color: var(--dim);
                    background: var(--panel); border: 1px solid var(--stroke); border-radius: 6px; }
-  .measure-fields { display: grid; grid-template-columns: 1fr; gap: 8px; margin-bottom: 8px; }
-  .measure-fields > div { min-width: 0; }
-  .measure-fields input { box-sizing: border-box; }
   .pt-measure > div { margin-bottom: 8px; }
   .pt-measure label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
   /* table-layout: auto (the default) sizes columns from content's own
@@ -141,13 +155,10 @@
   .measure-table th.blank-th { border: none; background: transparent; }
   /* The measure column is a third of the row, so the delete column needs a
      fixed-ish share to fit its button, and the timestamp cell wraps its "now". */
-  .measure-table col.mt-cmd { width: 24%; }
-  .measure-table col.mt-val { width: 26%; }
-  .measure-table col.mt-ts { width: 38%; }
   .measure-table col.mt-del { width: 12%; }
+  .measure-table col.pr-name { width: 48%; }
+  .measure-table col.pr-val { width: 40%; }
   .measure-table input { width: 100%; box-sizing: border-box; font-size: 11px; padding: 2px 4px; }
-  .measure-ts-cell { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px; }
-  .measure-ts-cell .btn.mini { padding: 1px 4px; font-size: 11px; }
   .cam-preview { width: 100%; max-width: 320px; border: 1px solid var(--stroke-hi); border-radius: 8px;
                  margin-top: 8px; display: block; }
   .pt-images { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
@@ -323,7 +334,6 @@
 .report-doc .rp-q-caution { color: #8a5a00; }
 .report-doc .rp-q-fail { color: #a11a1a; }
 .report-doc .rp-line { font-size: 10pt; margin-bottom: 4px; }
-.report-doc .rp-meas { width: auto; min-width: 50%; margin: 8px 0; }
 .report-doc .rp-imgs { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; }
 .report-doc .rp-img { margin: 8px 0; }
 .report-doc .rp-img img { max-width: 320px; max-height: 240px; border: 1px solid #d5dde3; display: block; }
@@ -392,3 +402,102 @@
 .report-doc.preview .section-text { font-size: 13px; color: var(--nw); }
 @media print { .report-doc .sr-new { break-before: page; } }
 @media print { .report-doc .rp-point { break-inside: avoid; } .report-doc .rp-point.rp-active { background: none; outline: none; } }
+/* System tab: boxes are modules on points, lines are connect()s, colored by the producing run. */
+.sy-canvas { overflow: auto; border: 1px solid var(--stroke); background: var(--panel); margin: 10px 0; }
+.sy-canvas svg { display: block; font-family: var(--mono); }
+.sy-box rect { fill: var(--bg); stroke: var(--bl); stroke-opacity: .55; stroke-width: 1.5; }
+.sy-box.ok rect { stroke: var(--ebl); stroke-opacity: 1; }
+.sy-box.failed rect { stroke: var(--rd); stroke-opacity: 1; }
+.sy-box.dim rect { stroke-dasharray: 4 3; }
+.sy-label { fill: var(--ebl); font-size: 12px; font-weight: 700; }
+.sy-box.dim .sy-label, .sy-box.dim .sy-port-name { fill: var(--dim); }
+.sy-port-name { fill: var(--nw); font-size: 11px; }
+.sy-const { fill: var(--dim); }
+.sy-port { fill: var(--stroke-hi); }
+.sy-line { fill: none; stroke-width: 2; }
+.sy-line.bus { stroke-width: 4; }
+.sy-line.amber { stroke: var(--amb); }
+.sy-line.dim { stroke: var(--amb); opacity: .4; }
+.sy-hit { fill: none; stroke: transparent; stroke-width: 12; }
+.sy-link { cursor: pointer; }
+.sy-link:hover .sy-line, .sy-link.sel .sy-line { stroke-width: 3.5; }
+.sy-errors { color: var(--amb); font-size: 12px; }
+.sy-legend { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--dim); }
+.sy-legend i, .sy-swatch { display: inline-block; width: 22px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 8px; }
+.sy-legend i.amber, .sy-swatch.amber { border-color: var(--amb); }
+.sy-legend i.dim, .sy-swatch.dim { border-color: var(--amb); opacity: .4; }
+.sy-legend i.box { height: 10px; width: 16px; border: 1.5px solid rgb(0 119 200 / .55); border-radius: 3px; margin-left: 3px; margin-right: 11px; }
+.sy-legend i.box.ok { border-color: var(--ebl); }
+.sy-legend i.box.failed { border-color: var(--rd); }
+.sy-value { border: 1px solid var(--stroke); background: var(--panel); padding: 10px; margin-bottom: 14px; }
+.sy-value-head { color: var(--ebl); margin-bottom: 6px; }
+.sy-value pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; margin: 6px 0 0; }
+.sy-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.sy-table th, .sy-table td { border: 1px solid var(--stroke); padding: 4px 6px; text-align: left; overflow-wrap: anywhere; }
+.sy-table th { color: var(--dim); font-weight: 400; }
+.sy-table tr[data-line] { cursor: pointer; }
+.sy-sigs { display: none; }   /* on screen a click on a line shows it; print and reports show them all */
+.sy-sig { margin: 10px 0; break-inside: avoid; }
+.sy-sig-head { font-weight: 700; margin-bottom: 4px; }
+.sy-sig-head span { font-weight: 400; color: var(--dim); }
+.sy-sig pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 8.5pt; margin: 6px 0 0; }
+@media print {
+  .system-doc .report-side, .system-doc .sy-value { display: none; }
+  .system-doc .sy-sigs { display: block; }
+  .system-doc .sy-sig .rp-plot { display: block; width: 100%; max-width: 640px; border: 1px solid #999; background: #fff; }
+  .system-doc .sy-sig .rp-plot line { stroke: #1a1a1a; }
+  .system-doc .sy-sig .rp-plot polyline { fill: none; stroke: #007C28; stroke-width: 2; }
+  .system-doc .sy-sig .rp-plot circle { fill: #007C28; }
+  .system-doc .sy-sig .rp-plot text { font-size: 10px; fill: #1a1a1a; }
+  .system-doc .sy-sig-head, .system-doc .sy-sig pre { color: #000; }
+  .system-doc, .system-doc .side-main { background: #fff; color: #000; overflow: visible; height: auto; }
+  .system-doc .panel.split { height: auto; }
+  .system-doc .side-head { color: #000; }
+  .system-doc .sy-canvas { background: #fff; border-color: #999; overflow: visible; }
+  .system-doc .sy-canvas svg { max-width: 100%; height: auto; }
+  .system-doc .sy-box rect { fill: #fff; stroke: #8fb6d6; stroke-opacity: 1; }
+  .system-doc .sy-box.ok rect { stroke: var(--bl); }
+  .system-doc .sy-box.failed rect { stroke: var(--rd); }
+  .system-doc .sy-label { fill: #000; }
+  .system-doc .sy-port-name { fill: #222; }
+  .system-doc .sy-table th, .system-doc .sy-table td { border-color: #999; color: #000; }
+}
+.live-tick { display: inline-flex; align-items: center; gap: 3px; color: var(--dim); cursor: pointer; }
+.live-tick input { width: auto; margin: 0; accent-color: var(--ebl); }
+.live-tick:has(input:checked) { color: var(--ebl); }
+.sy-value .rp-plot { display: block; width: 100%; max-width: 640px; border: 1px solid var(--stroke); background: var(--bg); }
+.sy-value .rp-plot line { stroke: var(--dim); }
+.sy-value .rp-plot polyline { fill: none; stroke: var(--nvg); stroke-width: 2; }
+.sy-value .rp-plot polyline.s1 { stroke: var(--amb); }
+.sy-value .rp-plot polyline.s2 { stroke: var(--ebl); }
+.sy-value .rp-plot polyline.s3 { stroke: var(--magenta); }
+.sy-value .rp-plot circle { fill: var(--nvg); }
+.sy-value .rp-plot text { font-size: 10px; fill: var(--nw); }
+.sy-value .rp-plot tspan.s0 { fill: var(--nvg); } .sy-value .rp-plot tspan.s1 { fill: var(--amb); }
+.sy-value .rp-plot tspan.s2 { fill: var(--ebl); } .sy-value .rp-plot tspan.s3 { fill: var(--magenta); }
+.report-btns .btn.on { color: var(--nvg); border-color: var(--nvg); }
+/* A System inside a printed Test Report or campaign report (the in-app preview keeps the dark look). */
+.report-doc .sy-report { margin-top: 18px; }
+.report-doc .sy-sig-head span { color: #555; }
+.report-doc:not(.preview) .sy-sig pre { color: #1a1a1a; }
+.report-doc .sy-canvas svg { max-width: 100%; height: auto; }
+.report-doc:not(.preview) .sy-canvas { background: #fff; border-color: #d5dde3; overflow: visible; }
+.report-doc:not(.preview) .sy-box rect { fill: #fff; stroke: #8fb6d6; stroke-opacity: 1; }
+.report-doc:not(.preview) .sy-box.ok rect { stroke: var(--bl); }
+.report-doc:not(.preview) .sy-box.failed rect { stroke: var(--rd); }
+.report-doc:not(.preview) .sy-label { fill: #000; }
+.report-doc:not(.preview) .sy-port-name { fill: #222; }
+.report-doc:not(.preview) .sy-box.dim .sy-label, .report-doc:not(.preview) .sy-box.dim .sy-port-name, .report-doc:not(.preview) .sy-const { fill: #777; }
+.report-doc:not(.preview) .sy-table th, .report-doc:not(.preview) .sy-table td { border-color: #d5dde3; color: #1a1a1a; }
+/* Pinned modules: at the bottom left of the module column, beside BRANCH / EXTEND. */
+.pt-pins { flex: 1; display: flex; gap: 6px; margin-left: calc((100% - 32px) * 2 / 3 + 32px); }
+.btn.mini.pin-btn { box-sizing: border-box; min-width: 30px; height: 30px; padding: 0 4px; font-size: 11px; font-weight: 700; text-transform: none; }
+.pin-btn[data-kind="bin"]:hover, .pin-btn[data-kind="bin"].active { color: var(--nvg); border-color: var(--nvg); }
+.pin-btn[data-kind="py"]:hover, .pin-btn[data-kind="py"].active { color: var(--amb); border-color: var(--amb); }
+.pin-btn[data-kind="jl"]:hover, .pin-btn[data-kind="jl"].active { color: var(--bl); border-color: var(--bl); }
+.pin-btn[data-kind="sh"]:hover, .pin-btn[data-kind="sh"].active { color: var(--nw); border-color: var(--nw); }
+.pin-btn[data-kind="other"]:hover, .pin-btn[data-kind="other"].active { color: var(--rd); border-color: var(--rd); }
+.btn.pin-toggle { margin-right: 4px; }
+.btn.pin-toggle.on { color: var(--amb); border-color: var(--amb); }
+/* Test Report: a point's parameters on one line, wrapping to two at most, then "..." */
+.report-doc .rp-params { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
