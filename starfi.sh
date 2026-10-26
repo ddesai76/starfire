@@ -2,22 +2,22 @@
 #
 # starfi.sh:      BUILD AND RUN LAUNCHER (LINUX)
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-15
-# VERSION:        0.1.0
+# UPDATED:        2026-10-23
+# VERSION:        0.3.0
 
-# Builds the Linux binary <starfire> into a dist/ folder, plus an optional
-# <starfire-hw> (the SCPI interface, from starfire.cpp via g++, skipped otherwise),
-# and/or runs starfire from it.
+# Builds the Linux binary `starfire` (via PyInstaller) into a dist folder, and/or runs it.
+# The default dist folder is dist/.
 #
 # Directory structure (pre-build):
 # ├── starfi.sh
-# ├── starfire.cpp             (optional; builds to starfire-hw)
 # ├── starfire.py              (builds to starfire)
+# ├── signet.py                (optional: Signet, built into starfire; without it Signals are off)
 # └── static
 #     ├── assets
 #     │   └── icon.png          (optional; only for --install-desktop)
 #     ├── campaign.html
 #     ├── starfire.css
+#     ├── system.html
 #     └── test.html
 #
 # Flags:
@@ -37,8 +37,8 @@
 #   * Build as a new dist:                     bash starfi.sh --build --new dist2
 #   * Build and run as a new dist:             bash starfi.sh --all --new dist2
 #
-# Output: a dist folder containing starfire, starfire-hw, and (if placed next
-# to starfi.sh) jira_config.json. Modules already in the dist folder are unaffected, unless --clean removes the folder.
+# Output: a dist folder containing starfire and (if placed next to starfi.sh) jira_config.json.
+# Modules already in the dist folder are unaffected, unless --clean removes the folder.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -107,13 +107,17 @@ if [ "$BUILD" -eq 1 ]; then
   fi
 
   missing=()
-  for f in starfire.py static/starfire.css static/test.html static/campaign.html; do
+  for f in starfire.py static/starfire.css static/test.html static/campaign.html static/system.html; do
     [ -f "$f" ] || missing+=("$f")
   done
   if [ "${#missing[@]}" -gt 0 ]; then
     echo "ERROR: missing required file(s) relative to starfi.sh:" >&2
     printf '  %s\n' "${missing[@]}" >&2
     exit 1
+  fi
+
+  if [ ! -f signet.py ]; then
+    echo "NOTE: no signet.py next to starfi.sh -- building without Signet, so Signals are off." >&2
   fi
 
   if [ "$CLEAN" -eq 1 ]; then
@@ -126,13 +130,6 @@ if [ "$BUILD" -eq 1 ]; then
     echo "Usually means an earlier build ran as a different user (e.g. root)." >&2
     echo "Fix: sudo rm -rf $DIST   (then rebuild)" >&2
     exit 1
-  fi
-
-  HW=1
-  if [ ! -f starfire.cpp ]; then
-    HW=0; HW_NOTE="starfire.cpp not found"
-  elif ! command -v g++ >/dev/null 2>&1; then
-    HW=0; HW_NOTE="g++ not found (Ubuntu: sudo apt install g++)"
   fi
 
   pip install --break-system-packages --quiet pyinstaller python-docx numpy
@@ -148,10 +145,6 @@ if [ "$BUILD" -eq 1 ]; then
     --specpath "$WORKDIR" \
     starfire.py
 
-  if [ "$HW" -eq 1 ]; then
-    g++ -O2 -Wall -Wextra -std=c++17 -o "$DIST/starfire-hw" starfire.cpp
-  fi
-
   # Jira is optional: copied in only if you have a config next to starfi.sh.
   if [ -f jira_config.json ]; then
     cp jira_config.json "$DIST/jira_config.json"
@@ -161,13 +154,7 @@ if [ "$BUILD" -eq 1 ]; then
   fi
 
   echo
-  if [ "$HW" -eq 1 ]; then
-    echo "Built: $DIST/starfire, $DIST/starfire-hw ($JIRA_NOTE)"
-    echo "starfire finds starfire-hw next to itself, so keep the two together."
-  else
-    echo "Built: $DIST/starfire ($JIRA_NOTE)"
-    echo "Skipped starfire-hw: $HW_NOTE. Everything except Measure still works."
-  fi
+  echo "Built: $DIST/starfire ($JIRA_NOTE)"
 
   if [ "$INSTALL" -eq 1 ]; then
     BINARY="$(realpath "$DIST/starfire")"
@@ -175,7 +162,7 @@ if [ "$BUILD" -eq 1 ]; then
     mkdir -p "$RUNDIR"
 
     # Jira reads jira_config.json from the working directory, which for the
-    # menu entry is RUNDIR; starfire-hw is found beside the binary, so stays put.
+    # menu entry is RUNDIR.
     if [ -f "$DIST/jira_config.json" ]; then
       cp "$DIST/jira_config.json" "$RUNDIR/"
       echo "Copied $DIST/jira_config.json -> $RUNDIR/jira_config.json"
@@ -203,7 +190,7 @@ if [ "$BUILD" -eq 1 ]; then
 [Desktop Entry]
 Type=Application
 Name=STARFIRE
-Comment=Test campaign and test card designer with hardware measure/activate
+Comment=Test campaign and test card designer with modules and signals
 Exec=$BINARY
 Path=$RUNDIR
 ${ICON_DEST:+Icon=$ICON_DEST}
