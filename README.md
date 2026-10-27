@@ -108,7 +108,7 @@ The extension decides: a `.py` file runs under `python3` even if it has a differ
 
 | Column | Meaning |
 |:--|:--|
-| **Module** | Picked from a list of the runnable files in `dist/`, which refreshes when you return to the page. The name's color shows its kind: **green** no extension, **amber** `.py`, **blue** `.jl`, **white** `.sh`, **purple** `.signet`, **green** a binary or a source Signet builds, **red** anything else. |
+| **Module** | Picked from a list of the runnable files in `dist/`, which refreshes when you return to the page. The name's color shows its kind: **amber** `.py`, **blue** `.jl`, **white** `.sh`, **purple** `.signet`, **green** a binary (no extension), **magenta** a source Signet builds (`.cpp`, `.rs`, `.adb`, `.f90`), **red** anything else. |
 | **Description** | Optional free text. |
 | **Scope** | Where it may be run. Blank means any test point. `TC-001` means any point on card TC-001. `TC-001-20` means only point 20 on card TC-001. Ids are compared exactly (not as prefixes), ignoring case. |
 | **Pin** | The pin button in the row's last column (amber when on) shows the module as an icon on the points in its scope. A point shows the first 4 pinned modules in its scope; the table warns when more than 4 are pinned. |
@@ -239,6 +239,24 @@ program multiply                          ! multiply.f90
   call signet_put("watts", volts * amps)  ! write one output -> ...-multiply.watts.sig
 end program multiply
 ```
+
+**Example, step by step: `hello.cpp`.** The source goes in `dist/`, next to the `starfire` binary (or beside `starfire.py` when running from source), like any other module.
+
+1. Save this as `dist/hello.cpp` (it needs `g++` installed):
+
+   ```cpp
+   #include <signet.hpp>                     // hello.cpp
+
+   int main() {
+       signet::out("greeting", std::string("Hello, world!"));   // -> ...-hello.greeting.sig
+   }
+   ```
+
+2. Open a test point and pick `hello.cpp` in the **Module** list (reload the page if it isn't there yet).
+3. Press **run**. The first run builds it; later runs reuse the build until the source changes.
+4. `hello.greeting.sig` appears in the point's Signals; tick it **live** to use it in other points.
+
+A build error, or a missing compiler, is shown as the run's error.
 
 To build one yourself, write the helper sources out with `python3 signet.py --export-helpers signet_helpers`, build from outside `dist/` (or the source shows up as a module too), and put the program in `dist/`:
 
