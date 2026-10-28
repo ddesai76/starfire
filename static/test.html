@@ -423,6 +423,258 @@ async function tickLive(p, fn, on) {
   renderPoints();
 }
 
+// Connections between points, from the ports modules declare (signet: in ..., out ...).
+// A connection is code in a Signals box (see connEdit); the checkboxes add and remove the simple lines
+// they recognize (connect, route exit, route merge) and leave any other code alone.
+let portMap = null, portMapTimer = null;
+const connOpen = new Set(), connFilter = new Map();   // which outputs' lists of inputs are open, and their filter text
+async function refreshPortMap() {
+  if (!SIGNET_AVAILABLE) return;
+  try {
+    const r = await fetch("/port_map", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({points: card.points.map(q => ({seq: q.seq, module: (q.module || "").trim(), signals: q.signals || ""}))})});
+    portMap = await r.json();
+  } catch (err) { return; }
+  card.points.forEach((q, i) => {
+    const el = document.getElementById("pt-conn-" + i);
+    if (el && moduleIsOpen(q)) { el.innerHTML = connHtml(i, q); bindConn(i); }
+  });
+}
+function schedulePortMap() { clearTimeout(portMapTimer); portMapTimer = setTimeout(refreshPortMap, 400); }
+
+const RE_SIG_CONNECT = /^(\s*)connect\(\s*([^,()\s]+)\s*,\s*((?:[A-Za-z0-9_-]+\.|\d+:)[A-Za-z_]\w*)\s*\)\s*(#.*)?$/i;   // to module.input or point:input
+const RE_SIG_ROUTE = /^(\s*)route\(\s*([^,()\s]+)\s*,\s*(exit|merge)\s*,\s*\[([^\]]*)\]\s*\)\s*(#.*)?$/i;
+function sigLine(text) {
+  let m = text.match(RE_SIG_CONNECT);
+  if (m) return {kind: "connect", indent: m[1], src: m[2], items: [m[3]], comment: m[4] || ""};
+  m = text.match(RE_SIG_ROUTE);
+  if (m) return {kind: m[3].toLowerCase(), indent: m[1], src: m[2], items: m[4].split(",").map(t => t.trim()).filter(Boolean), comment: m[5] || ""};
+  return null;
+}
+function sigFormat(x) {
+  const stmt = x.kind === "connect" ? `connect(${x.src}, ${x.items[0]})` : `route(${x.src}, ${x.kind}, [${x.items.join(", ")}])`;
+  return x.indent + stmt + (x.comment ? "  " + x.comment : "");
+}
+// The line that delivers input T (a connect or route exit), or -1.
+function sigDelivery(parsed, T) {
+  return parsed.findIndex(x => x && (x.kind === "connect" || x.kind === "exit") && x.items.includes(T));
+}
+// How many lines other than those in `skip` read source `src`.
+function sigUses(parsed, src, skip) {
+  return parsed.filter((x, k) => x && !skip.includes(k) && x.src === src).length;
+}
+// The Signals text with source S connected to input T (same(ref): a ref naming S's output), or null.
+function sigAddLink(text, S, T, same) {
+  const lines = text === "" ? [] : text.split("\n");
+  const parsed = lines.map(sigLine);
+  const d = sigDelivery(parsed, T);
+  if (d < 0) {   // T is free: one more input for a source already here, else a new connect
+    const ex = parsed.findIndex(x => x && x.kind === "exit" && same(x.src));
+    const co = parsed.findIndex(x => x && x.kind === "connect" && same(x.src));
+    if (ex >= 0) { parsed[ex].items.push(T); lines[ex] = sigFormat(parsed[ex]); }
+    else if (co >= 0) { parsed[co].kind = "exit"; parsed[co].items.push(T); lines[co] = sigFormat(parsed[co]); }
+    else return text + (text === "" || text.endsWith("\n") ? "" : "\n") + `connect(${S}, ${T})`;
+    return lines.join("\n");
+  }
+  const head = parsed[d].src;   // T has a source: merge S into it
+  if (same(head)) return text;
+  if (!head.endsWith(".sig") || parsed[d].items.length > 1) return null;   // a merge would change the other inputs too
+  const mi = parsed.findIndex((x, k) => k < d && x && x.kind === "merge" && x.src === head);
+  if (sigUses(parsed, head, [d, mi])) return null;
+  if (mi >= 0) {
+    if (parsed[mi].items.some(same)) return text;
+    parsed[mi].items.push(S);
+    lines[mi] = sigFormat(parsed[mi]);
+  } else {
+    lines.splice(d, 0, sigFormat({kind: "merge", indent: parsed[d].indent, src: head, items: [S], comment: ""}));
+  }
+  return lines.join("\n");
+}
+// The Signals text with the source naming one output (same) taken off input T, or null.
+function sigRemoveLink(text, T, same) {
+  const lines = text.split("\n");
+  const parsed = lines.map(sigLine);
+  const d = sigDelivery(parsed, T);
+  if (d < 0) return null;
+  const x = parsed[d], head = x.src;
+  const mi = parsed.findIndex((y, k) => k < d && y && y.kind === "merge" && y.src === head);
+  const drop = [];
+  if (!same(head)) {   // one of the merged sources
+    if (mi < 0) return null;
+    const j = parsed[mi].items.findIndex(same);
+    if (j < 0) return null;
+    parsed[mi].items.splice(j, 1);
+    if (parsed[mi].items.length) lines[mi] = sigFormat(parsed[mi]); else drop.push(mi);
+  } else if (mi >= 0) {   // the first of merged sources: the next one leads
+    if (x.kind !== "connect" || sigUses(parsed, head, [d, mi])) return null;
+    const [next, ...rest] = parsed[mi].items;
+    if (!next.endsWith(".sig")) return null;
+    x.src = next; lines[d] = sigFormat(x);
+    if (rest.length) { parsed[mi].src = next; parsed[mi].items = rest; lines[mi] = sigFormat(parsed[mi]); } else drop.push(mi);
+  } else if (x.kind === "connect") {
+    drop.push(d);
+  } else {
+    x.items = x.items.filter(t => t !== T);
+    if (x.items.length === 1) x.kind = "connect";
+    lines[d] = sigFormat(x);
+  }
+  return lines.filter((_, k) => !drop.includes(k)).join("\n");
+}
+
+function portWords(w) { return (w || []).join("::"); }
+function connHtml(i, p) {
+  if (!SIGNET_AVAILABLE || !pointCampaign()) return "";
+  const m = portMap;
+  if (!m) { schedulePortMap(); return ""; }
+  const row = (m.points || []).find(r => r.seq === String(p.seq));
+  if (!row || !row.module) return "";
+  if (row.error) return `<label>Ports</label><div class="module-status failed">${esc(row.error)}</div>`;
+  const ins = Object.entries((row.ports || {}).in || {}), outs = Object.entries((row.ports || {}).out || {});
+  if (!ins.length && !outs.length)
+    return `<label>Ports</label><div class="conn-none">${esc(row.module)} declares no ports: a <code>signet: in …, out …</code> comment line in it lists them here.</div>`;
+  const links = m.links || [];
+  const inRows = ins.map(([n, w]) => {
+    const from = links.filter(l => l.dst === row.seq && l.input === n);
+    const srcs = from.map(l => `<span class="${l.bad ? "st-bad" : "st-on"}"${l.bad ? ` title="${esc(l.bad)}"` : ""}>${esc(l.src)}:${esc(l.out)}</span>`);
+    return `<div class="conn-row"><span class="conn-port">in ${esc(n)}</span><span class="conn-type">${esc(portWords(w))}</span>
+      <span class="conn-to">${from.length ? "← " + srcs.join(", ") : "not connected"}</span></div>`;
+  });
+  const outRows = outs.map(([o, w]) => {
+    const targets = (m.pairs || []).filter(q => q.src === row.seq && q.out === o).map(q => [q.dst, q.input, q]);
+    links.filter(l => l.src === row.seq && l.out === o && !targets.some(t => t[0] === l.dst && t[1] === l.input)).forEach(l => targets.push([l.dst, l.input, null]));
+    const cells = targets.map(([dst, inp, q]) => {
+      const link = links.find(l => l.src === row.seq && l.out === o && l.dst === dst && l.input === inp), on = !!link;
+      const bad = (link && link.bad) || "", why = connBlocked(row, o, dst, inp, q, on);
+      const drow = m.points.find(r => r.seq === dst) || {};
+      const box = (text) => `<label class="conn-box${on ? " on" : ""}${bad ? " bad" : ""}${why ? " off" : ""}" title="${esc(bad || why || `point ${dst}: ${drow.stem}.${inp}`)}"><input type="checkbox" data-conn="${esc(JSON.stringify([o, dst, inp]))}"${on ? " checked" : ""}${why ? " disabled" : ""}>${esc(text)}</label>`;
+      return {on, dst, inp, stem: drow.stem || "", html: box(on ? `${dst}:${inp}` : inp)};
+    });
+    // Connected targets stay on the row; the rest are behind a button, grouped by point, so the row stays short
+    const key = `${row.seq}:${o}`, rest = cells.filter(c => !c.on), open = connOpen.has(key);
+    let menu = "";
+    if (open && rest.length) {
+      const groups = [...new Set(rest.map(c => c.dst))].map(d => {
+        const g = rest.filter(c => c.dst === d);
+        return `<div class="conn-grp"><span class="conn-grp-name">${esc(d)}${g[0].stem ? " " + esc(g[0].stem) : ""}</span>${g.map(c => c.html).join("")}</div>`;
+      });
+      menu = `<div class="conn-menu">${rest.length > 10 ? `<input class="conn-filter" data-connfilter="${esc(key)}" placeholder="filter" spellcheck="false" value="${esc(connFilter.get(key) || "")}">` : ""}${groups.join("")}</div>`;
+    }
+    const more = rest.length ? `<button class="btn mini conn-more" data-connopen="${esc(key)}" title="${open ? "hide" : "show"} the ${rest.length} inputs this can connect to">${open ? "−" : "+"} ${rest.length}</button>` : "";
+    return `<div class="conn-row"><span class="conn-port">out ${esc(o)}</span><span class="conn-type">${esc(portWords(w))}</span>
+      <span class="conn-to">${cells.length ? "→ " + cells.filter(c => c.on).map(c => c.html).join("") + more : `<span class="st-warn">no later input takes it</span>`}</span></div>${menu}`;
+  });
+  // connections written in code to a port that isn't declared: shown where the missing port belongs
+  const declared = (r, way, n) => !!((r.ports || {})[way] || {})[n];
+  const strays = links.filter(l => {
+    if (!l.bad) return false;
+    const srcMissing = !!connRow(l.src).ports && !declared(connRow(l.src), "out", l.out);
+    return l.src === row.seq ? srcMissing : l.dst === row.seq && !srcMissing && !declared(row, "in", l.input);
+  }).map(l => `<div class="conn-row"><span class="st-bad">${esc(l.src)}:${esc(l.out)} → ${esc(l.dst)}:${esc(l.input)}: ${esc(l.bad)}</span></div>`);
+  return `<label>Ports</label>${inRows.join("")}${outRows.join("")}${strays.join("")}`;
+}
+function connRef(row, out) { return `${row.seq}:${row.stem}.${out}.sig`; }
+function connSame(row, out) {
+  return ref => { const m = ref.match(/^(?:(\d+):)?([A-Za-z0-9_-]+)\.([A-Za-z_]\w*)\.sig$/); return !!m && (m[1] === undefined || m[1] === row.seq) && m[2] === row.stem && m[3] === out; };
+}
+function connPoint(seq) { return card.points.find(x => String(x.seq) === String(seq)); }
+function connRow(seq) { return (portMap.points || []).find(r => r.seq === String(seq)) || {}; }
+function connParsed(q) { return (q.signals || "").split("\n").map(sigLine); }
+// The line feeding input `inp` of point drow: {seq, T} (whose box, and the input as written there),
+// {many: true} if several boxes feed it, or null.
+function connFeed(drow, inp) {
+  const B = connPoint(drow.seq), T1 = `${drow.stem}.${inp}`, T2 = `${drow.seq}:${inp}`;
+  if (B && sigDelivery(connParsed(B), T1) >= 0) return {seq: drow.seq, T: T1};
+  const hits = card.points.filter(x => x !== B && !connRow(x.seq).sequence && sigDelivery(connParsed(x), T2) >= 0);
+  return hits.length === 1 ? {seq: String(hits[0].seq), T: T2} : hits.length ? {many: true} : null;
+}
+// The Signals boxes to change to connect (on) or disconnect row's output and drow's input: {seq: text},
+// or a reason the checkboxes can't. A new connection goes in the source's box, connect(10:psu.volts.sig, 20:volts),
+// or joins its route exit; a second source moves the input to the receiving box as a route merge.
+function connEdit(row, out, drow, inp, on) {
+  const same = connSame(row, out), S = connRef(row, out), T1 = `${drow.stem}.${inp}`, T2 = `${drow.seq}:${inp}`;
+  const feed = connFeed(drow, inp), A = connPoint(row.seq), B = connPoint(drow.seq);
+  const hand = seq => `set by code in point ${seq}'s Signals box this can't change: edit it there`;
+  if (feed && feed.many) return `${T2} is fed from several Signals boxes: edit them by hand`;
+  if (!on) {
+    if (!feed) return hand(drow.seq);
+    const t = sigRemoveLink(connPoint(feed.seq).signals || "", feed.T, same);
+    return t === null ? hand(feed.seq) : {[feed.seq]: t};
+  }
+  if (!feed) {   // a free input
+    if (row.sequence) return `point ${row.seq}'s Signals box is a sequence: connect it there by hand`;
+    const t = sigAddLink(A.signals || "", S, T2, same);
+    return t === null ? hand(row.seq) : {[row.seq]: t};
+  }
+  if (feed.seq === drow.seq) {   // fed from the receiving box: merge there
+    const t = sigAddLink(B.signals || "", S, T1, same);
+    return t === null ? hand(drow.seq) : {[drow.seq]: t};
+  }
+  // fed from another point's box: the input moves to the receiving box, as a merge
+  const X = connPoint(feed.seq), parsed = connParsed(X), d = sigDelivery(parsed, T2), head = parsed[d].src;
+  if (same(head)) return {};
+  if (!head.endsWith(".sig") || parsed.some((y, k) => k < d && y && y.kind === "merge" && y.src === head)) return hand(feed.seq);
+  const tx = sigRemoveLink(X.signals || "", T2, ref => ref === head);
+  if (tx === null) return hand(feed.seq);
+  const tb = B.signals || "";
+  return {[feed.seq]: tx, [drow.seq]: tb + (tb === "" || tb.endsWith("\n") ? "" : "\n") + `route(${head}, merge, [${S}])\nconnect(${head}, ${T1})`};
+}
+// Why a checkbox can't be changed, or "".
+function connBlocked(row, out, dst, inp, pair, on) {
+  const drow = connRow(dst);
+  if (!connPoint(dst) || !drow.seq) return "no such point";
+  if (!on) {   // ticking it: the ports must allow it
+    const others = (portMap.links || []).filter(l => l.dst === dst && l.input === inp).length;
+    if (!pair) return "the ports don't match";
+    if (others && !pair.merge) return `${dst}:${inp} already has a source, and its type takes only one`;
+    if (!others && !pair.fits && !pair.merge) return "the types don't match";   // merge: the first of several merged into it
+  }
+  const e = connEdit(row, out, drow, inp, !on);
+  if (typeof e === "string") return e;
+  const locked = Object.keys(e).find(seq => connPoint(seq).locked);
+  return locked ? `point ${locked} is locked` : "";
+}
+function bindConn(i) {
+  const root = document.getElementById("pt-conn-" + i);
+  if (!root) return;
+  const p = card.points[i];
+  const refilter = () => root.querySelectorAll("input[data-connfilter]").forEach(f => {
+    const q = f.value.trim().toLowerCase();
+    f.closest(".conn-menu").querySelectorAll(".conn-grp").forEach(g => {
+      let any = false;
+      g.querySelectorAll(".conn-box").forEach(b => { const hit = !q || (g.querySelector(".conn-grp-name").textContent + " " + b.textContent).toLowerCase().includes(q); b.hidden = !hit; any = any || hit; });
+      g.hidden = !any;
+    });
+  });
+  refilter();
+  root.querySelectorAll("input[data-connfilter]").forEach(f => f.addEventListener("input", () => { connFilter.set(f.dataset.connfilter, f.value); refilter(); }));
+  root.querySelectorAll("button[data-connopen]").forEach(b => b.addEventListener("click", () => {
+    const k = b.dataset.connopen;
+    if (connOpen.has(k)) connOpen.delete(k); else connOpen.add(k);
+    root.innerHTML = connHtml(i, p);
+    bindConn(i);
+  }));
+  root.querySelectorAll("input[data-conn]").forEach(cb => cb.addEventListener("change", () => {
+    const [out, dst, inp] = JSON.parse(cb.dataset.conn);
+    const row = connRow(p.seq), e = connEdit(row, out, connRow(dst), inp, cb.checked);
+    if (typeof e === "string") { cb.checked = !cb.checked; return; }
+    Object.entries(e).forEach(([seq, text]) => { const q = connPoint(seq); q.signals = text; refreshModulePanel(q); });
+    if (cb.checked) {   // a source that has run already goes live now; one that hasn't, when its run stamps it
+      const fn = (p.files || []).find(n => n.endsWith(`-${row.seq}-${row.stem}.${out}.sig`));
+      if (fn && !isLive(p, fn)) tickLive(p, fn, true);
+    }
+    refreshPortMap();
+  }));
+}
+// After a run: the stamped outputs a later point is connected to go live.
+function liveConnected(p, stamped) {
+  const row = portMap && (portMap.points || []).find(r => r.seq === String(p.seq));
+  if (!row) return;
+  (portMap.links || []).filter(l => l.src === row.seq).forEach(l => {
+    const fn = stamped.find(n => n.endsWith(`-${row.seq}-${row.stem}.${l.out}.sig`));
+    if (fn && !isLive(p, fn)) setLive(p, fn, true);
+  });
+}
+
 function modulesFor(p) {
   return campaignModules().filter(m => (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module);
 }
@@ -455,7 +707,8 @@ function modulePanelHtml(i, p) {
     </div>
     <div class="mod-args"><label>Arguments</label>
     <textarea data-modargs="${i}" rows="${Math.min(10, Math.max(3, (p.args || "").split("\n").length))}" spellcheck="false" style="resize:vertical"${p.locked ? " readonly" : ""} title="one or more lines; # starts a comment line; \\ at end of line continues it">${esc(p.args || "")}</textarea></div>
-    ${SIGNET_AVAILABLE ? `<div class="mod-args"><label>Signals</label>
+    ${SIGNET_AVAILABLE ? `<div class="mod-conn" id="pt-conn-${i}">${connHtml(i, p)}</div>
+    <div class="mod-args"><label>Signals</label>
     <div class="sig-wrap"><pre class="sig-hl" aria-hidden="true">${sigHtml(p.signals || "")}</pre>
     <textarea data-modsig="${i}" rows="${Math.min(14, Math.max(3, (p.signals || "").split("\n").length))}" spellcheck="false" style="resize:vertical"${p.locked || !pointCampaign() ? " disabled" : ""} title="${pointCampaign() ? "Signet code, run before the module: connect(source, module.input); see README.md" : "Signals need a campaign"}">${esc(p.signals || "")}</textarea></div></div>` : ""}
     <div class="module-status failed">${esc(st.fileMsg || "")}</div>
@@ -468,11 +721,11 @@ function modulePanelHtml(i, p) {
 }
 
 // Pinned modules (the campaign's Modules table): up to 4 in this point's scope, shown while the module column is open.
-const SOURCE_EXT = /^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i;   // sources Signet builds: shown as binaries
+const SOURCE_EXT = /^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i;   // sources Signet builds
 function moduleKind(name) {
   const dot = (name || "").lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot) : "";
-  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (SOURCE_EXT.test(ext) ? "bin" : "other");
+  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (SOURCE_EXT.test(ext) ? "src" : "other");
 }
 function pinnedFor(p) {
   return campaignModules().filter(m => m.pinned && (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module).slice(0, 4);
@@ -544,13 +797,13 @@ function bindModulePanel(i) {
   if (!root) return;
   const p = card.points[i];
   const inp = root.querySelector("input[data-modname]");
-  if (inp) inp.addEventListener("input", () => { if (!p.locked) p.module = inp.value; });
+  if (inp) inp.addEventListener("input", () => { if (!p.locked) p.module = inp.value; schedulePortMap(); });
   const argsInp = root.querySelector("textarea[data-modargs]");
   if (argsInp) argsInp.addEventListener("input", () => { if (!p.locked) p.args = argsInp.value; });
   const sigInp = root.querySelector("textarea[data-modsig]");
   if (sigInp) {
     const hl = sigInp.parentElement.querySelector(".sig-hl");
-    sigInp.addEventListener("input", () => { if (!p.locked) p.signals = sigInp.value; hl.innerHTML = sigHtml(sigInp.value); sigSync(sigInp, hl); });
+    sigInp.addEventListener("input", () => { if (!p.locked) p.signals = sigInp.value; hl.innerHTML = sigHtml(sigInp.value); sigSync(sigInp, hl); schedulePortMap(); });
     sigInp.addEventListener("scroll", () => sigSync(sigInp, hl));
     new ResizeObserver(() => sigSync(sigInp, hl)).observe(sigInp);
   }
@@ -585,6 +838,7 @@ function bindModulePanel(i) {
   };
   if (send) send.addEventListener("click", answer);
   if (ans) ans.addEventListener("keydown", e => { if (e.key === "Enter") answer(); });
+  bindConn(i);
 }
 
 // Redraws just this point's module panel (not the whole list) so a run
@@ -805,6 +1059,7 @@ function applyRunResult(p, name, r) {
     p.files = (p.files || []).filter(n => !sig.deleted.includes(n));
     sig.deleted.forEach(n => setLive(p, n, false));
   }
+  if ((sig.stamped || []).length) liveConnected(p, sig.stamped);
   (p.runs ||= {})[name.replace(/\.[^.]*$/, "")] = st.status;
   st.card = r.card || "";   // a test card the run printed: saved for BRANCH / EXTEND
   if (st.card) savePointFile(p, "test", st.card).then(msg => { st.text += ` | ${msg}`; refreshModulePanel(p); });
@@ -1261,6 +1516,7 @@ function normalizeCard(c) {
 }
 function loadCardIntoUI(c) {
   card = normalizeCard(c);
+  portMap = null;
   bindMeta(); renderPoints(); renderNomenclature(); renderReferences();
   renderTextList("notesList", "notes"); renderTextList("warningsList", "warnings");
 }
