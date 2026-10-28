@@ -10,6 +10,7 @@
 # Arguments: --window samples  --hop samples  (optional)
 
 using Signet: signals, series
+# signet: in series::signal_in, out series::spectrum, out series::ridge
 
 function arg(name, default)
     i = findfirst(==("--$name"), ARGS)
