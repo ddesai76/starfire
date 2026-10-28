@@ -2,8 +2,8 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-24
-# VERSION:        4.0.0
+# UPDATED:        2026-10-27
+# VERSION:        4.0.1
 #
 
 """
@@ -1802,6 +1802,111 @@ def _static_resolve(text: str, card_id: str, index: list):
         return f"can't read {text}"
 
 
+# Port map: each point's declared ports and the point-to-point connections in the Signals boxes,
+# for the connection checkboxes on the test page (see README.md, Connecting points)
+_POINT_SIG = re.compile(r"^(?:(\d+):)?([A-Za-z0-9_-]+)\.([A-Za-z_][A-Za-z0-9_]*)\.sig$")
+
+
+def _connectable(src, dst) -> bool:
+    """Whether an output declared `src` can be an input declared `dst`'s one source: signet's check, and a
+    vector or series only to its own kind (signet lets a single value into a vector input)."""
+    if src and dst and ({src[0], dst[0]} & {"vector", "series"}) and src[0] != dst[0]:
+        return False
+    return signet._fits(src, dst)
+
+
+def _mergeable(src, dst) -> bool:
+    """Whether an output declared `src` can be one of several merged into an input declared `dst`."""
+    if not dst:
+        return True
+    if dst[0] == "vector":
+        return signet._fits(src, dst[1:]) or signet._fits(src, dst)
+    return dst[0] == "series" and src == dst
+
+
+def _ref_point(text, rows, i):
+    """(seq, output) of an earlier point on the card that a ref like 10:psu.volts.sig names, or None."""
+    m = _POINT_SIG.match(text)
+    if not m:
+        return None
+    seq, stem, port = m.groups()
+    hits = [r for r in rows[:i] if r["stem"] == stem and (seq is None or r["seq"] == seq)]
+    return (hits[0]["seq"], port) if len(hits) == 1 else None
+
+
+def port_map(points) -> dict:
+    """points: the card's points in order, [{seq, module, signals}]. {"points": [{seq, module, stem, ports, error,
+    sequence}], "links": [{src, out, dst, input, box, line, bad}], "pairs": [{src, out, dst, input, fits, merge}]}: links
+    are the connections from earlier points the Signals boxes make now (box: whose code), pairs the ones the
+    declared ports allow."""
+    if not signet:
+        return {"points": [], "links": [], "pairs": [], "error": _NO_SIGNET}
+    pts = [p for p in points or [] if isinstance(p, dict)]
+    rows = []
+    for p in pts:
+        name = str(p.get("module") or "").strip()
+        row = {"seq": str(p.get("seq")), "module": name, "stem": os.path.splitext(name)[0], "ports": None, "error": "",
+               "sequence": False}
+        if name:
+            try:
+                row["ports"] = _ports_lookup([name])(row["stem"])
+            except ValueError as e:
+                row["error"] = str(e)
+        rows.append(row)
+    links, where = [], {r["seq"]: k for k, r in enumerate(rows)}
+    for i, (r, p) in enumerate(zip(rows, pts)):
+        code = str(p.get("signals") or "")
+        if not code.strip():
+            continue
+        try:
+            r["sequence"] = signet.is_sequence(code)
+            conns = signet.connections(code, points=True)
+            merged = {nd[3][1]: [nd[3][1]] + [e[1] for e in nd[4] if e[0] == "ref"]
+                      for nd in signet._walk(signet.parse_signals(code)) if nd[0] == "route" and nd[2] == "merge"}
+        except ValueError:
+            continue    # the run reports it
+        for c in conns:
+            if c["module"]:            # this point's own module, connect(x, multiply.volts)
+                j = i if c["module"] == r["stem"] else None
+            else:                      # another point's, connect(x, 20:volts): a sequence's go through its run()
+                j = None if r["sequence"] else where.get(c["point"])
+            if j is None:
+                continue
+            for ref in c["refs"]:
+                for text in merged.get(ref, [ref]):
+                    src = _ref_point(text, rows, j)
+                    link = src and {"src": src[0], "out": src[1], "dst": rows[j]["seq"], "input": c["port"],
+                                    "box": r["seq"], "line": c["line"]}
+                    if link and link not in links:
+                        links.append(link)
+    for l in links:       # a connection the declared ports don't allow (written in Signet code, not by the page)
+        a, b = rows[where[l["src"]]], rows[where[l["dst"]]]
+        outs, ins = (a["ports"] or {}).get("out"), (b["ports"] or {}).get("in")
+        l["bad"] = ""
+        if a["ports"] and l["out"] not in (outs or {}):
+            l["bad"] = f"{a['module']} has no output {l['out']}"
+        elif b["ports"] and l["input"] not in (ins or {}):
+            l["bad"] = f"{b['module']} has no input {l['input']}"
+        elif outs and ins:
+            ow, nw = outs[l["out"]], ins[l["input"]]
+            n = sum(1 for k in links if k["dst"] == l["dst"] and k["input"] == l["input"])
+            if not (signet._fits(ow, nw) or _mergeable(ow, nw)):
+                l["bad"] = f"{l['src']}:{l['out']} is {'::'.join(ow)}, but {l['dst']}:{l['input']} takes {'::'.join(nw)}"
+            elif n > 1 and (not nw or nw[0] not in ("vector", "series")):
+                l["bad"] = f"{l['dst']}:{l['input']} takes one source, not {n}"
+    pairs = []
+    for i, a in enumerate(rows):
+        for o, ow in ((a["ports"] or {}).get("out") or {}).items():
+            for b in rows[i + 1:]:
+                if not signet.STEM.match(b["stem"]):
+                    continue
+                for n, nw in ((b["ports"] or {}).get("in") or {}).items():
+                    f, m = _connectable(ow, nw), _mergeable(ow, nw)
+                    if f or m:
+                        pairs.append({"src": a["seq"], "out": o, "dst": b["seq"], "input": n, "fits": f, "merge": m})
+    return {"points": rows, "links": links, "pairs": pairs}
+
+
 def system_graph(card: dict, campaign_id: str, live) -> dict:
     """A card's System as it is now: boxes (modules on points, sources on other cards, live files,
     multiplex buses) and one line per source of every connect() in its Signet code. A box is
@@ -1863,13 +1968,19 @@ def system_graph(card: dict, campaign_id: str, live) -> dict:
         if not code.strip():
             continue
         try:
-            conns = signet.connections(code)
+            conns = signet.connections(code, points=not signet.is_sequence(code))   # a sequence's go through run()
         except ValueError as e:
             errors += [f"point {seq}: {ln}" for ln in str(e).splitlines()]
             continue
         def yield_connect(cn):
             line_no, words, stem, inp = cn["line"], cn["types"], cn["module"], cn["port"]
-            dst = box(("m", seq, stem), kind="module", point=seq, module=stem, label=f"{seq}:{stem}")
+            dseq = seq
+            if not stem:    # aimed at another point: connect(x, 20:volts)
+                dseq = cn["point"]
+                stem = os.path.splitext(str((points.get(dseq) or {}).get("module") or "").strip())[0]
+                if not stem:
+                    return
+            dst = box(("m", dseq, stem), kind="module", point=dseq, module=stem, label=f"{dseq}:{stem}")
             refs, consts, buses = cn["refs"], cn["constants"], cn["buses"]
             ip = port(dst["inputs"], inp)
             if consts and not refs and not buses:
@@ -2197,6 +2308,70 @@ def _point_files_state(campaign_id: str, card_id: str, point_seq) -> dict:
     return state
 
 
+def _ports_lookup(modules=None):
+    """signet.check_wiring's ports(module): None if no registered module has that stem, else the ports its
+    file declares ({} if none; text files under 1 MB only). A bad declaration raises ValueError."""
+    names = {os.path.splitext(m)[0]: m for m in (modules if modules is not None else list_modules())}
+    runnable = set(list_modules())
+
+    def ports(stem):
+        name = names.get(stem)
+        if name is None or name not in runnable:
+            return None
+        path = os.path.join(_modules_dir(), name)
+        try:
+            if os.path.getsize(path) > 1_000_000:
+                return {}
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError):
+            return {}
+        try:
+            return signet.read_ports(text) or {}
+        except ValueError as e:
+            raise ValueError(f"{name}: {e}")
+    return ports
+
+
+def _wiring_errors(code, modules, live):
+    """Raises ValueError listing the direction and port errors in a Signals box (see signet.check_wiring)."""
+    if not signet or not str(code or "").strip():
+        return
+    plain = lambda t: os.path.isfile(t) or any(os.path.basename(str(x.get("file", ""))) == t for x in live or [])
+    errs = signet.check_wiring(str(code), _ports_lookup(modules), plain)
+    if errs:
+        raise ValueError("\n".join(errs))
+
+
+def _delivered(point_seq, card_id, campaign_id, live, points) -> dict:
+    """{port: (point, input)} that other points' Signals boxes deliver to this point (connect(x, 20:volts),
+    route exit), read now. A sequence's box delivers through its run(), so it is left out here."""
+    get = getattr(signet, "deliveries", None)
+    out = {}
+    if not get or not isinstance(points, dict):
+        return out
+    me = str(point_seq)
+    for seq, info in points.items():
+        code = str((info or {}).get("signals") or "") if isinstance(info, dict) else ""
+        if str(seq) == me or not code.strip() or signet.is_sequence(code):
+            continue
+        try:
+            if not any(c["point"] in (me, "expr") for c in signet.connections(code, points=True) if not c["module"]):
+                continue
+        except ValueError:
+            continue            # that point's own run reports its bad code
+        try:
+            host = _PointHost(card_id, campaign_id, live, _parse_params(info.get("params") or []), points)
+            got = get(code, me, host)
+        except ValueError as e:
+            raise ValueError(f"point {seq}'s Signals: {e}")
+        for port, v in got.items():
+            if port in out:
+                raise ValueError(f"{port} is set by both point {out[port][0]}'s Signals and point {seq}'s")
+            out[port] = (str(seq), v)
+    return out
+
+
 def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: str = "", args="", params=None,
                signals="", live=None, modules=None, held=None, points=None) -> dict:
     """Run one module from dist/ and wait for it. The name must be a bare
@@ -2237,12 +2412,23 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         return {"status": "failed", "error": f"{_NO_SIGNET}; clear the Signals box to run without it", "output": "", "files": []}
     host = _PointHost(card_id, campaign_id, live, param_items, points)
     host.point = str(point_seq)
+    decl = None
     try:
+        _wiring_errors(signals, modules, live)
         inputs = signet.evaluate(signals, stem, host, modules) if str(signals or "").strip() else {}
         for port in held or {}:
             if port in inputs:
                 raise ValueError(f"{port} is set by both the sequence and this point's own Signals")
         inputs.update(held or {})
+        for port, (src, v) in _delivered(point_seq, card_id, campaign_id, live, points).items():
+            if port in inputs:
+                raise ValueError(f"{port} is set by both point {src}'s Signals and this point's")
+            inputs[port] = v
+        if signet:
+            decl = _ports_lookup(modules)(stem)
+            errs = signet.contract_errors(stem, decl, inputs=inputs)
+            if errs:
+                raise ValueError("; ".join(errs))
     except (signet.Break if signet else ()) as e:
         return {"status": "broken", "error": str(e), "output": "".join(ln + "\n" for ln in host.lines), "files": []}
     except ValueError as e:
@@ -2323,6 +2509,12 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         "output": _cap_lines(out),
         "files": sorted(n for n, st in _point_files_state(campaign_id, card_id, point_seq).items() if before.get(n) != st),
     }
+    if status == "complete" and signet and decl:
+        pre = f"{_point_prefix(campaign_id, card_id)}-{point_seq}-"
+        errs = signet.contract_errors(stem, decl, written=[n[len(pre):] for n in result["files"] if n.startswith(pre) and n.endswith(".sig")])
+        if errs:
+            status = result["status"] = "failed"
+            result["error"] = "; ".join(errs)
     if status == "complete" and signet and signet.STEM.match(stem):
         sig = signet.stamp(f"{_point_prefix(campaign_id, card_id)}-{point_seq}", stem, result["files"],
                            f"{campaign_id or 'XX-000'}:{card_id}-{point_seq}:")
@@ -2586,6 +2778,7 @@ def start_run(name, card_id="", point_seq="", campaign_id="", args="", params=No
         if name not in list_modules():
             return fail(f"{name!r} is not a runnable file in dist/")
         try:
+            _wiring_errors(code, modules, live)
             runner = _SeqRunner(code, key, os.path.splitext(str(name))[0], campaign_id, live,
                                 _parse_params(params), points if isinstance(points, dict) else {})
         except ValueError as e:
@@ -3194,6 +3387,9 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/point_signals":
             self._send_json(200, point_signals(data.get("card") or {}, str(data.get("campaign") or ""),
                                                data.get("point"), data.get("live") or []))
+        # Connection checkboxes: {"points": [{seq, module, signals}]}
+        elif path == "/port_map":
+            self._send_json(200, port_map(data.get("points") or []))
         elif path == "/system_graph":
             g = system_graph(data.get("card") or {}, str(data.get("campaign") or ""), data.get("live") or [])
             self._send_json(200, dict(g, svg=system_svg(g), signals=system_signals_html(g)))
