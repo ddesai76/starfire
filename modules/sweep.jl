@@ -9,6 +9,7 @@
 # Arguments: --f0 Hz  --f1 Hz  --duration s  --rate Hz  --amplitude  (all optional)
 
 using Signet: signals, series
+# signet: out series::waveform
 
 function arg(name, default)
     i = findfirst(==("--$name"), ARGS)
