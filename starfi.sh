@@ -11,7 +11,7 @@
 # Directory structure (pre-build):
 # ├── starfi.sh
 # ├── starfire.py              (builds to starfire)
-# ├── signet.py                (optional: Signet, built into starfire; without it Signals are off)
+# ├── signet.py                (optional: Signet language support, built into starfire; without it Signals are off)
 # └── static
 #     ├── assets
 #     │   └── icon.png          (optional; only for --install-desktop)
