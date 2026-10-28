@@ -187,12 +187,14 @@ connect(shunt.amps.sig, multiply.amps)
 ```
 
 ```python
+# signet: in float::volts, in float::amps, out float::watts
 from signet import signals                # multiply.py
 watts = signals.volts * signals.amps      # read two inputs
 signals.watts = watts                     # write one output -> ...-multiply.watts.sig
 ```
 
 ```julia
+# signet: in float::volts, in float::amps, out float::watts
 using Signet: signals                     # multiply.jl
 watts = signals.volts * signals.amps      # read two inputs
 signals.watts = watts                     # write one output -> ...-multiply.watts.sig
@@ -201,6 +203,7 @@ signals.watts = watts                     # write one output -> ...-multiply.wat
 C++, Rust, Ada and Fortran have built-in helpers too, so there is nothing to copy: put the source in `dist/`, and Signet builds it the first time it runs and again whenever it changes, keeping the program in a cache. A build error is the run's error.
 
 ```cpp
+// signet: in float::volts, in float::amps, out float::watts
 #include <signet.hpp>                     // multiply.cpp
 
 int main() {
@@ -211,6 +214,7 @@ int main() {
 ```
 
 ```rust
+// signet: in float::volts, in float::amps, out float::watts
 use signet::{get_f64, put};               // multiply.rs
 
 fn main() {
@@ -220,6 +224,7 @@ fn main() {
 ```
 
 ```ada
+--  signet: in float::volts, in float::amps, out float::watts
 with Signet;                              --  multiply.adb
 
 procedure Multiply is
@@ -230,6 +235,7 @@ end Multiply;
 ```
 
 ```fortran
+! signet: in float::volts, in float::amps, out float::watts
 program multiply                          ! multiply.f90
   use signet
   implicit none
@@ -270,6 +276,7 @@ To build one yourself, write the helper sources out with `python3 signet.py --ex
 **Rust is the special case.** Signet builds a single `.rs` file with `rustc` and no crates. A module that needs crates (`hotfire` and `tvac` need eframe) is a Cargo project you build yourself: the module goes in `src/bin/` with the helper `signet.rs` beside it, `Cargo.toml` lists it as a `[[bin]]` (with `autobins = false`, so `signet.rs` isn't taken for a program), and the module starts with `#[path = "signet.rs"] mod signet;`, after which `use signet::{get_f64, put};` works as above. `cargo build` won't work without both files.
 
 ```
+# signet: in float::volts, in float::amps, out float::watts
 # multiply.signet                         # Signet: an input is a variable of its name
 let float::watts = volts * amps
 output(float::watts, watts)               # write one output -> ...-multiply.watts.sig
@@ -398,6 +405,22 @@ The **C++, Rust, Ada and Fortran** helpers (examples above) read vectors, 2-D ar
 
 An output `watts` is written to `$SIGNET_PREFIX-$SIGNET_MODULE.watts.sig`. `.inputs.json` has one entry per input, `{"value": …, "type": …, "source": …}` (a file's value is its path, a worked-out value's source is its line). JSON has no NaN: write `null`; a bare `NaN` is replaced when stamping.
 
+**Declared ports (optional).** A module can say what it reads and writes in comment lines, `# signet: in float::volts, in float::amps, out float::watts` (`//` in C++ and Rust, `--` in Ada, `!` in Fortran). Starfire then checks a Signals box before the run: an input the module doesn't have, an output wired as an input, or a type that doesn't fit stops it with the line number. The run is refused if a declared input isn't connected, and fails, stamping nothing, if the module writes an output it didn't declare or doesn't write one it did. A module with no declaration is not checked. Type checks apply to connections that name the module (`connect(x, multiply.volts)`); one to another point (`20:volts`) is checked when that point runs.
+
+### Connecting points
+
+A point's Signals box can feed another point's module as well as its own: `connect(10:psu.volts.sig, 20:volts)` in point 10's box, or `route(10:psu.volts.sig, exit, [20:volts, 30:vals])` to several points at once. When point 20 runs, Starfire reads the lines aimed at it from the other points' boxes (not from a sequence's, which feeds points through `run`), along with its own; an input set from two places is an error.
+
+When a point's module declares its ports, its module panel lists them under **Ports**: each input with what feeds it (`← 10:volts`), and each output with the later points' inputs its type fits (nothing feeds an earlier point). Connected inputs stay on the output's row as ticked boxes; the rest are behind its **+ n** button, grouped by point, with a filter when there are many. Ticking one writes the code, on a new line after what is already there:
+
+| Ticked | Code written |
+|:--|:--|
+| An output into a free input | `connect(10:psu.volts.sig, 20:volts)` in the source's box (point 10) |
+| The same output into another input | that line becomes `route(10:psu.volts.sig, exit, [20:volts, 30:vals])` |
+| A second output into an input already fed (a `vector` or `series` input) | the input moves to the receiving point's box: `route(10:psu.volts.sig, merge, [25:shunt.amps.sig])` then `connect(10:psu.volts.sig, multiply.vals)` |
+
+Port colors: white is a port that exists but isn't connected, green is connected, amber is an output no later input takes, and red is a connection the declared ports don't allow (a wrong type, a port that isn't declared, one input fed twice), which only code can make. Unticking takes the connection out again, and editing a box by hand updates the checkboxes. They change only lines of these shapes (including `connect(x, multiply.volts)` in the receiving box); a connection made by other code (inside an `if`, or from an expression) shows ticked but greyed, to change in the box. A connected output is ticked live when its run stamps it (or straight away if it already has been), so the receiving point can read it.
+
 ### Signal files
 
 A `.sig` is one JSON object, at most 10 MB: `{"value": [12.1, 12.4], "type": "vector::float"}`. It, `.inputs.json` and `.inputs.txt` are point files.
@@ -455,4 +478,3 @@ escape(40, 600)                                   # finish when 40 completes, el
 * **As-run log.** `<campaign>-<card>-<point>-sequence.log`: the code as `#` lines, then one line per event with wall-clock time and seconds since **run**. It is attached to the point when the sequence ends and shown under its output while it runs.
 * A sequence doesn't survive Starfire closing. In a plain folder a sequence runs one point at a time.
 
-Not yet built: units other than seconds and hertz, several-channel series, series operators, a `for` over a vector's items, and `interchange`.
