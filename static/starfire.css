@@ -84,6 +84,7 @@
   .editor-doc .mod-jl { color: var(--bl); }
   .editor-doc .mod-sh { color: var(--nw); }
   .editor-doc .mod-sg { color: var(--pu); }
+  .editor-doc .mod-src { color: var(--magenta); }
   .editor-doc .mod-other { color: var(--rd); }
   /* The native dropdown arrow takes the select's text color, so the arrow is
      drawn separately in the normal text color (--nw, #b8ffd0) and only the name is tinted. */
@@ -107,6 +108,30 @@
   .mod-row > div { flex: 1; min-width: 0; }
   .mod-row input { width: 100%; box-sizing: border-box; }
   .mod-args { margin: 8px 0; }
+  /* Ports: a module's declared inputs and outputs; an output's checkboxes connect it to later points' inputs. */
+  .mod-conn { margin: 8px 0; }
+  .mod-conn:empty { display: none; }
+  .conn-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 8px; font-size: 12px; margin-bottom: 4px; }
+  .conn-port { font-family: var(--mono); color: var(--nw); }
+  .conn-type { font-family: var(--mono); font-size: 11px; color: var(--ind); }
+  /* White: a port that exists, not connected. Green: connected. Amber: no later input takes it. Red: a bad connection. */
+  .conn-to { color: var(--nw); display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; }
+  .st-on { color: var(--nvg); }
+  .st-warn { color: var(--amb); }
+  .st-bad { color: var(--rd); }
+  .pt-module label.conn-box { display: inline-flex; align-items: center; gap: 4px; margin: 0; font-size: 12px;
+    font-family: var(--mono); color: var(--nw); cursor: pointer; }
+  .pt-module label.conn-box.off { color: var(--dim); cursor: default; }
+  .pt-module label.conn-box.on { color: var(--nvg); }
+  .pt-module label.conn-box.bad { color: var(--rd); }
+  .conn-more { margin-left: 4px; font-family: var(--mono); }
+  .conn-menu { margin: 2px 0 8px 10px; padding-left: 8px; border-left: 1px solid var(--stroke); max-height: 160px; overflow-y: auto; }
+  .conn-grp { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; margin-bottom: 3px; font-size: 12px; }
+  .conn-grp[hidden], .conn-menu .conn-box[hidden] { display: none; }
+  .conn-grp-name { font-family: var(--mono); color: var(--dim); min-width: 5em; }
+  .conn-filter { width: 100%; box-sizing: border-box; margin-bottom: 4px; font-family: var(--mono); font-size: 12px; }
+  .conn-none { font-size: 11px; color: var(--dim); }
+  .conn-none code { font: inherit; }
   /* Signals box: coloured copy (.sig-hl) behind a transparent textarea; both must lay text out identically. */
   .sig-wrap { position: relative; background: var(--panel); border-radius: 6px; }
   .sig-hl, .editor-doc .sig-wrap textarea { display: block; width: 100%; margin: 0; padding: 5px 7px; border: 1px solid transparent;
@@ -496,6 +521,8 @@
 .pin-btn[data-kind="py"]:hover, .pin-btn[data-kind="py"].active { color: var(--amb); border-color: var(--amb); }
 .pin-btn[data-kind="jl"]:hover, .pin-btn[data-kind="jl"].active { color: var(--bl); border-color: var(--bl); }
 .pin-btn[data-kind="sh"]:hover, .pin-btn[data-kind="sh"].active { color: var(--nw); border-color: var(--nw); }
+.pin-btn[data-kind="sg"]:hover, .pin-btn[data-kind="sg"].active { color: var(--pu); border-color: var(--pu); }
+.pin-btn[data-kind="src"]:hover, .pin-btn[data-kind="src"].active { color: var(--magenta); border-color: var(--magenta); }
 .pin-btn[data-kind="other"]:hover, .pin-btn[data-kind="other"].active { color: var(--rd); border-color: var(--rd); }
 .btn.pin-toggle { margin-right: 4px; }
 .btn.pin-toggle.on { color: var(--amb); border-color: var(--amb); }
