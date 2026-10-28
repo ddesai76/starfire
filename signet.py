@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-# signet.py:      SIGNET, A LANGUAGE FOR SYSTEMS OF SIGNALS
+# signet.py:      SIGNET, A COORDINATION LANGUAGE FOR WIRING MODULES IN ANY LANGUAGE VIA SIGNALS
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-25
-# VERSION:        0.5.9
+# UPDATED:        2026-10-28
+# VERSION:        26.b.0.1.1
 #
 
 """
@@ -38,7 +38,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = "0.5.1"
+VERSION = "26.b.0.1.1"
 API = 2                       # the interface Starfire uses; raised when it changes
 
 _PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -2070,6 +2070,7 @@ class _Exec:
         self.ctx = {"host": host, "vars": {}, "lazy": lazy}
         self.ctx["root"] = self.ctx["vars"]
         self.pending, self.lines = {}, {}      # held connections by module or point; the line of each
+        self.to_point = None                   # deliveries(): only the lines aimed at this point count
 
     def block(self, nodes):
         ctx, seq = self.ctx, self.seq
@@ -2094,7 +2095,7 @@ class _Exec:
                     sv.source = f"line {line}: {nd[2]}"
                 ctx["vars"][nd[2]] = (sv, words)
             elif kind == "connect":
-                if self._applies(nd[4]):
+                if self._applies(nd[4], nd[6], line):
                     sv = _eval(nd[2], line, ctx)
                     self._hold(line, sv, nd[3], nd[4], nd[5], nd[6])
             elif kind == "route":
@@ -2112,6 +2113,8 @@ class _Exec:
                 ctx["first"] = v.value
             elif kind == "for":
                 yield from self._for(nd)
+            elif kind in ("echo", "break") and self.to_point is not None:
+                continue                       # the code's own point's business, not the point it delivers to
             elif kind == "echo":
                 text = f"line {line}: {nd[3]} = " + ", ".join(_show_value(_eval(a, line, ctx)) for a in nd[2])
                 if seq is not None:
@@ -2166,8 +2169,11 @@ class _Exec:
             self.ctx = ctx
             ctx["first"] = inner["first"]
 
-    def _applies(self, mod):
-        # In a point's own code only its module's connections count; in a sequence, only the sequence's own.
+    def _applies(self, mod, point=None, line=0):
+        # In a point's own code only its module's connections count; in a sequence, only the sequence's own;
+        # for deliveries(), only those aimed at to_point.
+        if self.to_point is not None:
+            return mod is None and point is not None and _point_str(point, line, self.ctx) == self.to_point
         if self.seq is None:
             return mod is not None and mod == self.module
         return not (mod is not None and self.module is not None)
@@ -2198,7 +2204,7 @@ class _Exec:
             return
         sv = None
         for words, mod, port, point in items:
-            if self._applies(mod):
+            if self._applies(mod, point, line):
                 sv = sv or _eval(src, line, ctx)
                 self._hold(line, sv, words, mod, port, point)
 
@@ -2450,6 +2456,22 @@ def evaluate(code: str, module, host, modules=None) -> dict:
     except SignalError as e:
         raise ValueError(str(e))
     return ex.pending.get(module, {})
+
+
+def deliveries(code: str, point, host) -> dict:
+    """What a point's own code gives another point's module: the inputs of `point` from its lines aimed at it,
+    connect(x, 20:volts) and route(x, exit, [20:volts, ...]), as {port: {value, type, source}}. Its own module's
+    lines, echo and break are skipped, and a live Signal is read only if one of those lines uses it.
+    For code that isn't a sequence (a sequence delivers through run). Raises ValueError or Break."""
+    prog = parse_signals(code)
+    ex = _Exec(host, None, lazy=True)
+    ex.to_point = str(point)
+    try:
+        for _ in ex.block(prog):
+            pass
+    except SignalError as e:
+        raise ValueError(str(e))
+    return ex.pending.get(str(point), {})
 
 
 class _ModuleHost:
@@ -5013,7 +5035,7 @@ signet_domain() {        # signet_domain NAME: the axis name of a series
   printf '%s\n' "$row" | LC_ALL=C awk -F'\t' '{ split($4, t, " "); print t[1] }'
 }
 
-signet_get() {           # signet_get NAME: one value per line (see SIGNALS.md for complex and series)
+signet_get() {           # signet_get NAME: one value per line
   local row; row=$(_signet_row "$1") || return 2
   printf '%s\n' "$row" | LC_ALL=C awk -F'\t' "$_signet_unescape"'
     { n = split($4, t, " ")
@@ -5275,6 +5297,187 @@ def build_module(path: str, log=None) -> list:
 _INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia"}
 
 
+# Ports: what a module declares it reads and writes, and the wiring checked against it
+_PORT_LINE = re.compile(r"^[ \t]*(?:#|//|--|!)[ \t]*signet:[ \t]*(.*)$", re.M | re.I)
+_PORT_ITEM = re.compile(r"(in|out)\s+((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Za-z_][A-Za-z0-9_]*)$", re.I)
+
+
+def read_ports(text: str):
+    """A module's declared ports from its `signet: in float::volts, out float::watts` comment lines
+    (after #, //, -- or !): {"in": {name: words}, "out": {name: words}}, or None if it declares none.
+    Raises ValueError for a bad declaration."""
+    lines = _PORT_LINE.findall(text)
+    if not lines:
+        return None
+    ports = {"in": {}, "out": {}}
+    for line in lines:
+        for item in (s.strip() for s in line.split(",")):
+            m = _PORT_ITEM.match(item)
+            if not m:
+                raise ValueError(f"bad port declaration {item!r}: expected in <name> or out <name>, with an optional type")
+            way, words, name = m.group(1).lower(), [w for w in m.group(2).split("::") if w], m.group(3)
+            if name in ports["in"] or name in ports["out"]:
+                raise ValueError(f"port {name} is declared twice")
+            if name in _RESERVED_PORTS:
+                raise ValueError(f"{name} can't be a port name")
+            ports[way][name] = words
+    return ports
+
+
+_FITS = {"hex": {"hex"}, "int": {"int", "hex"}, "float": {"float", "real", "int", "hex"},
+         "real": {"float", "real", "int", "hex"}, "num": {"float", "real", "int", "hex", "num", "complex"},
+         "bool": {"bool"}, "complex": {"complex"}, "bus": {"bus"}}
+
+
+def _fits(src, dst) -> bool:
+    """Whether a value declared as `src` can go where `dst` is declared; unknown pairs pass."""
+    if not src or not dst or dst == ["text"]:
+        return True
+    if src[0] == dst[0] == "vector":
+        return _fits(src[1:], dst[1:])
+    if dst[0] in _FITS and len(src) == 1 and (src[0] in _TYPE_WORDS or src[0] == "vector"):
+        return src[0] in _FITS[dst[0]]
+    if dst[0] in _TYPE_WORDS or src[0] in _TYPE_WORDS:
+        return src[0] == dst[0] or dst[0] not in _FITS
+    return src[0].lower() == dst[0].lower()          # file types
+
+
+def _literal_words(e):
+    if e[0] == "num":
+        return ["int"] if type(e[1]) is int else ["float"]
+    return {"imag": ["complex"], "str": ["text"], "bool": ["bool"]}.get(e[0])
+
+
+def check_wiring(code, ports=lambda m: None, is_file=lambda t: False) -> list:
+    """Direction and port errors in Signet code, as "line N: ..." strings. `ports(module)` gives None for
+    no such module, else {"in": {...}, "out": {...}} or {} when the module declares nothing;
+    `is_file(name)` says a name is a plain file."""
+    root = parse_signals(code) if isinstance(code, str) else code
+    nodes = list(_walk(root))
+    targets = {}
+    for nd in nodes:
+        if nd[0] == "connect" and nd[4]:
+            targets.setdefault((nd[4], nd[5]), nd[1])
+        elif nd[0] == "route" and nd[2] == "exit":
+            for _, mod, port, _ in nd[4]:
+                if mod:
+                    targets.setdefault((mod, port), nd[1])
+    known = {m for m, _ in targets} | {nd[2] for nd in nodes if nd[0] == "run" and isinstance(nd[2], str) and not nd[2].isdigit()}
+    cache, errors, here = {}, [], [0]
+    def decl(m):
+        if m not in cache:
+            try:
+                cache[m] = ports(m)
+            except ValueError as e:
+                cache[m] = {}
+                errors.append(f"line {here[0]}: {e}")
+        return cache[m]
+    def outs(m):
+        d = decl(m) or {}
+        return f" ({m} writes {', '.join(sorted(d['out']))})" if d.get("out") else ""
+    def source(e, line):
+        """The declared type of a source, or None; reports a source that is really an input."""
+        if e[0] != "ref" or ":" in e[1]:
+            return _literal_words(e)
+        text = e[1]
+        parts = text[:-4].split(".") if text.endswith(".sig") else text.split(".")
+        if not text.endswith(".sig"):
+            if len(parts) == 2 and (parts[0] in known or decl(parts[0]) is not None) and not is_file(text):
+                m, p = parts
+                d = decl(m) or {}
+                if p in d.get("out", {}):
+                    errors.append(f"line {line}: {text} isn't a Signal; did you mean {text}.sig?")
+                elif (m, p) in targets or p in d.get("in", {}):
+                    errors.append(f"line {line}: {text} is an input of {m}, not a Signal: read {m}'s output as {m}.<output>.sig{outs(m)}")
+                else:
+                    errors.append(f"line {line}: {text} isn't a Signal: write {text}.sig for {m}'s output {p}")
+            return None
+        if len(parts) != 2:
+            return None
+        m, p = parts
+        d = decl(m)
+        if not d:
+            return None
+        if p in d["in"]:
+            errors.append(f"line {line}: {m}.{p} is an input of {m}, so {text} is never written{outs(m)}")
+        elif p not in d["out"]:
+            errors.append(f"line {line}: {m} has no output {p}{outs(m)}")
+        else:
+            return d["out"][p]
+        return None
+    def target(words, mod, port, line, src_words):
+        d = decl(mod) if mod else None
+        if not d:
+            return
+        if port in d["out"]:
+            errors.append(f"line {line}: {mod}.{port} is an output of {mod}, not an input")
+        elif port not in d["in"]:
+            ins = ", ".join(sorted(d["in"])) or "none"
+            errors.append(f"line {line}: {mod} has no input {port} (its inputs: {ins})")
+        else:
+            want = d["in"][port]
+            got = words or src_words
+            if want and got and not _fits(got, want):
+                errors.append(f"line {line}: {mod}.{port} takes {'::'.join(want)}, got {'::'.join(got)}")
+    def reads(e, line):
+        if isinstance(e, tuple):
+            if e and e[0] == "ref":
+                source(e, line)
+            else:
+                for sub in e[1:]:
+                    reads(sub, line)
+        elif isinstance(e, list):
+            for sub in e:
+                reads(sub, line)
+    for nd in nodes:
+        line = here[0] = nd[1]
+        if nd[0] == "connect":
+            src = nd[2]
+            w = source(src, line) if src[0] in ("ref", "num", "imag", "str", "bool") else reads(src, line)
+            target(nd[3], nd[4], nd[5], line, w)
+        elif nd[0] == "route":
+            w = source(nd[3], line) if nd[3][0] == "ref" else reads(nd[3], line)
+            for item in nd[4]:
+                if nd[2] == "exit":
+                    target(item[0], item[1], item[2], line, w)
+                else:
+                    reads(item, line)
+        elif nd[0] == "run" and isinstance(nd[2], str):
+            decl(nd[2])                # reports a bad declaration
+        elif nd[0] in ("if", "when", "for", "function", "subprocess"):
+            for sub in nd[2:6]:
+                if not isinstance(sub, list):
+                    reads(sub, line)
+        else:
+            for sub in nd[2:]:
+                reads(sub, line)
+    return sorted(set(errors), key=lambda s: int(s.split()[1].rstrip(":")))
+
+
+def contract_errors(module: str, ports, inputs=None, written=None) -> list:
+    """Run-time checks against a module's declared ports: before a run (inputs), after it (written .sig names)."""
+    if not ports:
+        return []
+    errs = []
+    if inputs is not None:
+        missing = sorted(set(ports["in"]) - set(inputs))
+        extra = sorted(set(inputs) - set(ports["in"]))
+        if missing:
+            errs.append(f"{module} needs input{'s' * (len(missing) > 1)} {', '.join(missing)}: nothing is connected")
+        if extra:
+            errs.append(f"{module} has no input{'s' * (len(extra) > 1)} {', '.join(extra)}")
+    if written is not None:
+        pat = re.compile(r"^" + re.escape(module) + r"\.([A-Za-z_][A-Za-z0-9_]*)\.sig$")
+        got = {pat.match(n).group(1) for n in written if pat.match(n)}
+        extra = sorted(got - set(ports["out"]))
+        missing = sorted(set(ports["out"]) - got)
+        if extra:
+            errs.append(f"{module} wrote {', '.join(extra)}, which it doesn't declare")
+        if missing:
+            errs.append(f"{module} didn't write {', '.join(missing)}")
+    return errs
+
+
 class FolderHost:
     """A plain folder as Signet's world: every stamped .sig in it is live, any other file by name;
     parameters from --param; run(module) starts <module>.py/.jl/.sh or an executable <module> here."""
@@ -5344,7 +5547,7 @@ class FolderHost:
             raise
         self.states[module] = "complete"
 
-    def _run_signet(self, module, name, inputs):
+    def _run_signet(self, module, name, inputs, ports=None):
         """A module written in Signet: its inputs are variables, output(name, value) writes the Signals."""
         before = {n: os.stat(n).st_mtime_ns for n in os.listdir(".") if n.endswith(".sig") and os.path.isfile(n)}
         try:
@@ -5357,19 +5560,53 @@ class FolderHost:
             raise RuntimeError(f"{name}: {e}")
         written = [n for n, t in {n: os.stat(n).st_mtime_ns for n in os.listdir(".") if n.endswith(".sig") and os.path.isfile(n)}.items()
                    if before.get(n) != t]
+        self._contract(module, ports, written=written)
         res = stamp("", module, written, os.path.basename(os.getcwd()) + ":")
         for e in res["errors"]:
             print(f"{module}: {e}", file=sys.stderr)
 
-    def _run(self, module, inputs):
-        hits = [n for n in sorted(os.listdir("."))
+    def _hits(self, module):
+        return [n for n in sorted(os.listdir("."))
                 if n != "signet.py" and os.path.isfile(n) and (n in (module + e for e in (*_INTERPRETERS, *SOURCE_TYPES, ".signet"))
                                                                or (n == module and os.access(n, os.X_OK)))]
+
+    @staticmethod
+    def _file_ports(name):
+        """The ports a module file declares, {} if none (or it isn't text). Raises ValueError for a bad declaration."""
+        try:
+            if os.path.getsize(name) > 1_000_000:
+                return {}
+            with open(name, encoding="utf-8") as f:
+                text = f.read()
+        except (OSError, UnicodeDecodeError):
+            return {}
+        try:
+            return read_ports(text) or {}
+        except ValueError as e:
+            raise ValueError(f"{name}: {e}")
+
+    def module_ports(self, module):
+        """None if there is no module of this name here, else its declared ports ({} if it declares none)."""
+        hits = self._hits(module)
+        return None if not hits else self._file_ports(hits[0]) if len(hits) == 1 else {}
+
+    def _contract(self, module, ports, inputs=None, written=None):
+        errs = contract_errors(module, ports, inputs, written)
+        if errs:
+            raise RuntimeError("; ".join(errs))
+
+    def _run(self, module, inputs):
+        hits = self._hits(module)
         if len(hits) != 1:
             raise LookupError(f"no module {module} here" if not hits else f"{module} matches {', '.join(hits)}; keep one")
         name = hits[0]
+        try:
+            ports = self._file_ports(name)
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        self._contract(module, ports, inputs=inputs or {})
         if name.endswith(".signet"):
-            return self._run_signet(module, name, inputs)
+            return self._run_signet(module, name, inputs, ports)
         argv = [os.path.join(".", name)]
         interp = _INTERPRETERS.get(os.path.splitext(name)[1])
         if os.path.splitext(name)[1].lower() in SOURCE_TYPES:
@@ -5392,6 +5629,7 @@ class FolderHost:
         if code != 0:
             raise RuntimeError(f"{module} failed (exit {code})")
         written = [n for n, t in state().items() if before.get(n) != t]
+        self._contract(module, ports, written=written)
         res = stamp("", module, written, os.path.basename(os.getcwd()) + ":")
         for e in res["errors"]:
             print(f"{module}: {e}", file=sys.stderr)
@@ -5425,11 +5663,13 @@ def main(argv=None) -> int:
             return 1
         params[name.strip()] = value
     try:
-        parse_signals(code)
+        host = FolderHost(params)
+        wiring = check_wiring(parse_signals(code), host.module_ports, os.path.isfile)
+        if wiring:
+            raise ValueError("\n".join(wiring))
         if a.check:
             print(f"{a.file}: ok")
             return 0
-        host = FolderHost(params)
         seq = Sequence(code, None, host, now=time.monotonic())
         while True:
             st = seq.step(time.monotonic())
