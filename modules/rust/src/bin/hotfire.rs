@@ -1,7 +1,7 @@
 // hotfire.rs:     EXAMPLE TEST MODULE (ELECTRIC PROPULSION HOT FIRE)
 // AUTHOR:         DANIEL DESAI
-// UPDATED:        2026-10-13
-// VERSION:        0.2.0
+// UPDATED:        2026-10-27
+// VERSION:        0.2.1
 //
 // Rust version of hotfire.cpp with GUI. User-selected firing pattern (hex code),
 // and burn time. Prints voltage/current/accel as CSV (simulated values).
