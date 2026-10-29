@@ -7,11 +7,11 @@
 // interpolated to represent ramps/plateaus. An accelerated simulation mode (--sim) runs the
 // profile in 30 s.
 //
-// Works on its own or as a Signet module. Run from Signet/Starfire, the optional inputs `time`
-// and `temp` (vector::float, s and C), `baseline` (C), `vacuum` and `ambient` (torr) fill the
-// fields (you still ARM and START), and when the run ends the outputs `time`, `temp` and
-// `pressure` (the setpoint log, vector::float) are written as signals. Run on its own, no
-// signals are read or written.
+// Works on its own or as a Signet module. Run from Signet/Starfire, when the run ends the outputs
+// `temp` and `pressure` (the setpoint log, series over time in s) are written as signals, for
+// other modules to take. It reads no signals. Run on its own, none are written.
+//
+// signet: out series::time::float::temp, out series::time::float::pressure
 //
 // Usage:
 // 1. Build with cargo build --release. Lives in src/bin/ with signet.rs (the signal helper);
@@ -400,9 +400,9 @@ impl App {
             let time: Vec<f64> = self.trace.iter().map(|r| r[0]).collect();
             let temp: Vec<f64> = self.trace.iter().map(|r| r[1]).collect();
             let pressure = vec![self.vac_torr; time.len()];
-            signet::put("time", &time, "vector::float");
-            signet::put("temp", &temp, "vector::float");
-            signet::put("pressure", &pressure, "vector::float");
+            let over_time = |values: Vec<f64>| signet::Series { domain: "time".into(), x: time.clone(), values };
+            signet::put("temp", &over_time(temp), "");
+            signet::put("pressure", &over_time(pressure), "");
         }
         EXIT.store(if aborted { 1 } else { 0 }, Ordering::SeqCst);
         self.say(if aborted { "STOPPED" } else { "DONE" }, if aborted { RED } else { GRN });
@@ -800,23 +800,17 @@ fn main() {
         visuals.window_fill = BG;
         visuals.window_stroke = Stroke::new(1.0, DIM);
         cc.egui_ctx.set_visuals(visuals);
-        // Signet inputs, if connected; any not connected keep the defaults. A wrong type ends the module (exit 2).
-        let num = |n: &str, d: &str| if signet::has(n) { format!("{:e}", signet::get_f64(n)) } else { d.to_string() };
-        let (times, temps) = if signet::has("time") && signet::has("temp") {
-            (join(&signet::get_vec_f64("time")), join(&signet::get_vec_f64("temp")))
-        } else {
-            ("0 6000 24400".into(), "20 40 40".into())
-        };
+        let (times, temps): (String, String) = ("0 6000 24400".into(), "20 40 40".into());
         Ok(Box::new(App {
             times,
             temps,
             add_t: String::new(),
             add_temp: String::new(),
             csv: String::new(),
-            base: if signet::has("baseline") { format!("{}", signet::get_f64("baseline")) } else { "20".into() },
-            vac: num("vacuum", "1e-5"),
+            base: "20".into(),
+            vac: "1e-5".into(),
             pa: false,
-            amb: num("ambient", "760"),
+            amb: "760".into(),
             amb_pa: false,
             applied: None,
             k: None,
