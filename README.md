@@ -1,9 +1,9 @@
 # Starfire
 
-**Starfire** is a test campaign and test card designer for aerospace, automotive, and other engineering test programs. It runs on Linux, either as a Python 3 script (`python3 starfire.py`) or as a standalone binary, within a browser GUI, and provides three complementary workflows:
+**Starfire** is a ***test campaign*** and ***test card*** designer for aerospace, automotive, and other engineering test programs. It runs on Linux, either as a Python 3 script (`python3 starfire.py`) or as a standalone binary, within a browser UI, and provides three complementary workflows:
 * Documentation: campaigns (test plans), procedures (test cards), requirements matrices, and test reports, which can be combined into an overall campaign report.
-* Hardware integration: **Activate** runs _modules_, user-placed scripts or binaries in any language, and **Measure** shows the signals they write or read on a test point.
-* Integration with the custom **Signet** programming language (see [Signals and Signet](#signals-and-signet)).
+* Hardware integration: **Activate** runs ***modules***, user-placed scripts or binaries in any language, and **Measure** shows the ***signals*** they write or read on a ***test point***.
+* Integration with the ***Signet*** programming language, which wires the modules on different test points together (see [Signals and Signet](#signals-and-signet)).
 
 It reads and writes native JSON (`.camp`, `.test`, `.vcrm`) and exports `.csv`, `.docx`, and print/PDF.
 
@@ -42,7 +42,7 @@ bash starfi.sh --build --install-desktop   # also adds a menu entry (uses static
 ### Campaign
 * Metadata, a requirements table, a **Modules** table, and a numbered **Test Series** (plus ancillary tests). Open creates or opens the `.test` file in a tab.
 * Free-form write-up sections.
-* Every tab (campaign, test card, VCRM, report) has the same layout: the STARFIRE title and that tab's import, export and generate buttons in a left sidebar, and the page on the right.
+* Every tab (campaign, test card, verification cross-reference matrix or VCRM, report) has the same layout: the STARFIRE title and that tab's import, export and generate buttons in a left sidebar, and the page on the right.
 * **VCRM:** cross-references campaign requirements against each card's `Requirement(s)` field and reports `Covered`, `Partial`, `Planned`, or `Not Covered`. The VCRM tab shows the campaign header and details above the matrix and exports to `.vcrm`, `.docx`, and PDF.
 
 ### Test card
@@ -99,8 +99,8 @@ A **module** is a script or program placed in the `/dist` folder that Starfire r
 | `*.py` | `python3 <file>` | `python3` on `PATH`. No `chmod`, no shebang. |
 | `*.sh` | `bash <file>` | `bash` on `PATH`. No `chmod`, no shebang. |
 | `*.jl` | `julia <file>` | `julia` on `PATH`. No `chmod`, no shebang. |
-| `*.signet` | Run inside Starfire | Signet only. See [a module written in Signet](#a-module-written-in-signet). |
-| `*.cpp`, `*.rs`, `*.adb`, `*.f90` | Built by Signet on first run and whenever the source changes (cached), then run | `g++`, `rustc`, `gnatmake` or `gfortran` on `PATH`, and Signet. One-file Rust and Fortran. See [Signals and Signet](#signals-and-signet) for building one yourself, and Rust with crates. |
+| `*.signet` | Run inside Starfire | Signet only. See [SIGNET.md](SIGNET.md) and the [Signet spec](Signet_Language_Spec.pdf). |
+| `*.cpp`, `*.rs`, `*.adb`, `*.f90` | Built by Signet on first run and whenever the source changes (cached), then run | `g++`, `rustc`, `gnatmake` or `gfortran` on `PATH`, and Signet. One-file Rust and Fortran. Building one yourself, and Rust with crates, are in the [Signet spec](Signet_Language_Spec.pdf). |
 | Anything else | `./<file>` directly | Execute permission (`chmod +x`). A compiled binary (`g++ -o dist/test test.cpp`), or a script of any other language with a shebang line `#!/usr/bin/env <LANGUAGE>`. |
 
 The extension decides: a `.py` file runs under `python3` even if it has a different shebang. Other source files, such as `hello.c`, aren't listed until compiled. The same rule applies to what populates the Modules picker, so an unrunnable file never shows up. 
@@ -131,7 +131,7 @@ Starfire/                    <- launch ./dist/starfire from here; modules run he
     └── test.py            <- the module (runs as: python3 test.py)
 ```
 
-* Environment: `STARFIRE_CAMPAIGN` (campaign id, `XX-000` outside a campaign), `STARFIRE_CARD` (card id), `STARFIRE_POINT` (point number), `STARFIRE_PREFIX` (the point's file-name prefix, e.g. `SC-001-TC-001-20`, with unusual characters in the ids replaced by `_`), `STARFIRE_MODULE` (the module's name without its extension; both also set as `SIGNET_PREFIX` and `SIGNET_MODULE`), so a shell script can name a file for its point with `"$STARFIRE_PREFIX-plot.png"`.
+* Environment: `STARFIRE_CAMPAIGN` (campaign id, `XX-000` outside a campaign), `STARFIRE_CARD` (card id), `STARFIRE_POINT` (point number), `STARFIRE_PREFIX` (the point's file-name prefix, e.g. `SC-001-TC-001-20`, with unusual characters in the ids replaced by `_`), `STARFIRE_MODULE` (the module's name without its extension; both also set as `SIGNET_PREFIX` and `SIGNET_MODULE`), so a shell script can name a file for its point with `"$STARFIRE_PREFIX-plot.png"`. The `SIGNET_*` variables a module uses for its inputs and outputs are listed in the [Signet spec](Signet_Language_Spec.pdf).
 * The environment is the user's own, except that `LD_LIBRARY_PATH` is restored to its original value when running from the built binary, so a system `python3` or a compiled module isn't pointed at Starfire's bundled libraries.
 * Arguments: type them in the **Arguments** box below the module name, e.g. `--gui --burn 30`, on one line or several; a line starting with `#` is skipped and a `\` at the end of a line continues it. The **↓** button copies the point's Parameters in as `--name value` lines. They are split like a shell would (quotes and backslashes), and are passed as plain argv entries after the program (after `python3`/`bash`/ etc.  for scripts), so a module in any language reads them the usual way. The module name and Arguments are saved with the point in the `.test` file, and frozen when the card is Locked.
 * Parameters: each point has a **Parameters** table of names and values (e.g. `voltage` = `5.0`) between the module name and the Arguments box, saved in the `.test` file and frozen when the card is Locked. Names are `[A-Za-z_][A-Za-z0-9_]*`, unique on the point ignoring case. A module gets them three ways: as arguments, only when **↓** copies them into the Arguments box as `--<name> <value>` lines (an existing `--<name>` line is replaced in place, values quoted where needed); always as `STARFIRE_PARAM_<NAME>` environment variables (`STARFIRE_PARAM_VOLTAGE=5.0`); and as `$<name>` in Signet code (see [Signals and Signet](#signals-and-signet)).
@@ -141,7 +141,7 @@ Starfire/                    <- launch ./dist/starfire from here; modules run he
 **Safety.** Running a program on request from a web page needs care:
 * Only a bare filename that exists in `dist/`, is runnable (executable, `.py` / `.sh` / `.jl` / `.signet`, or a source Signet builds), and isn't `starfire` can run. Paths and `..` are rejected.
 * `/run_module` accepts only JSON requests addressed to `localhost`/`127.0.0.1` on Starfire's own port. A form post from another website, or a DNS-rebinding trick, is refused.
-* A sequence never starts a module itself: `run(n)` waits for a person to press **run** on point *n*.
+* A ***sequence*** never starts a module itself: `run(n)` waits for a person to press **run** on point *n*.
 * The scope rule is enforced by the page, not the server: the server knows which files are runnable, but not your campaign. Treat `dist/` as the trust boundary; anything executable you put there can be run from the UI.
 
 ---
@@ -163,21 +163,16 @@ Starfire/                    <- launch ./dist/starfire from here; modules run he
 
 ## Signals and Signet
 
-A **signal** is a value one module run writes to a file (`.sig`) so a later run can read it, which is how one test point's result feeds another's analysis. **Signet** is the small language in a point's **Signals** box that decides which signals go into which module inputs and, in a *sequence*, when to run the next point. It reads a signal's value when a line runs, like reading a file; nothing re-runs when a signal later changes. Modules never call each other: they read inputs and write outputs, in any language. Signals need `signet.py` next to `starfire.py`; without it Starfire works as before, minus the Signals box, live list, Systems and stamping.
+Signet is the language Starfire uses to wire modules together: a test point's **Signals** box says which signals feed which module inputs and, in a sequence, when the next point runs. Signet also runs on its own; Starfire is built on it, as Simulink is on MATLAB or Dyad on Julia. Two references cover it:
 
-| Term | File | What it is |
-|:--|:--|:--|
-| **Signal** | `.sig` | One named output of one module run, saved as a file and stamped with where, when and by which run it was made. |
-| **Signet** | `.signet` | The language, defined in `signet.py` (its own project; `python3 signet.py runner.signet` also runs it in a plain folder). A `.signet` file is code to paste into a Signals box. |
-| **Series** | | A value type: points against an axis (amplitude against frequency), real or complex. It can be written to a signal. |
-| **System** | `.sys` | A card's signals drawn as a diagram. |
-| **Sequence** | | Signet code that steps through other points of the card in order, waiting for conditions. |
+* **[SIGNET.md](SIGNET.md)**: a short introduction, with a first system to try.
+* **[The Signet Programming Language](Signet_Language_Spec.pdf)**: the full language, with a part on Signet in Starfire.
 
 ### How it works
 
 1. A module run writes outputs, one `.sig` per output, named for the module and output (`chirp.sweep.sig`).
-2. If the run ends `COMPLETE`, Starfire stamps each `.sig`.
-3. In the point's file list, tick the `.sig` **live**. Only live files can be connected, campaign-wide.
+2. If the run ends `COMPLETE`, Starfire stamps each `.sig`, and deletes that module's older `.sig` files on the point that it didn't rewrite.
+3. In the point's file list, tick the `.sig` **live**. Only live, stamped files can be connected, campaign-wide; the list is saved in the `.camp` file.
 4. On another point, Signet code says which live signals feed which inputs: `connect(chirp.sweep.sig, stft.signal_in)`.
 5. When you run that module, Starfire runs the Signet code, writes the inputs to `.inputs.json`, and starts the module.
 
@@ -193,242 +188,20 @@ watts = signals.volts * signals.amps      # read two inputs
 signals.watts = watts                     # write one output -> ...-multiply.watts.sig
 ```
 
-```julia
-# signet: in float::volts, in float::amps, out float::watts
-using Signet: signals                     # multiply.jl
-watts = signals.volts * signals.amps      # read two inputs
-signals.watts = watts                     # write one output -> ...-multiply.watts.sig
-```
+With a built-in helper, the same module can also be written in Julia, C++, Rust, Ada, Fortran, a shell script or Signet itself; C++, Rust, Ada and Fortran sources are built on their first run. Those are only the languages Signet has helpers for: any language that can read its inputs file and write a JSON file, MATLAB for example, works as a module too. The first line declares the module's ports, so Starfire can check the wiring before the run.
 
-C++, Rust, Ada and Fortran have built-in helpers too, so there is nothing to copy: put the source in `dist/`, and Signet builds it the first time it runs and again whenever it changes, keeping the program in a cache. A build error is the run's error.
+### The Signals box
 
-```cpp
-// signet: in float::volts, in float::amps, out float::watts
-#include <signet.hpp>                     // multiply.cpp
+The Signals box (beside Arguments) runs before every module run on the point, decides each input, and can stop the run with `break`, for interlocks. It is saved in the `.test` file and frozen when the card is Locked; a card outside a campaign has no live list, so its box is disabled. The box colours the code as you type: comments dim, commands purple, types indigo, names blue, signals magenta, files garnet, numbers and `true`/`false` amber, text green.
 
-int main() {
-    double volts = signet::in<double>("volts");   // read two inputs
-    double amps = signet::in<double>("amps");
-    signet::out("watts", volts * amps);           // write one output -> ...-multiply.watts.sig
-}
-```
-
-```rust
-// signet: in float::volts, in float::amps, out float::watts
-use signet::{get_f64, put};               // multiply.rs
-
-fn main() {
-    let watts = get_f64("volts") * get_f64("amps");   // read two inputs
-    put("watts", &watts, "");                          // write one output -> ...-multiply.watts.sig
-}
-```
-
-```ada
---  signet: in float::volts, in float::amps, out float::watts
-with Signet;                              --  multiply.adb
-
-procedure Multiply is
-   Watts : constant Long_Float := Signet.Get_Float ("volts") * Signet.Get_Float ("amps");   --  read two inputs
-begin
-   Signet.Put ("watts", Watts);           --  write one output -> ...-multiply.watts.sig
-end Multiply;
-```
-
-```fortran
-! signet: in float::volts, in float::amps, out float::watts
-program multiply                          ! multiply.f90
-  use signet
-  implicit none
-  real(8) :: volts, amps
-  call signet_get("volts", volts)         ! read two inputs
-  call signet_get("amps", amps)
-  call signet_put("watts", volts * amps)  ! write one output -> ...-multiply.watts.sig
-end program multiply
-```
-
-**Example, step by step: `hello.cpp`.** The source goes in `dist/`, next to the `starfire` binary (or beside `starfire.py` when running from source), like any other module.
-
-1. Save this as `dist/hello.cpp` (it needs `g++` installed):
-
-   ```cpp
-   #include <signet.hpp>                     // hello.cpp
-
-   int main() {
-       signet::out("greeting", std::string("Hello, world!"));   // -> ...-hello.greeting.sig
-   }
-   ```
-
-2. Open a test point and pick `hello.cpp` in the **Module** list (reload the page if it isn't there yet).
-3. Press **run**. The first run builds it; later runs reuse the build until the source changes.
-4. `hello.greeting.sig` appears in the point's Signals; tick it **live** to use it in other points.
-
-A build error, or a missing compiler, is shown as the run's error.
-
-To build one yourself, write the helper sources out with `python3 signet.py --export-helpers signet_helpers`, build from outside `dist/` (or the source shows up as a module too), and put the program in `dist/`:
-
-| Language | Build |
-|:--|:--|
-| C++ | `g++ -O2 -std=c++17 -I signet_helpers multiply.cpp -o dist/multiply` |
-| Ada | `gnatmake -O2 -gnat2012 -Isignet_helpers multiply.adb -o dist/multiply` |
-| Fortran | `gfortran -O2 signet_helpers/signet.f90 multiply.f90 -o dist/multiply` |
-| Rust | `cargo build --release`, then copy `target/release/multiply` to `dist/` |
-
-**Rust is the special case.** Signet builds a single `.rs` file with `rustc` and no crates. A module that needs crates (`hotfire` and `tvac` need eframe) is a Cargo project you build yourself: the module goes in `src/bin/` with the helper `signet.rs` beside it, `Cargo.toml` lists it as a `[[bin]]` (with `autobins = false`, so `signet.rs` isn't taken for a program), and the module starts with `#[path = "signet.rs"] mod signet;`, after which `use signet::{get_f64, put};` works as above. `cargo build` won't work without both files.
-
-```
-# signet: in float::volts, in float::amps, out float::watts
-# multiply.signet                         # Signet: an input is a variable of its name
-let float::watts = volts * amps
-output(float::watts, watts)               # write one output -> ...-multiply.watts.sig
-```
-
-### Signet code
-
-The Signals box (beside Arguments) runs before every module run on the point, decides each input, and can stop the run. It is saved in the `.test` file and frozen when the card is Locked. A card outside a campaign has no live list, so its box is disabled. `#` starts a comment; keywords match in any case. The box colours the code as you type: comments dim, commands purple, types indigo, names blue, signals magenta, files garnet, numbers and `true`/`false` amber, text green, the rest plain.
-
-| Statement | Does |
-|:--|:--|
-| `connect(<value>, <module>.<input>)` | Gives a module input a value (once per run). |
-| `let <name> = <value>`, `<name> = <value>`, `where <name> = <value>` | Declare a variable, change it, declare a constant. Not inside `if`, `for` or `when`. |
-| `if <cond> [then]` … `else` … `end if` | Conditional; the condition must be a bool. |
-| `for k = <start>[:<step>]:<stop>` … `next k` | Loop, inclusive, at most 100,000 turns. |
-| `route(<value>, exit, [<input>, …])` | One value to several inputs. |
-| `route(<signal>, merge, [<value>, …])` | Join signals into one value (series with series, vectors, scalars of one type) for the rest of the code. |
-| `index(<n>)` | First index of vectors and series from here on (default 0; `[end]` counts from the last). |
-| `function <name>(<args>)` … `end function`, or `<name>(<args>) = <value>` | Define a function (see **Functions, map and warp**). |
-| `subprocess <name>(<args>)` … `end subprocess` | Define steps to run by calling `<name>(<values>)`; `return <value>` gives a function's value. |
-| `break` | Stop the run: it ends `BROKEN`, the module never starts, nothing is written. Use it for interlocks. |
-| `echo(<value>, …)` | Prints `line N: … = value` above the module's output. |
-| `input([<type>::,] [<prompt>])` | Asks for a value, read like a parameter: `let v = input(float::, "Supply voltage?")`. Only a sequence asks: its point's page shows the prompt and an **answer** box, and the answer goes in the as-run log. Anywhere else it is an error. |
-
-| Value | Written as |
-|:--|:--|
-| Live signal | `[module.]port.sig`, such as `sweep.sig` or `chirp.sweep.sig` |
-| Live file | its file name, passed as a path: `sweep.csv` |
-| Parameter | `$name`, or another point's: `20:$temperature` (read as JSON; anything else is text) |
-| Number, hex, complex, bool, text, vector | `9.81`, `hex::FF`, `1 + 2i`, `true`, `'text'`, `[10, 20, 30]` |
-| Variable | its name |
-| Bundle | `multiplex(a.sig, b.sig)` bundles signals into one `bus`; `demultiplex(bus.a.sig)` takes one back |
-
-* **Naming the point.** A short name must match exactly one live signal in the campaign. Otherwise name the point: `10:chirp.sweep.sig` (this card) or `TC-001-10:chirp.sweep.sig`.
-* **Inputs** are `module.port`, the module's file name without extension. One box may connect several modules; connects for other modules are skipped.
-* **Operators:** `+ - * /` on numbers (two ints give an int, as in Fortran), `**` power and `\\` root (`9\\2` is `3.0`), `< <= > >= == /=`, `and or not`, parentheses. Complex numbers take the arithmetic and `==`/`/=`, not `<`. A hex with any other number counts as its plain value: `hex::FF + 1` is `256`.
-* **Built-in functions:** `Re(z)`, `Im(z)`, `abs(x)` or `|x|`, `arg(z)` or `>z<`, `conj(z)` or `z‾`, `power(x, p)`, `root(x, n)`. Each takes a vector too.
-* **Vectors** work element by element, and must be the same length. `+` and `-` take two vectors, `*` and `/` a vector and a number (`v * 2`). The dot forms `.+ .- .* ./` also take two vectors or a number against every value: `[1, 2, 3] .* [10, 20, 30]` is `[10, 40, 90]`, `2 .* v`, `10 .- v`. Write `2.0 * x`, not `2.* x`. Series, text and a vector `*` a vector are errors.
-* **Types** go in front, joined by `::`, and a mismatch stops the run before the module starts: `connect(float::$voltage, voltmeter.v_in)`, `series::time::float::stft.signal_in`.
-* **A run** reads the whole box (every unreadable line is listed, run `FAILED`), runs it top to bottom (the first error stops it, `FAILED`), then writes the inputs and starts the module. A point runs one module at a time, so write the box for one module.
-* **Functions, map and warp.** A function is pure and defined once, above its use: `volume(x) = x * 0.5`, or `function volume(x)` … `return x * 0.5` … `end function`. It sees only its arguments, its own `let`s and the constants and variables declared before it (a snapshot); it can't read a signal, file or parameter (pass it in), has no effects (`connect`, `run`, `echo`, `break`), and can't call itself. Arguments can be typed: `function scale(float::k, vector::float::v)`. A **subprocess** is the same for steps, and can do anything a sequence can; define it, then call it on its own line, `fire(20, 300)`. A sequence's points are found by following calls, so the arguments must be numbers, `let`s of numbers or loop values. `map(f, v)` applies `f` to every value of a vector (`map(add, a, b)` takes pairs). `warp(fx, fy, s)` applies `fx` to every point on a series' axis and `fy` to every value; the axis must stay strictly rising or falling. `unity` leaves one alone: `warp(unity, volume, amplitudes)`. `warp` takes real series; on a vector, `warp(unity, f, v)` is `map(f, v)`. Built-in names (`map`, `warp`, `unity`, `input`, `Re`, `Im`, `abs`, `arg`, `conj`, `power`, `root`) can't be variables.
-* **Style.** The System diagram doesn't show arithmetic: name a worked-out value with `let` (or vectorize with `route ... merge`) rather than writing an expression inside `connect()`.
-
-Typical messages: `line 4: sweep.sig matches 2 live signals: …` (name the point), `nothing live matches volts.sig`, `volts.sig has no valid stamp` (edited or unstamped), `this point has no parameter voltage`, `stft.signal_in is connected twice (lines 4 and 9)`, `expected series::frequency::float, got series::time::float`.
-
-### A module written in Signet
-
-A `.signet` file in `dist/` is a module like any other: pick it by name, run it, tick its outputs live. Starfire runs it itself, so it needs no interpreter, and it works wherever Signet does.
-
-* Each input is a variable of the port's name, with its type: `volts`, `amps`.
-* `output([<type>::]<name>, <value>)` writes an output. Each name once per run. Nothing is written if the run stops early: an error, or `break` (the run ends `FAILED` with the reason in its output).
-* The usual statements work: `let`, `if`, `for`, `echo`, operators, vectors, `index`, functions, `map` and `warp`. `connect`, `route` and the sequence statements don't (they belong in a Signals box).
-* No live signals, point parameters or Arguments: everything comes in through the inputs. It isn't for hardware or long jobs; use Python, Julia or a binary for those.
-
-```
-# limit.signet: watts, held at a limit
-let float::limit = 100.0
-let float::watts = volts * amps
-if watts > limit then
-  echo(watts)
-  watts = limit
-end if
-output(float::watts, watts)
-output(bool::limited, watts == limit)
-```
-
-### Types
-
-`int`, `float` (or `null` for NaN), `real` (an int or float), `num` (any number, complex too), `bool`, `hex` (0 to `FFFFFFFF`, stored as a whole number with type `hex`), `text`, `complex` (`{"re": a, "im": b}`), `vector::<type>` (nest for 2-D), `series::<domain>::<type>`, `bus`, and `<ext>` for a file by extension (`csv::`).
-
-A **series** is one signal carrying an axis and values. The axis is `start` and `step` (even) or `x` (any array), with a `domain`: `time` is seconds, `frequency` hertz, any other name has no unit. A series has one array of values; write one series per channel.
-
-```json
-{"value": {"domain": "time", "start": 0.0, "step": 0.1, "values": [0.0, 0.5, 0.9]}, "type": "series::time::float"}
-{"value": {"domain": "frequency", "x": [5, 10, 20, 40], "values": [0.5, 0.5, 1.0, 1.0]}, "type": "series::frequency::float"}
-```
-
-In a type, `series::frequency::float::` is a real frequency series; either part can be left out (`series::`, `series::complex::`). A complex vector given to a helper with no axis becomes a series the way MATLAB's `plot(z)` reads it (real parts the axis, imaginary parts the values).
-
-### Writing a module
-
-A module can use signals if its file name without extension is letters, digits, `_` and `-`, and no other registered module has the same name. The Python (`signet`) and Julia (`Signet`, needs JSON3) helpers come with Signet; nothing to copy.
-
-| | Python | Julia |
-|:--|:--|:--|
-| Import | `from signet import signals` | `using Signet: signals, series` |
-| Read input `volts` | `v = signals.volts` | `v = signals.volts` |
-| Write output `watts` | `signals.watts = w` | `signals.watts = w` |
-| Write, with a type | `signals.write("watts", w, "float")` | `write(signals, "watts", w, "float")` |
-| Build a series | `signals.series(v, domain="time", start=0.0, step=0.1)` or `x=f` | `series(v; domain="time", start=0.0, step=0.1)` or `x=f` |
-
-`signals.my_output = signals.series(amps, domain="frequency", x=freqs)` writes a series; `my_output` is any name you choose. Without a type the helper picks the narrowest that fits; with one it checks the value and stops the module on a mismatch, so no bad `.sig` is stamped. Reading gives native values: `nan` for `null`, a `list`/`Vector` for a vector, a path string for a file, a `dict` for a bus, and for a series an object with `domain`, `x`, `values`, `start` and `step` (`x` is always full; `start` and `step` are `None`/`nothing` if it was stored with `x`).
-
-**xarray and DimensionalData.** A series maps onto an xarray `DataArray` or a DimensionalData.jl `DimArray`: `domain` is the dimension's name, `x` its coordinate (a range for `start`/`step`), `values` the data. A `.sig` keeps only domain, axis, values and type, so names and units live in your array. To write one back, pass its values and axis to `series`; in Julia use `Dim{:time}` or `Dim{:frequency}`, not `Ti` or `X`.
-
-```python
-import xarray as xr
-from signet import signals
-
-s = signals.my_input                    # my_input is the input's name
-da = xr.DataArray(s.values, dims=[s.domain], coords={s.domain: s.x})
-```
-
-```julia
-using DimensionalData, Signet
-using Signet: signals
-
-s = signals.my_input
-x = s.start === nothing ? s.x : range(s.start; step=s.step, length=length(s.values))
-da = DimArray(s.values, (Dim{Symbol(s.domain)}(x),))
-```
-
-The **C++, Rust, Ada and Fortran** helpers (examples above) read vectors, 2-D arrays, series and complex values as well as numbers, bools and text. **Shell** modules `source "$SIGNET_HELPERS/signet.sh"` and use `signet_get`, `signet_put`, `signet_put_vector` and friends.
-
-**Other languages** read the file named by `SIGNET_SIGNALS_IN` and write each output as a `.sig`:
-
-| Variable | Value |
-|:--|:--|
-| `SIGNET_PREFIX` | Start of every file name for the point: `<campaign>-<card>-<point>`, such as `SC-001-TC-001-10` |
-| `SIGNET_MODULE` | The module's name without extension |
-| `SIGNET_SIGNALS_IN` | Path of the run's `.inputs.json` (unset with no connections) |
-| `SIGNET_SIGNALS_TXT` | The same inputs as plain text, for the shell and compiled helpers |
-| `SIGNET_HELPERS` | The helpers folder (also on `CPLUS_INCLUDE_PATH`) |
-| `STARFIRE_PARAM_<NAME>` | Each of the point's parameters |
-| `PYTHONPATH`, `JULIA_LOAD_PATH` | Signet's helper folder, in front |
-
-An output `watts` is written to `$SIGNET_PREFIX-$SIGNET_MODULE.watts.sig`. `.inputs.json` has one entry per input, `{"value": …, "type": …, "source": …}` (a file's value is its path, a worked-out value's source is its line). JSON has no NaN: write `null`; a bare `NaN` is replaced when stamping.
-
-**Declared ports (optional).** A module can say what it reads and writes in comment lines, `# signet: in float::volts, in float::amps, out float::watts` (`//` in C++ and Rust, `--` in Ada, `!` in Fortran). Starfire then checks a Signals box before the run: an input the module doesn't have, an output wired as an input, or a type that doesn't fit stops it with the line number. The run is refused if a declared input isn't connected, and fails, stamping nothing, if the module writes an output it didn't declare or doesn't write one it did. A module with no declaration is not checked. Type checks apply to connections that name the module (`connect(x, multiply.volts)`); one to another point (`20:volts`) is checked when that point runs.
+* **Naming the point.** A short name must match exactly one live signal in the campaign. Otherwise name the point: `10:chirp.sweep.sig` (this card) or `TC-001-10:chirp.sweep.sig`. A parameter is `$name`, or another point's: `20:$temperature`.
+* **One module per point.** A point runs one module at a time; connects for other modules in its box are skipped.
+* **Declared ports.** When a module declares its ports, an input it doesn't have, an output wired as an input, or a type that doesn't fit stops the run with the line number, and the run must write exactly the outputs it declares or nothing is stamped.
+* **Messages** name the line and the cause: `line 4: sweep.sig matches 2 live signals: …` (name the point), `volts.sig has no valid stamp` (edited or unstamped), `this point has no parameter voltage`.
 
 ### Connecting points
 
-A point's Signals box can feed another point's module as well as its own: `connect(10:psu.volts.sig, 20:volts)` in point 10's box, or `route(10:psu.volts.sig, exit, [20:volts, 30:vals])` to several points at once. When point 20 runs, Starfire reads the lines aimed at it from the other points' boxes (not from a sequence's, which feeds points through `run`), along with its own; an input set from two places is an error.
-
-When a point's module declares its ports, its module panel lists them under **Ports**: each input with what feeds it (`← 10:volts`), and each output with the later points' inputs its type fits (nothing feeds an earlier point). Connected inputs stay on the output's row as ticked boxes; the rest are behind its **+ n** button, grouped by point, with a filter when there are many. Ticking one writes the code, on a new line after what is already there:
-
-| Ticked | Code written |
-|:--|:--|
-| An output into a free input | `connect(10:psu.volts.sig, 20:volts)` in the source's box (point 10) |
-| The same output into another input | that line becomes `route(10:psu.volts.sig, exit, [20:volts, 30:vals])` |
-| A second output into an input already fed (a `vector` or `series` input) | the input moves to the receiving point's box: `route(10:psu.volts.sig, merge, [25:shunt.amps.sig])` then `connect(10:psu.volts.sig, multiply.vals)` |
-
-Port colors: white is a port that exists but isn't connected, green is connected, amber is an output no later input takes, and red is a connection the declared ports don't allow (a wrong type, a port that isn't declared, one input fed twice), which only code can make. Unticking takes the connection out again, and editing a box by hand updates the checkboxes. They change only lines of these shapes (including `connect(x, multiply.volts)` in the receiving box); a connection made by other code (inside an `if`, or from an expression) shows ticked but greyed, to change in the box. A connected output is ticked live when its run stamps it (or straight away if it already has been), so the receiving point can read it.
-
-### Signal files
-
-A `.sig` is one JSON object, at most 10 MB: `{"value": [12.1, 12.4], "type": "vector::float"}`. It, `.inputs.json` and `.inputs.txt` are point files.
-
-* **Stamping.** A `COMPLETE` run adds `origin`, `generated` and a SHA-256 `hash` of every other key. Only Starfire computes or checks it. A `.sig` from a `FAILED` or `BROKEN` run is unstamped, and one that is unstamped or edited can't be ticked live or connected.
-* **Live.** Ticking checks the stamp. Detaching a file or deleting a superseded `.sig` takes it off the list, which is saved in the `.camp` file.
-* **Superseded.** A `COMPLETE` run deletes that module's older `.sig` files on the point that it didn't rewrite.
-* **Bulk data** (a long record, an image) belongs in a `.csv` or other point file, connected as a file.
+A point's Signals box can feed another point's module as well as its own: `connect(10:psu.volts.sig, 20:volts)`, or `route(10:psu.volts.sig, exit, [20:volts, 30:vals])` to several points at once. When a module declares its ports, its module panel lists them under **Ports**, and ticking an output against a later point's input writes the `connect` or `route` line for you. Port colors: white unconnected, green connected, amber an output nothing takes, red a connection the declared ports don't allow.
 
 ### Systems
 
@@ -439,42 +212,13 @@ A `.sig` is one JSON object, at most 10 MB: `{"value": [12.1, 12.4], "type": "ve
 * **Exports:** **print / pdf** (diagram, a connection table of source, input, type and value, then a **Signals** section with each vector or series plotted), **.png**, and **.sys** (the diagram as JSON, no values). **+ system** in a Test Report, or **+ append** on the SY tab while the SR tab is open, adds it to reports (a `.docx` gets a heading and a note pointing to the PDF).
 * **Import:** **import system file (.sys)** on the campaign page opens a saved `.sys` in an SY tab, redrawn as exported. It is a snapshot: no values, no refresh, and it can't be appended to a report.
 
+The System diagram doesn't show arithmetic: name a worked-out value with `let` rather than writing an expression inside `connect()`.
+
 ### Sequences
 
-A **sequence** is Signet code containing `when`, `run`, `delay`, `escape` or `finish`. **run** on its point starts that point's module as usual; the sequence then carries on in the background, waiting for conditions and calling for the next points of the card in order. It goes in one point's Signals box (example: `tvac_hotfire.signet`, in point 10's):
+A sequence is Signet code containing `when`, `run`, `delay`, `escape` or `finish`, in one point's Signals box. **run** on that point starts its module as usual; the sequence then carries on in the background, waiting for conditions and calling for the next points of the card in order (example: `tvac_hotfire.signet`, in point 10's box).
 
-```
-where burn = int::300
-      pattern = hex::FF
-let plateau_1 = 20:$temperature                   # point 20's parameter
-let temperature = column(10:tvac.txt, temp_C)     # tvac's output, read while it runs
-
-when temperature[end] >= plateau_1 by 7200        # clock seconds from run on point 10
-    connect(burn, 20:burn_time)
-    connect(pattern, 20:pattern)
-    run(20)
-end when
-
-when complete(20) within 3900                     # from reaching this when
-    connect(20:hotfire.txt, 40:hotfire_in)
-    run(40)
-end when
-
-escape(40, 600)                                   # finish when 40 completes, else break
-```
-
-| Word | Means |
-|:--|:--|
-| `when <cond> [within s] [by s]` … `end when` | Wait until the condition holds (checked every second and when a run ends), then run the block. `within` counts from reaching the `when`, `by` from the start; a missed deadline breaks the sequence. |
-| `run(n)` | Hold point *n* for **run**; pressing it starts the point's module with the `connect(…, n:input)` lines held for it, merged with its own box (the same input from both is an error). Goes on once the run starts. |
-| `complete(n)` `failed(n)` `broken(n)` `running(n)` | State of point *n*'s latest run since the sequence started. |
-| `finish`, `escape(n[, s])`, `delay(s)` | End normally; wait for *n* to end then finish (or break if it failed or ran past `s`); wait `s` seconds. |
-| `column(<file>, <name>)`, `s[end]` | A csv point file column as a series (`time_s` makes a `time` domain); a series' last value. |
-
-* **Waiting for RUN.** `run(n)` never starts a point by itself: the point shows `Waiting for RUN` until you press **run** on it, and the sequence waits.
-* **Failure and break.** A run the sequence started that fails or breaks breaks the sequence, own point included. **break** on the sequence's point, `break` in the code, or closing Starfire stops it and every run it started. **break** on a point it started breaks the sequence on its next step.
-* **Points** come from numbers, `let`s of numbers and `for` loops over numbers, fixed before the sequence starts. Two sequences on a card can't use the same point, and a point a sequence uses can't be run by hand until it ends (unless waiting for RUN).
-* **On the page** the sequence's point shows `line N: waiting for …`, then COMPLETE or BROKEN. A started point's output is `<prefix>-<point>-<module>.txt`, written as it runs.
-* **As-run log.** `<campaign>-<card>-<point>-sequence.log`: the code as `#` lines, then one line per event with wall-clock time and seconds since **run**. It is attached to the point when the sequence ends and shown under its output while it runs.
-* A sequence doesn't survive Starfire closing. In a plain folder a sequence runs one point at a time.
-
+* **Waiting for RUN.** `run(n)` never starts a point by itself: the point shows `Waiting for RUN` until you press **run** on it.
+* **Failure and break.** A run the sequence started that fails or breaks breaks the sequence. **break** on the sequence's point, `break` in the code, or closing Starfire stops it and every run it started.
+* **Questions.** `input(...)` in a sequence shows its prompt and an **answer** box on the point's page.
+* **As-run log.** `<campaign>-<card>-<point>-sequence.log` records the code and every event with its time, and is attached to the point when the sequence ends.
