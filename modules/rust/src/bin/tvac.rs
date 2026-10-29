@@ -1,7 +1,7 @@
 // tvac.rs:        THERMAL VACUUM PROFILE
 // AUTHOR:         DANIEL DESAI
-// UPDATED:        2026-10-17
-// VERSION:        0.2.0
+// UPDATED:        2026-10-27
+// VERSION:        0.2.1
 //
 // Thermal profile visualization and editing tool. Time and temperature vectors, linearly
 // interpolated to represent ramps/plateaus. An accelerated simulation mode (--sim) runs the
