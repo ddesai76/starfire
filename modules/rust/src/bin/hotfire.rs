@@ -6,10 +6,10 @@
 // Rust version of hotfire.cpp with GUI. User-selected firing pattern (hex code),
 // and burn time. Prints voltage/current/accel as CSV (simulated values).
 //
-// Works on its own or as a Signet module. Run from Signet/Starfire, the inputs `pattern` (hex)
-// and `burn_time` (s) fill the fields (you still ARM and FIRE), and when the burn ends the
-// outputs `time`, `voltage`, `current` and `accel` are written as vector::float signals.
-// Run on its own, no signals are read or written.
+// Works on its own or as a Signet module. Run from Signet/Starfire, when the burn ends the outputs
+// `voltage`, `current` and `accel` are written as series over time (s), for other modules to take. It reads no signals. Run on its own, none are written.
+//
+// signet: out series::time::float::voltage, out series::time::float::current, out series::time::float::accel
 //
 // Usage:
 // 1. Build with cargo build --release. Lives in src/bin/ with signet.rs (the signal helper);
@@ -212,9 +212,10 @@ impl App {
         self.k = None;
         println!("{}", if aborted { "# STOPPED" } else { "# DONE" });
         if under_signet() && !self.log.is_empty() {
-            for (n, name) in ["time", "voltage", "current", "accel"].iter().enumerate() {
-                let col: Vec<f64> = self.log.iter().map(|r| r[n]).collect();
-                signet::put(name, &col, "vector::float");
+            let time: Vec<f64> = self.log.iter().map(|r| r[0]).collect();
+            for (n, name) in ["voltage", "current", "accel"].iter().enumerate() {
+                let values: Vec<f64> = self.log.iter().map(|r| r[n + 1]).collect();
+                signet::put(name, &signet::Series { domain: "time".into(), x: time.clone(), values }, "");
             }
         }
         EXIT.store(if aborted { 1 } else { 0 }, Ordering::SeqCst);
@@ -352,22 +353,10 @@ fn main() {
         visuals.text_cursor.stroke = Stroke::new(2.0, AMB);
         visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, FG);
         cc.egui_ctx.set_visuals(visuals);
-        // Signet inputs, if connected: pattern (hex 01-FF), burn_time (s). A wrong type ends the module (exit 2).
-        let sel = if signet::has("pattern") {
-            match u8::try_from(signet::get_i64("pattern")) {
-                Ok(v) if v != 0 => v,
-                _ => {
-                    eprintln!("signet: input pattern must be hex::01 to hex::FF");
-                    std::process::exit(2)
-                }
-            }
-        } else {
-            0xFF
-        };
-        let burn = signet::has("burn_time").then(|| signet::get_f64("burn_time"));
+        let sel: u8 = 0xFF;
         Ok(Box::new(App {
             code: format!("0x{sel:02X}"),
-            secs: burn.map_or("300".into(), |b| format!("{b}")),
+            secs: "300".into(),
             sel,
             applied: None,
             k: None,
