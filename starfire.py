@@ -2,8 +2,8 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-27
-# VERSION:        4.0.1
+# UPDATED:        2026-10-29
+# VERSION:        4.1.0
 #
 
 """
@@ -24,6 +24,7 @@ import csv
 import errno
 import io
 import json
+import math
 import os
 import re
 import shlex
@@ -1154,6 +1155,36 @@ def csv_plot_svg(path: str, cols: list = None) -> str:
     return _plot_svg([s for s in (csv_series(path, y=c) for c in cols) if s])
 
 
+def _heatmap_svg(cols: list) -> str:
+    # A 2-D array as a grid of shades, darkest at its smallest value: column 1 at the left, row 1 at the bottom.
+    # Large arrays are shown in blocks, each the largest value it covers.
+    nc, nr = len(cols), len(cols[0])
+    bc, br = -(-nc // 160), -(-nr // 80)
+    cells = [[max((e for c in cols[i:i + bc] for e in c[j:j + br] if e is not None), default=None)
+              for j in range(0, nr, br)] for i in range(0, nc, bc)]
+    known = [e for c in cells for e in c if e is not None]
+    if not known:
+        return ""
+    lo, hi = min(known), max(known)
+    log = lo >= 0 and hi > 1000 * max(lo, 1e-300)       # a power, such as a spectrogram: shaded over 40 dB
+    w, h = 484 / len(cells), 156 / len(cells[0])
+    def shade(e):               # dark blue to yellow
+        if log:
+            t = min(max(1 + math.log10(max(e, 1e-300) / hi) / 4, 0.0), 1.0)
+        else:
+            t = 0.0 if hi == lo else (e - lo) / (hi - lo)
+        return f"rgb({int(30 + 220 * t)},{int(40 + 190 * t)},{int(110 - 80 * t)})"
+    rects = "".join(f'<rect x="{56 + i * w:.2f}" y="{176 - (j + 1) * h:.2f}" width="{w + 0.3:.2f}" height="{h + 0.3:.2f}" '
+                    f'fill="{shade(e)}"/>' for i, c in enumerate(cells) for j, e in enumerate(c) if e is not None)
+    g = lambda v: f"{v:.4g}"
+    return (f'<svg class="rp-plot" viewBox="0 0 560 210" role="img" aria-label="{nr} by {nc} array">'
+            f'<g>{rects}</g><line x1="56" y1="176" x2="540" y2="176"/><line x1="56" y1="20" x2="56" y2="176"/>'
+            f'<text x="50" y="24" text-anchor="end">{nr}</text><text x="50" y="176" text-anchor="end">1</text>'
+            f'<text x="56" y="194">1</text><text x="540" y="194" text-anchor="end">{nc}</text>'
+            f'<text x="298" y="206" text-anchor="middle">column ({g(lo)} to {g(hi)}{", 40 dB shown" if log else ""})</text>'
+            f'<text x="12" y="98" transform="rotate(-90 12 98)" text-anchor="middle">row</text></svg>')
+
+
 def _plot_svg(series: list) -> str:
     # Up to four (x_label, y_label, xs, ys) traces on one set of axes.
     if not series:
@@ -1744,6 +1775,7 @@ class _PointHost:
 
     def __init__(self, card_id, campaign_id, live, params, pts=None):
         self.card, self.index = str(card_id), _live_index(campaign_id, live)
+        self.module_dirs = (_modules_dir(),)    # where lineage() finds module files
         self.params = {k.lower(): v for k, v in params}
         self.pts = pts if isinstance(pts, dict) else {}   # the card's points, for a sequence box
         self.lines = []    # echo output, shown above the module's own
@@ -2005,7 +2037,7 @@ def system_graph(card: dict, campaign_id: str, live) -> dict:
                         prt = disp
                         port(b["outputs"], prt, file=fname)
                     try:
-                        signet.read_sig(fname)
+                        signet.stream_sig(fname) or signet.read_sig(fname)    # a stream still being written counts
                         color = "amber"
                     except ValueError:
                         color = "dim"
@@ -2052,7 +2084,7 @@ def signal_value(name: str) -> dict:
     if not name.endswith(".sig") or not os.path.isfile(name):
         return {"error": "not found"}
     try:
-        obj = signet.read_sig(name)
+        obj = signet.stream_sig(name) or signet.read_sig(name)
     except ValueError as e:
         return {"error": f"{name} {e}"}
     v, t = obj["value"], str(obj.get("type") or signet.infer_type(obj["value"]))
@@ -2067,8 +2099,9 @@ def signal_value(name: str) -> dict:
             series = [(xl, "re", x, vals["re"]), (xl, "im", x, vals["im"])]
         else:
             series = [(xl, "value", x, vals)]
-    elif isinstance(v, list) and v and all(isinstance(r, list) for r in v):
-        series = [("sample", f"row {k + 1}", list(range(1, len(r) + 1)), r) for k, r in enumerate(v)]
+    elif isinstance(v, list) and v and all(isinstance(c, list) and len(c) == len(v[0]) for c in v) and v[0] \
+            and all(signet.is_num(e) or e is None for c in v for e in c):
+        out["svg"] = _heatmap_svg(v)        # a 2-D array, kept by column: columns across, rows up
     elif isinstance(v, list) and len(v) > 1:
         series = [("sample", "value", list(range(1, len(v) + 1)), v)]
     ok = lambda x, y: signet.is_num(x) and signet.is_num(y)
@@ -2348,8 +2381,11 @@ def _delivered(point_seq, card_id, campaign_id, live, points) -> dict:
     route exit), read now. A sequence's box delivers through its run(), so it is left out here."""
     get = getattr(signet, "deliveries", None)
     out = {}
-    if not get or not isinstance(points, dict):
+    if not isinstance(points, dict):
         return out
+    if not get:
+        raise ValueError(f"{signet.__file__} is Signet {getattr(signet, 'VERSION', '?')}, which can't pass one point's "
+                         "connections to another: use 26.b.0.1.3 or later")
     me = str(point_seq)
     for seq, info in points.items():
         code = str((info or {}).get("signals") or "") if isinstance(info, dict) else ""
@@ -2369,6 +2405,23 @@ def _delivered(point_seq, card_id, campaign_id, live, points) -> dict:
             if port in out:
                 raise ValueError(f"{port} is set by both point {out[port][0]}'s Signals and point {seq}'s")
             out[port] = (str(seq), v)
+    return out
+
+
+def _elsewhere(stem, point_seq, points, have) -> list:
+    """Hints for inputs another point's box connects as <module>.<port>, which only feeds that point's own module."""
+    out = []
+    for seq, info in (points or {}).items():
+        code = str((info or {}).get("signals") or "") if isinstance(info, dict) else ""
+        if str(seq) == str(point_seq) or not code.strip():
+            continue
+        try:
+            ports = sorted({c["port"] for c in signet.connections(code) if c["module"] == stem and c["port"] not in have})
+        except ValueError:
+            continue
+        for port in ports:
+            out.append(f"point {seq}'s Signals connect {stem}.{port}, but a box only feeds its own point's module: "
+                       f"write {point_seq}:{port} there, or move the line to point {point_seq}'s Signals")
     return out
 
 
@@ -2428,7 +2481,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
             decl = _ports_lookup(modules)(stem)
             errs = signet.contract_errors(stem, decl, inputs=inputs)
             if errs:
-                raise ValueError("; ".join(errs))
+                raise ValueError("; ".join(errs + _elsewhere(stem, point_seq, points, set(inputs))))
     except (signet.Break if signet else ()) as e:
         return {"status": "broken", "error": str(e), "output": "".join(ln + "\n" for ln in host.lines), "files": []}
     except ValueError as e:
@@ -2472,6 +2525,15 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
             out_file.flush()
         except OSError as e:
             return {"status": "failed", "error": f"can't write {e.filename}: {e.strerror}"}
+        streams = [f"{_point_prefix(campaign_id, card_id)}-{point_seq}-{stem}.{p}.sig"
+                   for p, w in ((decl or {}).get("out") or {}).items() if w[:1] == ["stream"]] if signet and not in_signet else []
+        for path in streams:          # there from the start, so a reader can follow it at once
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps({"value": {"x": [], "values": [], "window": signet.STREAM_WINDOW, "count": 0,
+                                                  "ended": False}, "type": "stream"}) + "\n")
+            except OSError:
+                pass
         if in_signet:
             proc = _Finished(code_rc)
         else:
@@ -2496,6 +2558,11 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
             _RUNS.pop(key, None)
             broken = key in _BROKEN
             _BROKEN.discard(key)
+    if signet:                    # its streams have ended, however the run went; one with no samples goes
+        pre = f"{_point_prefix(campaign_id, card_id)}-{point_seq}-{stem}."
+        for n in sorted(set(streams) | {n for n, st in _point_files_state(campaign_id, card_id, point_seq).items()
+                                        if n.startswith(pre) and n.endswith(".sig") and before.get(n) != st}):
+            signet.end_stream(n)
     with open(out_path, encoding="utf-8", errors="replace") as f:
         out = f.read()
     if proc.returncode == 0 and not timed_out:
@@ -2517,7 +2584,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
             result["error"] = "; ".join(errs)
     if status == "complete" and signet and signet.STEM.match(stem):
         sig = signet.stamp(f"{_point_prefix(campaign_id, card_id)}-{point_seq}", stem, result["files"],
-                           f"{campaign_id or 'XX-000'}:{card_id}-{point_seq}:")
+                           f"{campaign_id or 'XX-000'}:{card_id}-{point_seq}:", inputs, os.path.join(_modules_dir(), name))
         if any(sig.values()):
             result["signals"] = sig
             result["files"] = sorted(set(result["files"]) - set(sig["deleted"]))
