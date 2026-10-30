@@ -2,8 +2,8 @@
 
 # signet.py:      SIGNET, A COORDINATION LANGUAGE FOR WIRING MODULES IN ANY LANGUAGE VIA SIGNALS
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-28
-# VERSION:        26.b.0.1.1
+# UPDATED:        2026-10-29
+# VERSION:        26.b.0.1.3
 #
 
 """
@@ -25,6 +25,7 @@ import argparse
 import hashlib
 import json
 import cmath
+import decimal
 import math
 import os
 import re
@@ -35,10 +36,11 @@ import tempfile
 import threading
 import time
 from collections import namedtuple
+import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = "26.b.0.1.1"
+VERSION = "26.b.0.1.3"
 API = 2                       # the interface Starfire uses; raised when it changes
 
 _PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -51,24 +53,26 @@ _KEYWORDS = {"let", "where", "connect", "if", "then", "else", "end", "and", "or"
              "break", "multiplex", "demultiplex", "true", "false", "echo", "run",
              "when", "within", "by", "finish", "delay", "escape", "complete", "failed", "broken",
              "running", "column", "autorun", "for", "next", "index", "route", "exit", "merge", "interchange", "output",
-             "function", "subprocess", "return"}
+             "function", "subprocess", "return", "in", "xor", "lineage"}
 _MAX_NEST = 32                  # deepest vector of vectors that can be written
-_TYPE_WORDS = {"int", "float", "real", "num", "bool", "text", "complex", "vector", "series", "bus", "hex"}
-_RESERVED_PORTS = {"write", "series"}
+_TYPE_WORDS = {"int", "float", "real", "num", "bool", "text", "complex", "vector", "series", "bus", "hex", "stream", "tuple",
+               "range", "bits"}
+_RESERVED_PORTS = {"write", "series", "stream"}
 _SIG_TOKEN = re.compile(r"""
    (?P<ws>\s+)
  | (?P<string>'[^'\n]*'|"[^"\n]*")
  | (?P<comment>\#.*)
- | (?P<type>(?:[A-Za-z_][A-Za-z0-9_]*::)+)
+ | (?P<type>[A-Za-z_][A-Za-z0-9_]*::(?:[A-Za-z0-9_]+::)*)
  | (?P<pparam>[A-Za-z0-9_-]+:\$[A-Za-z_][A-Za-z0-9_]*)
  | (?P<ref>[A-Za-z0-9_-]+:[A-Za-z0-9_.-]+)
  | (?P<hexval>(?<=hex::)(?:0[xX])?[0-9A-Fa-f]+(?![A-Za-z0-9_]))
+ | (?P<bitsval>0[bB][01]+(?![A-Za-z0-9_.]))
  | (?P<imag>(?:\d+(?:\.(?![*/+\-])\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?:im|i)(?![A-Za-z0-9_]))
  | (?P<num>(?:\d+(?:\.(?![*/+\-])\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![A-Za-z0-9_]|\.(?![*/+\-])))
  | (?P<path>[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*)
  | (?P<param>\$[A-Za-z_][A-Za-z0-9_]*)
  | (?P<name>[A-Za-z_][A-Za-z0-9_]*)
- | (?P<op>\.[*/+\-]|\*\*|\\\\|‾|==|/=|<=|>=|[-+*/()<>=,\[\]:|])
+ | (?P<op>\.[*/+\-]|\*\*|\\\\|‾|==|/=|<=|>=|<<|>>|[-+*/()<>=,\[\]:|@{};&~])
 """, re.X)
 
 
@@ -96,6 +100,30 @@ class Hex(int):
 _HEX_MAX = 0xFFFFFFFF
 
 
+class Bits(int):
+    """A fixed-width field of bits, 1 to 64 wide, as an unsigned int with its width. Bit 0 is the lowest."""
+
+    def __new__(cls, value, width):
+        o = int.__new__(cls, value)
+        o.width = width
+        return o
+
+
+_BITS_MAX = 64
+
+
+def _bits_type(width) -> str:
+    return f"bits::{width}"
+
+
+def _bits_from(t: str, v):
+    """A stored int as Bits when its type says bits::<n>."""
+    m = re.fullmatch(r"bits::(\d+)", t)
+    if m and type(v) is int and 1 <= int(m.group(1)) <= _BITS_MAX and 0 <= v < 1 << int(m.group(1)):
+        return Bits(v, int(m.group(1)))
+    return v
+
+
 @dataclass
 class _SV:
     """A value in Signet code: its data, its type string, and where it came from."""
@@ -103,6 +131,9 @@ class _SV:
     type: str = ""
     source: str = ""
     file: bool = False
+    path: str = ""                # the file it was read from
+    stamp: str = ""               # that Signal's stamp hash
+    trace: dict = None            # the Signals, files and parameters it was worked out from: {name: hash or value}
 
 
 def _code_part(text: str) -> str:
@@ -253,7 +284,10 @@ class _LineParser:
 
     def types(self):
         if self.peek()[0] == "type":
-            return [w for w in self.take()[1].split("::") if w]
+            words = [w for w in self.take()[1].split("::") if w]
+            if words[-1] == "bits" and self.peek()[0] == "num" and self.peek()[1].isdigit():   # bits::8
+                words.append(self.take()[1])
+            return words
         return []
 
     def statement(self):
@@ -349,6 +383,14 @@ class _LineParser:
         elif self.kw("return"):
             self.take()
             node = ("return", self.line, None if self.i >= len(self.t) else self.expr())
+        elif self.kw("lineage") and self.peek(1) == ("op", "("):
+            self.take()
+            self.expect_op("(")
+            kind, text = self.take()
+            if kind not in ("ref", "path") or not text.endswith(".sig"):
+                raise self.err("lineage takes a Signal, such as lineage(report.pass.sig)")
+            self.expect_op(")")
+            node = ("lineage", self.line, text)
         elif self.callable_name():
             name, depth, j = self.take()[1], 0, self.i
             while j < len(self.t):
@@ -470,8 +512,38 @@ class _LineParser:
         return self.compare()
 
     def compare(self):
+        a = self.bit_or()
+        if self.kw("in"):
+            self.take()
+            a = ("bin", "in", a, self.bit_or())
+        elif self.peek()[0] == "op" and self.peek()[1] in ("<", "<=", ">", ">=", "==", "/="):
+            a = ("bin", self.take()[1], a, self.bit_or())
+        return a
+
+    def bit_or(self):
+        a = self.bit_xor()
+        while self.peek() == ("op", "|"):
+            self.take()
+            a = ("bin", "|", a, self.bit_xor())
+        return a
+
+    def bit_xor(self):
+        a = self.bit_and()
+        while self.kw("xor"):
+            self.take()
+            a = ("bin", "xor", a, self.bit_and())
+        return a
+
+    def bit_and(self):
+        a = self.shift()
+        while self.peek() == ("op", "&"):
+            self.take()
+            a = ("bin", "&", a, self.shift())
+        return a
+
+    def shift(self):
         a = self.sum()
-        if self.peek()[0] == "op" and self.peek()[1] in ("<", "<=", ">", ">=", "==", "/="):
+        while self.peek() in (("op", "<<"), ("op", ">>")):
             a = ("bin", self.take()[1], a, self.sum())
         return a
 
@@ -491,9 +563,14 @@ class _LineParser:
         if self.peek() == ("op", "-"):
             self.take()
             return ("neg", self.unary())
+        if self.peek() == ("op", "~"):
+            self.take()
+            return ("bnot", self.unary())
         words = self.types()
         if words == ["hex"] and self.peek()[0] == "hexval":
             return ("hexraw", self.take()[1])
+        if words and self.peek()[0] == "type":          # int::hex::FF, bits::12 hex::FF
+            return ("typed", words, self.unary())
         if self.peek() == ("op", "|"):                # |z|: the absolute value
             self.take()
             inner = self.sum()
@@ -506,7 +583,7 @@ class _LineParser:
             a = ("call", "arg", inner)
         else:
             a = self.atom()
-        while self.peek() in (("op", "["), ("op", ":")):
+        while self.peek() == ("op", "[") or (self.peek() == ("op", ":") and self.peek(1)[0] in ("param", "path")):
             if self.take() == ("op", "["):
                 a = ("index", a, self.index())
                 self.expect_op("]")
@@ -524,6 +601,37 @@ class _LineParser:
         return ("typed", words, a) if words else a
 
     def index(self):
+        depth, j = 0, self.i
+        while j < len(self.t):         # v[0:3] and v[k:end] read 0:3 and k:end as one token: split them
+            kind, text = self.t[j]
+            if (kind, text) in (("op", "["), ("op", "(")):
+                depth += 1
+            elif (kind, text) in (("op", "]"), ("op", ")")):
+                if depth == 0:
+                    break
+                depth -= 1
+            elif kind == "ref" and depth == 0 and re.fullmatch(r"[A-Za-z0-9_-]+:[A-Za-z0-9_-]+", text):
+                parts = _sig_tokens(text.replace(":", " : "), self.line)
+                self.t[j:j + 1] = parts
+                j += len(parts) - 1
+            j += 1
+        specs = [self.index_one()]
+        while self.peek() == ("op", ","):          # A[i, j]: row, column
+            self.take()
+            specs.append(self.index_one())
+        return specs[0] if len(specs) == 1 else ("multi",) + tuple(specs)
+
+    def index_one(self):
+        if self.peek() == ("op", ":") and self.peek(1) in (("op", ","), ("op", "]")):
+            self.take()
+            return ("all",)
+        lo = self.index_end()
+        if self.peek() == ("op", ":"):
+            self.take()
+            return ("slice", lo, self.index_end())
+        return lo
+
+    def index_end(self):
         if self.kw("end"):
             self.take()
             off = None
@@ -535,6 +643,15 @@ class _LineParser:
 
     def atom(self):
         kind, text = self.peek()
+        if (kind, text) in (("name", "sample"), ("param", "$sample")) and self.peek(1) == ("op", "("):
+            self.take()
+            return ("sample", "$" if kind == "param" else "") + tuple(self.args())
+        if (kind, text) == ("op", "@"):
+            self.take()
+            if self.peek() != ("name", "sample") or self.peek(1) != ("op", "("):
+                raise self.err("@ goes before sample: @sample(stream)")
+            self.take()
+            return ("sample", "@") + tuple(self.args())
         if kind == "name" and text == "input" and self.peek(1) == ("op", "("):
             self.take()
             self.take()
@@ -558,6 +675,18 @@ class _LineParser:
         if kind == "imag":
             self.take()
             return ("imag", float(text[:-2] if text.endswith("im") else text[:-1]))
+        if kind == "bitsval":
+            self.take()
+            if len(text) - 2 > _BITS_MAX:
+                raise self.err(f"bits can be {_BITS_MAX} wide at most, got {len(text) - 2}")
+            return ("bits", text[2:])
+        if (kind, text) == ("op", "{"):
+            self.take()
+            lo = self.expr()
+            self.expect_op(",")
+            hi = self.expr()
+            self.expect_op("}")
+            return ("range", lo, hi)
         if kind == "name" and text == "im":          # the imaginary unit, as in Julia
             self.take()
             return ("imag", 1.0)
@@ -595,15 +724,28 @@ class _LineParser:
             self.depth = getattr(self, "depth", 0) + 1
             if self.depth > _MAX_NEST:
                 raise self.err(f"vectors can nest {_MAX_NEST} deep at most")
-            items = []
+            rows = [[]]                # [1, 2; 3, 4]: rows of a 2-D array
             while self.peek() != ("op", "]"):
-                items.append(self.expr())
+                rows[-1].append(self.expr())
+                if self.peek() == ("op", ";"):
+                    self.take()
+                    rows.append([])
+                    continue
                 if self.peek() != ("op", ","):
                     break
                 self.take()
             self.expect_op("]")
             self.depth -= 1
-            return ("vec",) + tuple(items)
+            if len(rows) == 1:
+                return ("vec",) + tuple(rows[0])
+            if len(rows) > 1 and not rows[-1]:     # [1, 2, 3;] is a matrix of one row
+                rows.pop()
+            if any(not r for r in rows):
+                raise self.err("a row of a matrix is empty")
+            if len({len(r) for r in rows}) > 1:
+                raise self.err("the rows of a matrix must all be the same length, got " + ", ".join(str(len(r)) for r in rows))
+            # written row by row, kept column by column, as Julia and Fortran
+            return ("vec",) + tuple(("vec",) + tuple(r[j] for r in rows) for j in range(len(rows[0])))
         if (kind, text) == ("op", "("):
             self.take()
             a = self.expr()
@@ -730,7 +872,7 @@ def parse_signals(code: str, inputs=()) -> list:
     funcs = {}                         # name -> (kind, argument count), in order of definition
     scope = {"kind": None, "locals": None, "name": None}
     banned = {"connect": "connect", "route": "route", "run": "run", "when": "when", "finish": "finish", "delay": "delay",
-              "escape": "escape", "echo": "echo", "break": "break", "setindex": "index", "output": "output",
+              "escape": "escape", "echo": "echo", "break": "break", "setindex": "index", "output": "output", "lineage": "lineage",
               "callstmt": "a subprocess call"}
     unpure = {"ref": "signals and files", "pref": "signals and files", "param": "parameters", "pparam": "parameters",
               "column": "files", "state": "run states", "autorun": "AUTORUN", "input": "answers"}
@@ -886,6 +1028,16 @@ def parse_signals(code: str, inputs=()) -> list:
             return
         if e[0] == "pexpr":
             return check(e[1], line)
+        if e[0] == "sample" and len(e) != 3:
+            errors.append(f"line {line}: {e[1]}sample takes one stream, got {len(e) - 2}")
+        if e[0] == "call" and e[1] == "freeze":
+            if len(e) != 3:
+                errors.append(f"line {line}: freeze takes one stream, got {len(e) - 2}")
+            if scope["kind"] == "function":
+                errors.append(f"line {line}: {_NO_STREAMS}")
+            for a in e[2:]:
+                check(a, line)
+            return
         if e[0] == "call" and e[1] in _FNARGS:
             return check_builtin(e, line)
         if e[0] == "call" and e[1] in _MATH:
@@ -895,7 +1047,9 @@ def parse_signals(code: str, inputs=()) -> list:
             for a in e[2:]:
                 check(a, line)
             return
-        if scope["kind"] == "function" and e[0] in unpure:
+        if scope["kind"] == "function" and e[0] == "sample":
+            errors.append(f"line {line}: {_NO_STREAMS}")
+        elif scope["kind"] == "function" and e[0] in unpure:
             errors.append(f"line {line}: a function can't read {unpure[e[0]]}; pass them in as arguments")
         if e[0] == "name" and e[1] not in names:
             errors.append(f"line {line}: unknown name {e[1]}")
@@ -987,6 +1141,8 @@ def infer_type(v) -> str:
     """The narrowest type string for a JSON value ("" if none fits)."""
     if isinstance(v, Hex):
         return "hex"
+    if isinstance(v, Bits):
+        return _bits_type(v.width)
     if type(v) is bool:
         return "bool"
     if type(v) is int:
@@ -996,17 +1152,23 @@ def infer_type(v) -> str:
     if isinstance(v, str):
         return "text"
     if isinstance(v, dict):
+        if _is_range(v):
+            return _range_type(v)
         d = _complex_depth(v)
         if d is not None:
             return "vector::" * d + "complex"
         s = _series_parts(v)
         if s:
             return f"series::{s[0]}::{s[1]}"
+        if _stream_paths(v) is not None:
+            return "stream"
         return "bus" if _is_bus(v) else ""
     if isinstance(v, list):
         inner = {infer_type(e) for e in v}
-        if inner <= {"int", "float"} and inner:
-            inner = {"float"} if "float" in inner else {"int"}
+        heads = {t.rpartition("::")[0] for t in inner}
+        if inner and len(heads) == 1 and {t.rpartition("::")[2] for t in inner} <= {"int", "float"}:
+            head = heads.pop()                 # ints and floats together are floats, at any depth
+            inner = {(head + "::" if head else "") + ("float" if any(t.endswith("float") for t in inner) else "int")}
         return "vector::" + inner.pop() if len(inner) == 1 and "" not in inner else "vector"
     return ""
 
@@ -1020,8 +1182,20 @@ def type_ok(words, sv: _SV) -> bool:
         return True
     if sv.file:
         return len(words) == 1 and w not in _TYPE_WORDS and str(v).lower().endswith("." + w.lower())
-    if w in ("int", "float", "real", "num", "bool", "complex", "bus", "hex") and rest:
+    if w in ("int", "float", "real", "num", "bool", "complex", "bus", "hex", "tuple") and rest:
         return False
+    if w == "tuple":
+        return isinstance(v, list) and sv.type in ("", "tuple")
+    if w == "bits":
+        return isinstance(v, Bits) and (not rest or rest == [str(v.width)])
+    if w == "range":
+        return _is_range(v) and (not rest or rest in (["float"], ["real"], ["num"]) or rest == ["int"] and _range_type(v) == "range::int")
+    if w == "stream":
+        if _stream_paths(v) is None:
+            return False
+        have = sv.type.split("::")[1:]          # empty while the stream has no header yet
+        return not have or all(r == "num" or (r if r != "real" else "float") == have[1] if r in ("float", "real", "complex", "num")
+                               else r.lower() == have[0] for r in rest)
     if w == "hex":
         return isinstance(v, Hex)
     if w == "int":
@@ -1105,13 +1279,43 @@ def _show_type(sv: _SV) -> str:
 def _typed(words, sv: _SV, line: int) -> _SV:
     if sv.type == "text" and sv.source.startswith("$") and words == ["bool"] and sv.value in ("True", "False"):
         sv = _SV(sv.value == "True", "bool", sv.source)
-    if words == ["int"] and isinstance(sv.value, Hex):
+    if words == ["int"] and isinstance(sv.value, (Hex, Bits)):
         return _SV(int(sv.value), "int", sv.source)
+    if words[:1] == ["bits"] and not sv.file and (type(sv.value) is int or isinstance(sv.value, (Hex, Bits))):
+        return _to_bits(words, sv, line)
+    if words == ["hex"] and isinstance(sv.value, Bits):
+        if sv.value.width > 32:
+            raise SignalError(line, f"bits::{sv.value.width} is too wide for hex (32 bits)")
+        return _SV(Hex(int(sv.value)), "hex", sv.source)
+    if words == ["range", "float"] and _is_range(sv.value) and not sv.file:
+        return _SV({"lo": float(sv.value["lo"]), "hi": float(sv.value["hi"])}, "range::float", sv.source)
     if words == ["hex"] and type(sv.value) is int and not sv.file and 0 <= sv.value <= _HEX_MAX:
         return _SV(Hex(sv.value), "hex", sv.source)
+    if words == ["tuple"] and isinstance(sv.value, list) and not sv.file and sv.type.count("::") <= 1:
+        return _SV(sv.value, "tuple", sv.source)
     if not type_ok(words, sv):
         raise SignalError(line, f"expected {'::'.join(words)}, got {_show_type(sv)}")
     return sv if sv.type else _SV(sv.value, "::".join(words), sv.source, sv.file)
+
+
+def _to_bits(words, sv: _SV, line: int) -> _SV:
+    """bits::8 x: an int, hex or bits as a bit field; a hex is 32 wide unless a width is given."""
+    v = sv.value
+    if len(words) > 2 or (len(words) == 2 and not words[1].isdigit()):
+        raise SignalError(line, f"expected bits::<width>, such as bits::8, got {'::'.join(words)}")
+    w = int(words[1]) if len(words) == 2 else None
+    if w is not None and not 1 <= w <= _BITS_MAX:
+        raise SignalError(line, f"bits are 1 to {_BITS_MAX} wide, got bits::{w}")
+    if isinstance(v, Bits):
+        if w is None or w >= v.width:             # a wider field fills with zeros
+            return _SV(Bits(int(v), w or v.width), _bits_type(w or v.width), sv.source)
+        raise SignalError(line, f"bits::{v.width} doesn't fit in bits::{w}")
+    width = w or (32 if isinstance(v, Hex) else None)
+    if width is None:
+        raise SignalError(line, "give bits a width, such as bits::8")
+    if not 0 <= int(v) < 1 << width:
+        raise SignalError(line, f"{int(v)} doesn't fit in bits::{width}")
+    return _SV(Bits(int(v), width), _bits_type(width), sv.source)
 
 
 def _unhex(sv: _SV) -> _SV:
@@ -1147,6 +1351,11 @@ def _complex_arith(op, a: _SV, b: _SV, line: int) -> _SV:
 
 def _is_vec(sv: _SV) -> bool:
     return isinstance(sv.value, list) or (sv.type == "vector::complex" and isinstance(sv.value, dict))
+
+
+def _is_array(sv: _SV) -> bool:
+    """A vector or array, real or complex."""
+    return _is_vec(sv) or (sv.type.startswith("vector::") and sv.type.endswith("complex") and isinstance(sv.value, dict))
 
 
 def _items(sv: _SV) -> list:
@@ -1306,9 +1515,406 @@ def _maths(name, args, line) -> _SV:
     return _SV(vals, infer_type(vals) or "vector::float")
 
 
+# Ranges, bits, signal shaping, vector functions and matrices
+def _is_range(v) -> bool:
+    return isinstance(v, dict) and set(v) == {"lo", "hi"} and all(_is_num(v[k]) for k in ("lo", "hi"))
+
+
+def _range_type(v) -> str:
+    return "range::int" if type(v["lo"]) is int and type(v["hi"]) is int else "range::float"
+
+
+def _make_range(lo: _SV, hi: _SV, line: int) -> _SV:
+    ends = []
+    for x in (_unhex(lo), _unhex(hi)):
+        if x.file or not _is_num(x.value):
+            raise SignalError(line, f"a range's ends must be numbers, got {_show_type(x)}")
+        ends.append(x.value)
+    if ends[0] > ends[1]:
+        raise SignalError(line, f"a range's low end is above its high end: {{{ends[0]}, {ends[1]}}}")
+    v = {"lo": ends[0], "hi": ends[1]}
+    return _SV(v, _range_type(v))
+
+
+def _range_arg(name: str, sv: _SV, line: int):
+    if sv.file or not _is_range(sv.value):
+        raise SignalError(line, f"{name} needs a range such as {{0, 5}}, got {_show_type(sv)}")
+    return sv.value["lo"], sv.value["hi"]
+
+
+def _in_range(a: _SV, r: _SV, line: int) -> _SV:
+    """x in {lo, hi}: true when x is within the range, ends included; a vector or series only if every value is."""
+    lo, hi = _range_arg("in", r, line)
+    v = _unhex(a).value
+    if isinstance(v, dict) and _series_parts(v):
+        if _series_parts(v)[1] != "float":
+            raise SignalError(line, "in needs real values, not complex ones")
+        v = v["values"]
+    def ok(x):
+        if isinstance(x, list):
+            return all(ok(e) for e in x)
+        if isinstance(x, Hex):
+            x = int(x)
+        if x is not None and not _is_num(x):
+            raise SignalError(line, f"in needs numbers, got {_show_type(a)}")
+        return x is not None and lo <= x <= hi
+    if a.file or type(v) is bool or isinstance(v, dict):
+        raise SignalError(line, f"in needs numbers, got {_show_type(a)}")
+    return _SV(ok(v), "bool")
+
+
+def _each_real(name: str, sv: _SV, line: int, f) -> _SV:
+    """f on a real number, on every value of a vector or array, or on the values of a real series."""
+    sv = _unhex(sv)
+    v = sv.value
+    if isinstance(v, dict) and _series_parts(v):
+        dom, kind = _series_parts(v)
+        if kind != "float":
+            raise SignalError(line, f"{name} works on real values, not complex ones")
+        new = dict(v)
+        new["values"] = [None if y is None else float(f(y)) for y in v["values"]]
+        return _SV(new, f"series::{dom}::float", sv.source)
+    def go(x):
+        if isinstance(x, list):
+            return [go(e) for e in x]
+        if x is None:
+            return None
+        if not _is_num(x):
+            raise SignalError(line, f"{name} needs real numbers, got {_show_type(sv)}")
+        return f(x)
+    if sv.file or type(v) is bool or isinstance(v, dict) or isinstance(v, str):
+        raise SignalError(line, f"{name} needs real numbers, got {_show_type(sv)}")
+    out = go(v)
+    if not isinstance(out, list):
+        return _fres(out)
+    t = infer_type(out)
+    if t.endswith("float"):
+        out = _floats(out)
+    return _SV(out, t or "vector::float")
+
+
+def _floats(x):
+    return [_floats(e) for e in x] if isinstance(x, list) else float(x) if type(x) is int else x
+
+
+def _saturate(name, args, line, ctx=None) -> _SV:
+    lo, hi = _range_arg(name, args[1], line)
+    ints = type(lo) is int and type(hi) is int
+    def f(x):
+        r = lo if x < lo else hi if x > hi else x
+        return r if ints and type(x) is int else float(r)
+    return _each_real(name, args[0], line, f)
+
+
+def _excess(name, args, line, ctx=None) -> _SV:
+    lo, hi = _range_arg(name, args[1], line)
+    ints = type(lo) is int and type(hi) is int
+    def f(x):
+        r = x - lo if x < lo else x - hi if x > hi else 0
+        return r if ints and type(x) is int else float(r)
+    return _each_real(name, args[0], line, f)
+
+
+def _quantize(name, args, line, ctx=None) -> _SV:
+    q = _unhex(args[1])
+    if q.file or not _is_num(q.value) or q.value <= 0:
+        raise SignalError(line, f"quantize needs a step above 0, got {_show_value(q) if _is_num(q.value) else _show_type(q)}")
+    q = q.value
+    step = decimal.Decimal(repr(q))
+    def f(x):
+        k = math.floor(abs(x) / q + 0.5) * (1 if x >= 0 else -1)      # halfway goes away from zero
+        if type(x) is int and type(q) is int:
+            return k * q
+        return float(step * k)
+    return _each_real(name, args[0], line, f)
+
+
+def _popcount(name, args, line, ctx=None) -> _SV:
+    v = args[0].value
+    if not isinstance(v, Bits):
+        raise SignalError(line, f"popcount needs bits, got {_show_type(args[0])}")
+    return _SV(bin(v).count("1"), "int")
+
+
+def _vec_values(name: str, sv: _SV, line: int, complex_ok=True):
+    """(values, complex?) of a vector or a series' values; NaN is None."""
+    v = sv.value
+    if isinstance(v, dict) and _series_parts(v):
+        vals = v["values"]
+    elif isinstance(v, list) or (isinstance(v, dict) and sv.type.endswith("complex") and isinstance(v.get("re"), list)):
+        vals = v
+    else:
+        raise SignalError(line, f"{name} needs a vector or series, got {_show_type(sv)}")
+    if isinstance(vals, dict):
+        if any(isinstance(r, list) for r in vals["re"]):
+            raise SignalError(line, f"{name} takes a vector, not an array")
+        if not complex_ok:
+            raise SignalError(line, f"{name} can't order complex numbers; use abs, Re or Im first")
+        return [None if r is None or i is None else complex(r, i) for r, i in zip(vals["re"], vals["im"])], True
+    out = []
+    for x in vals:
+        if isinstance(x, list):
+            raise SignalError(line, f"{name} takes a vector, not an array")
+        if isinstance(x, Hex):
+            x = int(x)
+        if x is not None and not _is_num(x):
+            raise SignalError(line, f"{name} needs numbers, got {_show_type(sv)}")
+        out.append(x)
+    return out, False
+
+
+def _num_sv(x) -> _SV:
+    if isinstance(x, complex):
+        return _cres(x)
+    return _fres(x)
+
+
+def _reduce(name, args, line, ctx=None) -> _SV:
+    vals, _ = _vec_values(name, args[0], line)
+    if name == "sum":
+        return _SV(None, "float") if None in vals else _num_sv(sum(vals, 0))
+    if name == "prod":
+        if None in vals:
+            return _SV(None, "float")
+        r = 1
+        for x in vals:
+            r *= x
+        return _num_sv(r)
+    if not vals:
+        raise SignalError(line, f"{name} needs at least one value")
+    if None in vals:
+        return _SV(None, "float")
+    n = len(vals)
+    if name == "mean":
+        m = sum(vals, 0) / n
+        return _num_sv(m if isinstance(m, complex) else float(m))
+    if name == "rms":
+        return _fres(math.sqrt(sum(abs(x) ** 2 for x in vals) / n))
+    if name == "norm":
+        return _fres(math.sqrt(sum(abs(x) ** 2 for x in vals)))
+    if n < 2:
+        raise SignalError(line, "std needs at least two values")
+    m = sum(vals, 0) / n
+    return _fres(math.sqrt(sum(abs(x - m) ** 2 for x in vals) / (n - 1)))      # n - 1, as MATLAB and Julia
+
+
+def _extreme(name, args, line, ctx=None) -> _SV:
+    vals, _ = _vec_values(name, args[0], line, complex_ok=False)
+    if not vals:
+        raise SignalError(line, f"{name} needs at least one value")
+    known = [(x, i) for i, x in enumerate(vals) if x is not None]       # NaN is skipped, as in MATLAB
+    if not known:
+        return _SV(None, "float")
+    x, i = (min if name in ("min", "argmin") else max)(known, key=lambda p: p[0])
+    if name.startswith("arg"):
+        return _SV(i + (ctx or {}).get("first", 0), "int")
+    return _fres(x)
+
+
+def _sort(name, args, line, ctx=None) -> _SV:
+    vals, _ = _vec_values(name, args[0], line, complex_ok=False)
+    out = sorted(x for x in vals if x is not None) + [x for x in vals if x is None]      # NaN last
+    return _SV(out, infer_type(out) or "vector::float")
+
+
+def _length(name, args, line, ctx=None) -> _SV:
+    sv = args[0]
+    v = sv.value
+    if isinstance(v, Bits):
+        return _SV(v.width, "int")
+    if isinstance(v, dict) and _series_parts(v):
+        vals = v["values"]
+        return _SV(len(vals["re"]) if isinstance(vals, dict) else len(vals), "int")
+    if (isinstance(v, list) or (isinstance(v, dict) and sv.type.endswith("complex") and isinstance(v.get("re"), list))) \
+            and not sv.file:
+        dims = _dims(_nest(sv)[0])
+        if name == "size":
+            return _SV(dims, "vector::int")
+        return _SV(math.prod(dims), "int")              # every value, as Julia's length
+    raise SignalError(line, f"{name} needs a vector, array, series or bits, got {_show_type(sv)}")
+
+
+def _nest(sv: _SV):
+    """(nested list, complex?) of a vector or array: a complex one with {"re", "im"} leaves."""
+    v = sv.value
+    if isinstance(v, dict) and isinstance(v.get("re"), list):
+        def z(r, i):
+            return [z(a, b) for a, b in zip(r, i)] if isinstance(r, list) else {"re": r, "im": i}
+        return z(v["re"], v["im"]), True
+    return v, False
+
+
+def _dims(n) -> list:
+    """An array's size in mathematical order, rows first. It is stored column by column, so the outer list is
+    the last dimension."""
+    out = []
+    while isinstance(n, list):
+        out.append(len(n))
+        n = n[0] if n else None
+    return out[::-1]
+
+
+def _flat(n) -> list:
+    return [x for e in n for x in _flat(e)] if isinstance(n, list) else [n]
+
+
+def _unnest(n, cplx: bool, leaf_type: str, src: str) -> _SV:
+    if not isinstance(n, list):
+        return _SV(n, "complex" if cplx else (leaf_type or infer_type(n)), src)
+    if cplx:
+        def side(x, k):
+            return [side(e, k) for e in x] if isinstance(x, list) else x[k]
+        v = {"re": side(n, "re"), "im": side(n, "im")}
+        return _SV(v, "vector::" * len(_dims(n)) + "complex", src)
+    return _SV(n, infer_type(n) or "vector", src)
+
+
+def _dot(name, args, line, ctx=None) -> _SV:
+    a, ca = _vec_values(name, args[0], line)
+    b, cb = _vec_values(name, args[1], line)
+    if len(a) != len(b):
+        raise SignalError(line, f"{name} needs vectors of the same length, got {len(a)} and {len(b)} values")
+    if name == "cross":
+        if len(a) != 3 or ca or cb:
+            raise SignalError(line, "cross needs two real vectors of 3 values")
+        if None in a or None in b:
+            return _SV([None] * 3, "vector::float")
+        out = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+        return _SV(out, infer_type(out))
+    if None in a or None in b:
+        return _SV(None, "float")
+    return _num_sv(sum(((x.conjugate() if isinstance(x, complex) else x) * y for x, y in zip(a, b)), 0))   # conj(a), as Julia
+
+
+def _matrix(sv: _SV, line: int, what: str):
+    """(rows, 2-D?) of a real or complex vector or 2-D array, as Python numbers (NaN as nan)."""
+    v = sv.value
+    def num(x):
+        if isinstance(x, Hex):
+            x = int(x)
+        if x is None:
+            return math.nan
+        if not _is_num(x):
+            raise SignalError(line, f"{what} needs numbers, got {_show_type(sv)}")
+        return x
+    if isinstance(v, dict) and sv.type.endswith("complex") and isinstance(v.get("re"), list):
+        re_, im_ = v["re"], v["im"]
+        if re_ and isinstance(re_[0], list):
+            if any(isinstance(e, list) for r in re_ for e in r):
+                raise SignalError(line, f"{what} works on vectors and 2-D arrays")
+            cols = [[complex(num(a), num(b)) for a, b in zip(r, i)] for r, i in zip(re_, im_)]
+            return [list(r) for r in zip(*cols)], True
+        return [complex(num(a), num(b)) for a, b in zip(re_, im_)], False
+    if not isinstance(v, list) or sv.file:
+        raise SignalError(line, f"{what} needs a vector or 2-D array, got {_show_type(sv)}")
+    if v and isinstance(v[0], list):
+        if any(isinstance(e, list) for r in v for e in r):
+            raise SignalError(line, f"{what} works on vectors and 2-D arrays")
+        return [list(r) for r in zip(*[[num(e) for e in c] for c in v])], True     # stored by column
+    return [num(e) for e in v], False
+
+
+def _from_matrix(rows) -> _SV:
+    """A vector, or a 2-D array given as rows and stored by column."""
+    flat = [x for r in rows for x in (r if isinstance(r, list) else [r])]
+    if rows and isinstance(rows[0], list):
+        rows = [list(c) for c in zip(*rows)]
+    if any(isinstance(x, complex) for x in flat):
+        part = lambda f: None if math.isnan(f) else f
+        def side(x, which):
+            if isinstance(x, list):
+                return [side(e, which) for e in x]
+            z = complex(x)
+            return part(z.real if which else z.imag)
+        v = {"re": side(rows, True), "im": side(rows, False)}
+        return _SV(v, "vector::" * _complex_depth(v) + "complex")
+    def clean(x):
+        if isinstance(x, list):
+            return [clean(e) for e in x]
+        return None if isinstance(x, float) and math.isnan(x) else x
+    out = clean(rows)
+    t = infer_type(out)
+    if t.endswith("float"):
+        out = _floats(out)
+    return _SV(out, t or "vector::float")
+
+
+def _matmul(a: _SV, b: _SV, line: int) -> _SV:
+    """A * B: the matrix product of 2-D arrays, or of an array and a vector."""
+    A, a2 = _matrix(a, line, "*")
+    B, b2 = _matrix(b, line, "*")
+    if not a2 and not b2:
+        raise SignalError(line, "* of two vectors isn't defined; use dot(a, b), or .* for each pair of values")
+    Am = A if a2 else [[x] for x in A]          # a vector is a column, as in Julia
+    Bm = B if b2 else [[x] for x in B]
+    n = len(Am[0]) if Am else 0
+    if n != len(Bm):
+        shape = lambda m: f"{len(m)}x{len(m[0]) if m else 0}"
+        hint = "; a vector is a column: transpose(v) * A multiplies by a row" if not a2 else ""
+        raise SignalError(line, f"* needs the columns of the first to match the rows of the second, got "
+                                f"{shape(Am)} and {shape(Bm)}{hint}")
+    out = [[sum((Am[i][k] * Bm[k][j] for k in range(n)), 0) for j in range(len(Bm[0]))] for i in range(len(Am))]
+    if not b2:
+        out = [r[0] for r in out]
+    return _from_matrix(out)
+
+
+def _transpose(name, args, line, ctx=None) -> _SV:
+    sv = args[0]
+    v = sv.value
+    if isinstance(v, dict) and sv.type.endswith("complex") and isinstance(v.get("re"), list):
+        t = lambda m: [list(r) for r in zip(*m)] if m and isinstance(m[0], list) else [[e] for e in m]
+        if any(isinstance(e, list) for r in v["re"] if isinstance(r, list) for e in r):
+            raise SignalError(line, "transpose works on vectors and 2-D arrays")
+        out = {"re": t(v["re"]), "im": t(v["im"])}
+        return _SV(out, "vector::vector::complex")
+    if not isinstance(v, list) or sv.file:
+        raise SignalError(line, f"transpose needs a vector or 2-D array, got {_show_type(sv)}")
+    if v and isinstance(v[0], list):
+        if any(isinstance(e, list) for r in v for e in r):
+            raise SignalError(line, "transpose works on vectors and 2-D arrays")
+        out = [list(r) for r in zip(*v)]
+    else:
+        out = [[e] for e in v]
+    return _SV(out, infer_type(out) or "vector")
+
+
+def _bits_not(a: _SV, line: int) -> _SV:
+    v = a.value
+    if not isinstance(v, Bits):
+        raise SignalError(line, f"~ needs bits, got {_show_type(a)}")
+    return _SV(Bits(~int(v) & ((1 << v.width) - 1), v.width), _bits_type(v.width))
+
+
+def _bits_op(op: str, a: _SV, b: _SV, line: int) -> _SV:
+    x, y = a.value, b.value
+    if not isinstance(x, Bits):
+        raise SignalError(line, f"{op} needs bits, got {_show_type(a)}")
+    w = x.width
+    if op in ("<<", ">>"):
+        if type(y) is not int or y < 0:
+            raise SignalError(line, f"{op} shifts by a whole number from 0 up, got {_show_value(b) if type(y) is int else _show_type(b)}")
+        r = (int(x) << y) & ((1 << w) - 1) if op == "<<" else int(x) >> y
+        return _SV(Bits(r, w), _bits_type(w))
+    if not isinstance(y, Bits):
+        raise SignalError(line, f"{op} needs bits, got {_show_type(b)}")
+    if y.width != w:
+        raise SignalError(line, f"{op} needs bits of the same width, got bits::{w} and bits::{y.width}")
+    r = int(x) & int(y) if op == "&" else int(x) | int(y) if op == "|" else int(x) ^ int(y)
+    return _SV(Bits(r, w), _bits_type(w))
+
+
+_MORE = {"saturate": _saturate, "excess": _excess, "quantize": _quantize, "popcount": _popcount,
+         "min": _extreme, "max": _extreme, "argmin": _extreme, "argmax": _extreme,
+         "sum": _reduce, "prod": _reduce, "mean": _reduce, "std": _reduce, "rms": _reduce, "norm": _reduce,
+         "sort": _sort, "length": _length, "size": _length, "dot": _dot, "cross": _dot, "transpose": _transpose}
+
 _MATH = {"Re": 1, "Im": 1, "abs": 1, "arg": 1, "conj": 1, "power": 2, "root": 2}     # built-in maths, and their argument counts
+_MATH.update({n: (2 if n in ("saturate", "excess", "quantize", "dot", "cross") else 1) for n in _MORE})
+_NO_STREAMS = "a function can't read streams: sample or freeze the stream first and pass in the value"
 _FNARGS = {"map": 1, "warp": 2}      # built-in calls and how many function arguments they start with
-_BUILTINS = ("map", "warp", "unity", "Re", "Im", "im", "input", "abs", "arg", "conj", "power", "root")
+_BUILTINS = ("map", "warp", "unity", "Re", "Im", "im", "input", "abs", "arg", "conj", "power", "root", "sample", "freeze") \
+    + tuple(_MORE)
 
 
 def _fn_name(node) -> str:
@@ -1442,6 +2048,8 @@ class _Live:
 def _is_live(e, ctx) -> bool:
     if e[0] in ("ref", "column", "state"):
         return True
+    if e[0] == "sample":                     # a sample is taken once, when its line runs
+        return False
     if e[0] == "name":
         return isinstance(ctx["vars"].get(e[1], (None,))[0], _Live)
     if e[0] == "mux":
@@ -1450,6 +2058,18 @@ def _is_live(e, ctx) -> bool:
 
 
 def _param_value(text, source) -> _SV:
+    t = str(text).strip()
+    if re.fullmatch(r"0[bB][01]{1,64}", t):
+        return _SV(Bits(int(t[2:], 2), len(t) - 2), _bits_type(len(t) - 2), source)
+    m = re.fullmatch(r"\{\s*([^,{}]+?)\s*,\s*([^,{}]+?)\s*\}", t)
+    if m:
+        try:
+            lo, hi = json.loads(m.group(1)), json.loads(m.group(2))
+        except ValueError:
+            lo = hi = None
+        if _is_num(lo) and _is_num(hi) and lo <= hi:
+            v = {"lo": lo, "hi": hi}
+            return _SV(v, _range_type(v), source)
     try:
         v = json.loads(text)
     except ValueError:
@@ -1506,6 +2126,165 @@ def _read_column(path: str, name: str, line: int) -> dict:
     if header is None:
         raise _Pending(line, f"{shown} has no column {name} yet")
     return {"domain": _domain_of(header[0]), "x": x, "values": values}
+
+
+# Streams: a stream is a Signal still being written, <module>.<port>.sig with type stream::<domain>::<kind>.
+# Its value is {"domain", "x", "values", "window", "count", "ended"}: the last `window` samples (values as in a
+# series), how many were ever written, and whether its module has ended. The module rewrites the whole file at
+# each sample; Signet marks it ended when the module stops, and stamps it if the run went well. A stream's value
+# in Signet code is {"stream": [path, ...]}, read again at each use: more than one path after a merge.
+STREAM_WINDOW = 1048
+
+
+def _stream_paths(v):
+    if isinstance(v, dict) and len(v) == 1 and isinstance(v.get("stream"), list) and v["stream"] \
+            and all(isinstance(p, str) for p in v["stream"]):
+        return v["stream"]
+    return None
+
+
+def stream_sig(path: str):
+    """A stream's .sig as a dict, or None if it isn't one: stamped, or unstamped while its module still writes it."""
+    try:
+        if os.path.getsize(path) > _SIG_MAX:
+            return None
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not (isinstance(obj, dict) and str(obj.get("type", "")).split("::")[0] == "stream" and isinstance(obj.get("value"), dict)):
+        return None
+    if obj.get("hash"):
+        return obj if obj["hash"] == _sig_hash(obj) else None
+    return None if obj["value"].get("ended") else obj
+
+
+def _stream_type(paths, line=None) -> str:
+    """stream::<domain>::<kind> of one stream or a merge of them; just "stream" before any sample."""
+    kinds = {o["type"] for o in map(stream_sig, paths) if o and o["type"] != "stream"}
+    if len(kinds) > 1:
+        raise SignalError(line, "merged streams differ: " + ", ".join(sorted(kinds)))
+    return kinds.pop() if kinds else "stream"
+
+
+def _stream_rows(obj):
+    """[(t, value)] of a stream's window; a complex value is {"re", "im"}."""
+    v = obj["value"]
+    x, vals = v.get("x") or [], v.get("values") or []
+    if isinstance(vals, dict):
+        vals = [{"re": r, "im": i} for r, i in zip(vals.get("re") or [], vals.get("im") or [])]
+    return [(t, y) for t, y in zip(x, vals) if _is_num(t)]
+
+
+def _stream_arg(fn: str, arg, line: int, ctx):
+    s = _eval(arg, line, ctx)
+    paths = _stream_paths(s.value)
+    if paths is None:
+        raise SignalError(line, f"{fn} needs a stream, got {_show_type(s)}")
+    kind = _stream_type(paths, line)
+    rows = sorted((r for o in map(stream_sig, paths) if o for r in _stream_rows(o)), key=lambda r: r[0])
+    return kind, rows
+
+
+def _sample(mode: str, arg, line: int, ctx) -> _SV:
+    """sample(s): the latest [t, value] as a tuple; $sample(s) the value; @sample(s) its t."""
+    kind, rows = _stream_arg(f"{mode}sample", arg, line, ctx)
+    if not rows:
+        raise _Pending(line, f"{arg[1] if arg[0] in ('name', 'ref') else 'the stream'} has no samples yet")
+    t, v = rows[-1]
+    if kind.endswith("::complex"):
+        vv = _SV(v if isinstance(v, dict) else {"re": None, "im": None}, "complex")
+    else:
+        vv = _SV(float(v) if _is_num(v) else None, "float")
+    src = f"line {line}: {mode}sample"
+    if mode == "$":
+        return _SV(vv.value, vv.type, src)
+    if mode == "@":
+        return _SV(t, "int" if type(t) is int else "float", src)
+    return _SV([t, vv.value], "tuple", src)
+
+
+def _freeze(arg, line: int, ctx) -> _SV:
+    """freeze(s): the stream's window as it is now, a series; the stream goes on."""
+    kind, rows = _stream_arg("freeze", arg, line, ctx)
+    if kind == "stream":
+        raise _Pending(line, f"{arg[1] if arg[0] in ('name', 'ref') else 'the stream'} has no samples yet")
+    _, domain, k = kind.split("::")
+    x = [r[0] for r in rows]
+    if k == "complex":
+        vals = {"re": [r[1].get("re") if isinstance(r[1], dict) else None for r in rows],
+                "im": [r[1].get("im") if isinstance(r[1], dict) else None for r in rows]}
+    else:
+        vals = [float(r[1]) if _is_num(r[1]) else None for r in rows]
+    return _SV({"domain": domain, "x": x, "values": vals}, f"series::{domain}::{k}", f"line {line}: freeze")
+
+
+_END_LOCK = threading.Lock()
+
+
+def end_stream(path: str) -> None:
+    """Mark an unstamped stream ended: its module has stopped. A stream with no samples is removed."""
+    with _END_LOCK:
+        _end_stream(path)
+
+
+def _end_stream(path: str) -> None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return
+    if not isinstance(obj, dict) or obj.get("hash") or not isinstance(obj.get("value"), dict) \
+            or str(obj.get("type", "")).split("::")[0] != "stream":
+        return
+    if "domain" not in obj["value"]:
+        os.remove(path)
+        return
+    obj["value"]["ended"] = True
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    os.replace(path + ".tmp", path)
+
+
+def _note(ctx, sv: _SV) -> _SV:
+    """Adds what a variable was worked out from to the expression being traced."""
+    if sv.trace and ctx.get("touched") is not None:
+        ctx["touched"].update(sv.trace)
+    return sv
+
+
+def _traced(e, line: int, ctx) -> _SV:
+    """_eval, keeping on the result the Signals, files and parameters it was worked out from (for lineage)."""
+    outer, ctx["touched"] = ctx.get("touched"), {}
+    try:
+        sv = _eval(e, line, ctx)
+        got = ctx["touched"]
+    finally:
+        ctx["touched"] = outer
+    if outer is not None:
+        outer.update(got)
+    if got:
+        sv = dataclasses.replace(sv, trace={**(sv.trace or {}), **got})
+    return sv
+
+
+_FILE_HASHES = {}
+
+
+def _file_hash(path: str) -> str:
+    """"sha256:<hex>" of a file's bytes, kept while the file is unchanged; "" if it can't be read."""
+    try:
+        st = os.stat(path)
+        key = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+        if key not in _FILE_HASHES:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            _FILE_HASHES[key] = "sha256:" + h.hexdigest()
+        return _FILE_HASHES[key]
+    except OSError:
+        return ""
 
 
 def _cmp(op, x, y) -> bool:
@@ -1596,10 +2375,20 @@ def _eval(e, line: int, ctx) -> _SV:
         if n > _HEX_MAX:
             raise SignalError(line, f"hex::{raw} is over hex::FFFFFFFF")
         return _SV(Hex(n), "hex")
+    if kind == "call" and e[1] in _MORE:
+        return _MORE[e[1]](e[1], [_eval(a, line, ctx) for a in e[2:]], line, ctx)
+    if kind == "bits":
+        return _SV(Bits(int(e[1], 2), len(e[1])), _bits_type(len(e[1])))
+    if kind == "range":
+        return _make_range(_eval(e[1], line, ctx), _eval(e[2], line, ctx), line)
+    if kind == "bnot":
+        return _bits_not(_eval(e[1], line, ctx), line)
     if kind == "call" and e[1] in _MATH:
         return _maths(e[1], [_eval(a, line, ctx) for a in e[2:]], line)
     if kind == "call" and e[1] == "map":
         return _map(_fn_name(e[2]), [_eval(a, line, ctx) for a in e[3:]], line, ctx)
+    if kind == "call" and e[1] == "freeze":
+        return _freeze(e[2], line, ctx)
     if kind == "call" and e[1] == "warp":
         return _warp(_fn_name(e[2]), _fn_name(e[3]), _eval(e[4], line, ctx), line, ctx)
     if kind == "call":
@@ -1616,11 +2405,13 @@ def _eval(e, line: int, ctx) -> _SV:
                 and all(isinstance(v, dict) for v in vals):
             packed = {"re": [v["re"] for v in vals], "im": [v["im"] for v in vals]}
             if _complex_depth(packed) is None:
-                raise SignalError(line, "the rows of an array must all be the same length")
+                raise SignalError(line, "the columns of an array must all be the same length")
             return _SV(packed, "vector::" + items[0].type, "vector")
         t = infer_type(vals)
         if items and t in ("vector", ""):
             raise SignalError(line, "a vector's values must all be of one type, got " + ", ".join(sorted({_show_type(i) for i in items})))
+        if t.endswith("float") and t.count("::") > 1:
+            vals = _floats(vals)
         return _SV(vals, t or "vector", "vector")
     if kind == "pref":
         point = _point_str(("pexpr", e[1]), line, ctx)
@@ -1630,16 +2421,22 @@ def _eval(e, line: int, ctx) -> _SV:
     if kind == "ref":
         text = _ref_text(e[1], line, ctx)
         if text in ctx.get("merged", {}):
-            return ctx["merged"][text]
+            return _note(ctx, ctx["merged"][text])
         try:
-            return host.resolve(text)
+            sv = host.resolve(text)
         except LookupError as err:
             raise _Pending(line, err.args[0] if err.args else f"nothing live matches {text}")
+        if ctx.get("touched") is not None:
+            key = getattr(sv, "path", "") or text
+            ctx["touched"][key] = _file_hash(key) if sv.file else (getattr(sv, "stamp", "") or None)
+        return sv
     if kind == "param":
         try:
             text = host.param(e[1])
         except LookupError as err:
             raise SignalError(line, err.args[0] if err.args else f"no parameter {e[1]}")
+        if ctx.get("touched") is not None:
+            ctx["touched"]["$" + e[1]] = str(text)
         return _param_value(text, "$" + e[1])
     if kind == "pparam":
         if not hasattr(host, "point_param"):
@@ -1649,6 +2446,8 @@ def _eval(e, line: int, ctx) -> _SV:
             text = host.point_param(point, e[2])
         except LookupError as err:
             raise SignalError(line, err.args[0] if err.args else f"point {point} has no parameter {e[2]}")
+        if ctx.get("touched") is not None:
+            ctx["touched"][f"{point}:${e[2]}"] = str(text)
         return _param_value(text, f"{point}:${e[2]}")
     if kind == "autorun":
         if not hasattr(host, "autorun"):
@@ -1666,6 +2465,8 @@ def _eval(e, line: int, ctx) -> _SV:
         return _SV(s, f"series::{s['domain']}::float", f"column({f.source}, {e[2]})")
     if kind == "index":
         return _index(e, line, ctx)
+    if kind == "sample":
+        return _sample(e[1], e[2], line, ctx)
     if kind == "name":
         sv, words = ctx["vars"][e[1]]
         if isinstance(sv, _Blocked):
@@ -1674,7 +2475,7 @@ def _eval(e, line: int, ctx) -> _SV:
             sv = _eval(sv.expr, sv.line, ctx)
             if words:
                 sv = _typed(words, sv, line)
-        return sv
+        return _note(ctx, sv)
     if kind == "typed":
         return _typed(e[1], _eval(e[2], line, ctx), line)
     if kind == "input":
@@ -1714,25 +2515,36 @@ def _eval(e, line: int, ctx) -> _SV:
         f = bus.value[e[2]]
         return _SV(f.get("value"), str(f.get("type") or ""), f"{e[1]}.{e[2]}")
     op, a, b = e[1], _eval(e[2], line, ctx), _eval(e[3], line, ctx)
+    if op == "*" and _is_array(a) and _is_array(b):
+        return _matmul(a, b, line)
     if op in ("+", "-", "*", "/"):
         if _is_vec(a) or _is_vec(b):
             both = _is_vec(a) and _is_vec(b)
             if op in ("+", "-") and not both:
                 raise SignalError(line, f"{op} needs two vectors; use .{op} to apply a number to every value")
             if op == "*" and both:
-                raise SignalError(line, "* isn't elementwise; use .* for vectors")
+                return _matmul(a, b, line)
             if op == "/" and (both or _is_vec(b)):
                 raise SignalError(line, "/ divides a vector by a number; use ./ for elementwise division")
             return _broadcast(op, op, a, b, line)
         return _arith(op, a, b, line)
     if op in (".+", ".-", ".*", "./"):
         return _broadcast(op[1], op, a, b, line)
+    if op in ("&", "|", "xor", "<<", ">>"):
+        return _bits_op(op, a, b, line)
+    if op == "in":
+        return _in_range(a, b, line)
     if op in ("and", "or"):
         for x in (a, b):
             if type(x.value) is not bool:
                 raise SignalError(line, f"{op} needs bools, got {_show_type(x)}")
         return _SV(a.value and b.value if op == "and" else a.value or b.value, "bool")
     x, y = a.value, b.value
+    if isinstance(x, Bits) or isinstance(y, Bits):
+        if op not in ("==", "/=") or not (isinstance(x, Bits) and isinstance(y, Bits)):
+            raise SignalError(line, f"{op} can't compare {_show_type(a)} with {_show_type(b)}" if op in ("==", "/=")
+                              else f"{op} can't order bits; compare them with == or /=")
+        return _SV((int(x) == int(y) and x.width == y.width) == (op == "=="), "bool")
     if isinstance(x, Hex) != isinstance(y, Hex):
         a, b = _unhex(a), _unhex(b)
         x, y = a.value, b.value
@@ -1758,11 +2570,56 @@ def _eval(e, line: int, ctx) -> _SV:
     return _SV(_cmp(op, x, y), "bool")
 
 
+def _position(spec, n: int, label: str, line: int, ctx) -> int:
+    """The 0-based place an index names: a number (counted from index(), 0 by default) or end, end-k."""
+    if spec[0] == "end":
+        back = 0
+        if spec[1] is not None:
+            off = _eval(spec[1], line, ctx)
+            if type(off.value) is not int:
+                raise SignalError(line, f"an index needs a whole number, got {_show_type(off)}")
+            back = off.value
+        i = n - 1 - back
+        shown = i
+    else:
+        iv = _eval(spec, line, ctx)
+        if type(iv.value) is not int:
+            raise SignalError(line, f"an index needs a whole number, got {_show_type(iv)}")
+        i = iv.value - ctx.get("first", 0)
+        shown = iv.value
+    if not 0 <= i < n:
+        raise SignalError(line, f"index {shown} is outside {label} ({n} values)")
+    return i
+
+
 def _index(e, line: int, ctx) -> _SV:
     base = _eval(e[1], line, ctx)
     label = e[1][1] if e[1][0] == "name" else "the value"
     v = base.value
+    spec = e[2]
+    if isinstance(v, Bits):                    # b[0] is the lowest bit
+        if spec[0] == "slice":
+            lo, hi = (_position(s, v.width, label, line, ctx) for s in spec[1:])
+            if lo > hi:
+                raise SignalError(line, f"a slice runs from low to high, got [{lo}:{hi}]")
+            w = hi - lo + 1
+            return _SV(Bits((int(v) >> lo) & ((1 << w) - 1), w), _bits_type(w), f"{base.source or label}[{lo}:{hi}]")
+        i = _position(spec, v.width, label, line, ctx)
+        return _SV(bool(int(v) >> i & 1), "bool", f"{base.source or label}[{i}]")
+    if _is_range(v) and not base.file:
+        i = _position(spec, 2, label, line, ctx) if spec[0] != "slice" else None
+        if i is None:
+            raise SignalError(line, "a range can't be sliced; use r[0] and r[1]")
+        x = v["lo" if i == 0 else "hi"]
+        return _SV(x, infer_type(x), f"{base.source or label}[{i}]")
+    if (isinstance(v, list) and v and isinstance(v[0], list)) or spec[0] == "multi" \
+            or (isinstance(v, dict) and isinstance(v.get("re"), list) and v["re"] and isinstance(v["re"][0], list)):
+        return _index_array(base, spec, label, line, ctx)
+    if spec[0] == "all" and (isinstance(v, list) or (isinstance(v, dict) and isinstance(v.get("re"), list))):
+        return base
     if isinstance(v, dict) and _series_parts(v):
+        if spec[0] == "slice":
+            raise SignalError(line, "a series can't be sliced")
         vals = v["values"]
         n = len(vals["re"]) if isinstance(vals, dict) else len(vals)
     elif isinstance(v, list):
@@ -1773,21 +2630,15 @@ def _index(e, line: int, ctx) -> _SV:
         raise SignalError(line, f"can't index {_show_type(base)}")
     if n == 0:
         raise _Pending(line, f"{label} has no values yet")
-    if e[2][0] == "end":
-        back = 0
-        if e[2][1] is not None:
-            off = _eval(e[2][1], line, ctx)
-            if type(off.value) is not int:
-                raise SignalError(line, f"an index needs a whole number, got {_show_type(off)}")
-            back = off.value
-        i = n - 1 - back
-    else:
-        iv = _eval(e[2], line, ctx)
-        if type(iv.value) is not int:
-            raise SignalError(line, f"an index needs a whole number, got {_show_type(iv)}")
-        i = iv.value - ctx.get("first", 0)
-    if not 0 <= i < n:
-        raise SignalError(line, f"index {i + ctx.get('first', 0) if e[2][0] != 'end' else i} is outside {label} ({n} values)")
+    if spec[0] == "slice":                     # v[1:3]: both ends included
+        lo, hi = (_position(s, n, label, line, ctx) for s in spec[1:])
+        if lo > hi:
+            raise SignalError(line, f"a slice runs from low to high, got [{lo}:{hi}]")
+        src = f"{base.source or label}[{lo}:{hi}]"
+        if isinstance(vals, dict):
+            return _SV({"re": vals["re"][lo:hi + 1], "im": vals["im"][lo:hi + 1]}, base.type, src)
+        return _SV(vals[lo:hi + 1], base.type or infer_type(vals), src)
+    i = _position(spec, n, label, line, ctx)
     src = f"{base.source or label}[{i}]"
     if isinstance(vals, dict):
         t = "complex" if base.type.startswith("series") else base.type[len("vector::"):]
@@ -1797,6 +2648,46 @@ def _index(e, line: int, ctx) -> _SV:
     if isinstance(v, dict):
         t = "float"
     return _SV(el, t, src)
+
+
+def _index_array(base: _SV, spec, label: str, line: int, ctx) -> _SV:
+    """A[k], A[a:b] and A[:] count down the columns; A[i, j] is row i, column j, and A[:, j] a column."""
+    if isinstance(base.value, dict) and _series_parts(base.value) or not (isinstance(base.value, list)
+                                                                         or isinstance(base.value, dict) and isinstance(base.value.get("re"), list)):
+        raise SignalError(line, f"{_show_type(base)} takes one index")
+    n, cplx = _nest(base)
+    leaf = re.sub(r"^(vector::)+", "", base.type or "")
+    dims = _dims(n)
+    src = f"{base.source or label}[...]"
+    if spec[0] != "multi":
+        flat = _flat(n)
+        if not flat:
+            raise _Pending(line, f"{label} has no values yet")
+        if spec[0] == "all":
+            return _unnest(flat, cplx, leaf, src)
+        if spec[0] == "slice":
+            lo, hi = (_position(x, len(flat), label, line, ctx) for x in spec[1:])
+            if lo > hi:
+                raise SignalError(line, f"a slice runs from low to high, got [{lo}:{hi}]")
+            return _unnest(flat[lo:hi + 1], cplx, leaf, src)
+        return _unnest(flat[_position(spec, len(flat), label, line, ctx)], cplx, leaf, src)
+    specs = spec[1:]
+    if len(specs) != len(dims):
+        raise SignalError(line, f"{label} has {len(dims)} dimension{'s' * (len(dims) != 1)}, "
+                                f"so it takes 1 or {len(dims)} indexes, got {len(specs)}")
+    def pick(node, rest):              # the outer list is the last dimension
+        if not rest:
+            return node
+        sp, more = rest[-1], rest[:-1]
+        if sp[0] == "all":
+            return [pick(e, more) for e in node]
+        if sp[0] == "slice":
+            lo, hi = (_position(x, len(node), label, line, ctx) for x in sp[1:])
+            if lo > hi:
+                raise SignalError(line, f"a slice runs from low to high, got [{lo}:{hi}]")
+            return [pick(e, more) for e in node[lo:hi + 1]]
+        return pick(node[_position(sp, len(node), label, line, ctx)], more)
+    return _unnest(pick(n, list(specs)), cplx, leaf, src)
 
 
 def _elements(sv: _SV, line: int):
@@ -1823,6 +2714,12 @@ def _series_x(v: dict) -> list:
 def _merge2(a: _SV, b: _SV, line: int) -> _SV:
     ta, tb = a.type or infer_type(a.value), b.type or infer_type(b.value)
     bad = SignalError(line, f"can't merge {ta or 'this'} with {tb or 'this'}")
+    if ta.startswith("stream") or tb.startswith("stream"):
+        pa, pb = _stream_paths(a.value), _stream_paths(b.value)
+        if pa is None or pb is None:
+            raise bad
+        paths = pa + [p for p in pb if p not in pa]
+        return _SV({"stream": paths}, _stream_type(paths, line), "route merge")
     if ta.startswith("series") or tb.startswith("series"):
         if ta != tb or not (_series_parts(a.value) and _series_parts(b.value)):
             raise bad
@@ -1869,6 +2766,8 @@ def _expr_sources(e, names: dict, seen=()) -> tuple:
             refs += r; consts += c; buses += b
     elif kind in ("num", "bool"):
         consts.append(str(e[1]).lower() if kind == "bool" else str(e[1]))
+    elif kind == "bits":
+        consts.append("0b" + e[1])
     elif kind == "name" and e[1] not in seen:
         for sub in names.get(e[1], []):
             r, c, b = _expr_sources(sub, names, seen + (e[1],))
@@ -1893,7 +2792,10 @@ def _expr_sources(e, names: dict, seen=()) -> tuple:
 def source_value(path: str, label: str, ref: str) -> _SV:
     """A host's answer for a reference: a stamped .sig's value, or any other file as its path."""
     if not path.endswith(".sig"):
-        return _SV(path, os.path.splitext(path)[1][1:].lower(), label, file=True)
+        return _SV(path, os.path.splitext(path)[1][1:].lower(), label, file=True, path=path)
+    live = stream_sig(path)
+    if live is not None:
+        return _SV({"stream": [path]}, _stream_type([path]), label, path=path, stamp=live.get("hash", ""))
     try:
         obj = read_sig(path)
     except ValueError as e:
@@ -1901,7 +2803,8 @@ def source_value(path: str, label: str, ref: str) -> _SV:
     v = obj["value"]
     if obj.get("type") == "hex" and type(v) is int and 0 <= v <= _HEX_MAX:
         v = Hex(v)
-    return _SV(v, str(obj.get("type") or ""), label)
+    v = _bits_from(str(obj.get("type") or ""), v)
+    return _SV(v, str(obj.get("type") or ""), label, path=path, stamp=obj["hash"])
 
 
 def _cshow(re_, im_) -> str:
@@ -1913,12 +2816,26 @@ def _cshow(re_, im_) -> str:
 
 
 def _show_value(sv: _SV) -> str:
+    if sv.type == "tuple" and isinstance(sv.value, list):
+        return "[" + ", ".join(_show_value(_SV(x, infer_type(x))) for x in sv.value) + "]"
+    if _stream_paths(sv.value) is not None:
+        return "stream " + ", ".join(sv.value["stream"])
     if isinstance(sv.value, Hex):
         return f"hex::{sv.value:X}"
+    if isinstance(sv.value, Bits):
+        return "0b" + format(int(sv.value), f"0{sv.value.width}b")
+    if _is_range(sv.value):
+        return "{" + json.dumps(sv.value["lo"]) + ", " + json.dumps(sv.value["hi"]) + "}"
     if sv.type == "complex" and isinstance(sv.value, dict) and not isinstance(sv.value["re"], list):
         return _cshow(sv.value["re"], sv.value["im"])
     if sv.type == "vector::complex" and isinstance(sv.value, dict) and not any(isinstance(x, list) for x in sv.value["re"]):
         return "[" + ", ".join(_cshow(r, i) for r, i in zip(sv.value["re"], sv.value["im"])) + "]"
+    if isinstance(sv.value, (list, dict)) and sv.type.startswith("vector::vector::") and sv.type.count("vector::") == 2:
+        n, cplx = _nest(sv)
+        if n and all(isinstance(c, list) and len(c) == len(n[0]) and not any(isinstance(x, list) for x in c) for c in n):
+            one = (lambda z: _cshow(z["re"], z["im"])) if cplx else (lambda x: _show_value(_SV(x, infer_type(x))))
+            rows = [", ".join(one(x) for x in r) for r in zip(*n)]
+            return "[" + "; ".join(rows) + (";" if len(rows) == 1 else "") + "]"      # written as it is typed in
     text = json.dumps(sv.value, ensure_ascii=False)
     return text if len(text) <= 200 else text[:200] + " ..."
 
@@ -2070,7 +2987,6 @@ class _Exec:
         self.ctx = {"host": host, "vars": {}, "lazy": lazy}
         self.ctx["root"] = self.ctx["vars"]
         self.pending, self.lines = {}, {}      # held connections by module or point; the line of each
-        self.to_point = None                   # deliveries(): only the lines aimed at this point count
 
     def block(self, nodes):
         ctx, seq = self.ctx, self.seq
@@ -2080,7 +2996,7 @@ class _Exec:
                 if ctx["lazy"] and _is_live(nd[4], ctx):
                     ctx["vars"][nd[3]] = (_Live(nd[4], line, nd[2]), nd[2])
                 else:
-                    sv = _eval(nd[4], line, ctx)
+                    sv = _traced(nd[4], line, ctx)
                     if nd[2]:
                         sv = _typed(nd[2], sv, line)
                     if not sv.source:
@@ -2088,15 +3004,15 @@ class _Exec:
                     ctx["vars"][nd[3]] = (sv, nd[2])
             elif kind == "set":
                 words = ctx["vars"][nd[2]][1]
-                sv = _eval(nd[3], line, ctx)
+                sv = _traced(nd[3], line, ctx)
                 if words:
                     sv = _typed(words, sv, line)
                 if not sv.source:
                     sv.source = f"line {line}: {nd[2]}"
                 ctx["vars"][nd[2]] = (sv, words)
             elif kind == "connect":
-                if self._applies(nd[4], nd[6], line):
-                    sv = _eval(nd[2], line, ctx)
+                if self._applies(nd[4]):
+                    sv = _traced(nd[2], line, ctx)
                     self._hold(line, sv, nd[3], nd[4], nd[5], nd[6])
             elif kind == "route":
                 self._route(nd)
@@ -2113,8 +3029,17 @@ class _Exec:
                 ctx["first"] = v.value
             elif kind == "for":
                 yield from self._for(nd)
-            elif kind in ("echo", "break") and self.to_point is not None:
-                continue                       # the code's own point's business, not the point it delivers to
+            elif kind == "lineage":
+                text = _ref_text(nd[2], line, ctx)
+                sv = _eval(("ref", nd[2]), line, ctx)
+                path = sv.path or text
+                if sv.file or not path.endswith(".sig"):
+                    raise SignalError(line, f"lineage takes a Signal, got {_show_type(sv)}")
+                folder = getattr(ctx["host"], "folder", ".")
+                say = seq.say if seq is not None else lambda t, ln: (ctx["host"].echo if hasattr(ctx["host"], "echo") else print)(t)
+                say(f"line {line}: lineage of {text}", line)
+                for ln in lineage(os.path.basename(path), os.path.dirname(path) or folder, getattr(ctx["host"], "module_dirs", ())):
+                    say("  " + ln, line)
             elif kind == "echo":
                 text = f"line {line}: {nd[3]} = " + ", ".join(_show_value(_eval(a, line, ctx)) for a in nd[2])
                 if seq is not None:
@@ -2155,7 +3080,7 @@ class _Exec:
         if fn is None or fn["kind"] != "subprocess":
             raise SignalError(line, f"unknown subprocess {name}")
         local = _Scope(ctx["root"])
-        local.update(_bind(fn["params"], [_eval(a, line, ctx) for a in exprs], name, line, ctx))
+        local.update(_bind(fn["params"], [_traced(a, line, ctx) for a in exprs], name, line, ctx))
         inner = {"host": ctx["host"], "vars": local, "root": ctx["root"], "lazy": ctx["lazy"], "funcs": fn["funcs"],
                  "merged": ctx.setdefault("merged", {}), "first": ctx.get("first", 0)}
         if "out" in ctx:
@@ -2169,11 +3094,11 @@ class _Exec:
             self.ctx = ctx
             ctx["first"] = inner["first"]
 
-    def _applies(self, mod, point=None, line=0):
+    def _applies(self, mod):
         # In a point's own code only its module's connections count; in a sequence, only the sequence's own;
-        # for deliveries(), only those aimed at to_point.
-        if self.to_point is not None:
-            return mod is None and point is not None and _point_str(point, line, self.ctx) == self.to_point
+        # for deliveries(), only those to other points.
+        if getattr(self, "points_only", False):
+            return mod is None
         if self.seq is None:
             return mod is not None and mod == self.module
         return not (mod is not None and self.module is not None)
@@ -2186,10 +3111,13 @@ class _Exec:
         name = f"{mod}.{port}" if mod else f"{point}:{port}"
         if (target, port) in self.lines:
             raise SignalError(line, f"{name} is connected twice (lines {self.lines[target, port]} and {line})")
+        trace = sv.trace or {}
         if words:
             sv = _typed(words, sv, line)
-        self.pending.setdefault(target, {})[port] = {"value": sv.value, "type": sv.type or infer_type(sv.value),
-                                                     "source": sv.source or f"line {line}"}
+        entry = {"value": sv.value, "type": sv.type or infer_type(sv.value), "source": sv.source or f"line {line}"}
+        if trace:
+            entry["sources"] = dict(trace)
+        self.pending.setdefault(target, {})[port] = entry
         self.lines[target, port] = line
 
     def _route(self, nd):
@@ -2197,15 +3125,20 @@ class _Exec:
         ctx = self.ctx
         if mode == "merge":
             text = _ref_text(src[1], line, ctx)
-            first = _eval(src, line, ctx)
-            merged = _merge(first, [_eval(i, line, ctx) for i in items], line)
+            outer, ctx["touched"] = ctx.get("touched"), {}
+            try:
+                first = _eval(src, line, ctx)
+                merged = _merge(first, [_eval(i, line, ctx) for i in items], line)
+                merged.trace = ctx["touched"]
+            finally:
+                ctx["touched"] = outer
             merged.source = f"line {line}: merge of {text}"
             ctx.setdefault("merged", {})[text] = merged
             return
         sv = None
         for words, mod, port, point in items:
-            if self._applies(mod, point, line):
-                sv = sv or _eval(src, line, ctx)
+            if self._applies(mod):
+                sv = sv or _traced(src, line, ctx)
                 self._hold(line, sv, words, mod, port, point)
 
     def _for(self, nd):
@@ -2459,13 +3392,11 @@ def evaluate(code: str, module, host, modules=None) -> dict:
 
 
 def deliveries(code: str, point, host) -> dict:
-    """What a point's own code gives another point's module: the inputs of `point` from its lines aimed at it,
-    connect(x, 20:volts) and route(x, exit, [20:volts, ...]), as {port: {value, type, source}}. Its own module's
-    lines, echo and break are skipped, and a live Signal is read only if one of those lines uses it.
-    For code that isn't a sequence (a sequence delivers through run). Raises ValueError or Break."""
+    """What a point's code gives another point's module: connect(x, 20:volts) and route(x, exit, [20:volts]),
+    as {port: {value, type, source}} for `point`. Raises ValueError or Break."""
     prog = parse_signals(code)
-    ex = _Exec(host, None, lazy=True)
-    ex.to_point = str(point)
+    ex = _Exec(host, None, lazy=False)
+    ex.points_only = True
     try:
         for _ in ex.block(prog):
             pass
@@ -2579,10 +3510,27 @@ def connections(code: str, points: bool = False) -> list:
     return out
 
 
-def stamp(prefix: str, module: str, written, origin: str) -> dict:
+_PROVENANCE = ("origin", "generated", "hash", "inputs", "module", "signet")
+
+
+def provenance(inputs=None, module_file=None) -> dict:
+    """What a stamp records about the run that made a Signal: each input's value hash and what it was
+    worked out from, the module file's hash, and the Signet version."""
+    out = {"signet": VERSION}
+    if inputs is not None:
+        out["inputs"] = {port: {"value": hashlib.sha256(_canonical({"value": _denan(e.get("value")), "type": e.get("type")}).encode()).hexdigest(),
+                                "sources": dict(e.get("sources") or {})} for port, e in inputs.items()}
+    if module_file:
+        out["module"] = {"file": os.path.basename(module_file), "sha256": _file_hash(module_file)[len("sha256:"):]}
+    return out
+
+
+def stamp(prefix: str, module: str, written, origin: str, inputs=None, module_file=None) -> dict:
     """After a run that ended well: stamp the .sig files the module wrote (named <prefix>-<module>.<port>.sig,
     or <module>.<port>.sig with no prefix) and delete its older ones that it didn't rewrite.
-    `origin` is put before "<module>.<port>" in each stamp. {"stamped", "deleted", "errors"}."""
+    `origin` is put before "<module>.<port>" in each stamp; `inputs` (the run's inputs) and `module_file`
+    are recorded for lineage. {"stamped", "deleted", "errors"}."""
+    prov = provenance(inputs, module_file)
     head = f"{prefix}-{module}." if prefix else f"{module}."
     pat = re.compile(r"^" + re.escape(head) + r"([A-Za-z_][A-Za-z0-9_]*)\.sig$")
     out = {"stamped": [], "deleted": [], "errors": []}
@@ -2602,11 +3550,12 @@ def stamp(prefix: str, module: str, written, origin: str) -> dict:
         except (OSError, ValueError) as e:
             out["errors"].append(f"{n}: {e.strerror if isinstance(e, OSError) else e}")
             continue
-        obj = {k: _denan(v) for k, v in obj.items() if k not in ("origin", "generated", "hash")}
+        obj = {k: _denan(v) for k, v in obj.items() if k not in _PROVENANCE}
         if obj.get("type") is not None and not isinstance(obj["type"], str):
             obj["type"] = str(obj["type"])
         obj["origin"] = f"{origin}{module}.{pat.match(n).group(1)}"
         obj["generated"] = now
+        obj.update(prov)
         obj["hash"] = _sig_hash(obj)
         tmp = n + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -2625,6 +3574,95 @@ def stamp(prefix: str, module: str, written, origin: str) -> dict:
             except OSError as e:
                 out["errors"].append(f"{n}: can't delete ({e.strerror})")
     return out
+
+
+def _sig_index(folder: str) -> dict:
+    """{stamp hash: file name} of the stamped Signals in a folder."""
+    out = {}
+    for n in sorted(os.listdir(folder)):
+        if n.endswith(".sig"):
+            try:
+                out[read_sig(os.path.join(folder, n))["hash"]] = n
+            except ValueError:
+                pass
+    return out
+
+
+def _edited(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as f:
+            obj = json.load(f)
+        return isinstance(obj, dict) and bool(obj.get("hash")) and obj["hash"] != _sig_hash(obj)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+
+def lineage(path: str, folder: str = ".", module_dirs=()) -> list:
+    """The chain that made a Signal, as lines of text: each Signal checked against its stamp, the module that
+    wrote it checked against the hash it had then, and each input followed back to the Signals, files and
+    parameters it came from."""
+    index = _sig_index(folder)
+    lines, seen = [], set()
+
+    def walk(name, depth, want=None):
+        pad = "  " * depth
+        full = os.path.join(folder, name)
+        if depth > 32:
+            lines.append(pad + f"{name}: too deep to follow")
+            return
+        try:
+            obj = read_sig(full)
+        except ValueError as e:
+            if want and want in index:
+                name, full = index[want], os.path.join(folder, index[want])
+                obj = read_sig(full)
+            else:
+                lines.append(pad + f"{name}: " + ("missing" if not os.path.isfile(full) else
+                                                  "edited after it was stamped" if _edited(full) else str(e)))
+                return
+        if want and obj["hash"] != want:
+            if want in index:          # the one that was used is still here under another name
+                return walk(index[want], depth, want)
+            lines.append(pad + f"{name}: replaced by a later run; the one used ({want[:12]}) is gone")
+            return
+        shown = _show_value(_SV(_bits_from(str(obj.get("type") or ""), obj["value"]), str(obj.get("type") or "")))
+        if len(shown) > 60:
+            shown = shown[:57] + "..."
+        lines.append(pad + f"{name} = {shown}  {obj.get('type') or ''}  made by {obj.get('origin', '?')} at {obj.get('generated', '?')}, stamp ok")
+        if obj["hash"] in seen:
+            lines.append(pad + "  (shown above)")
+            return
+        seen.add(obj["hash"])
+        mod = obj.get("module")
+        if isinstance(mod, dict) and mod.get("file"):
+            now = next((h for h in (_file_hash(os.path.join(d, mod["file"])) for d in (folder, *module_dirs)) if h), "")
+            state = "unchanged" if now == "sha256:" + str(mod.get("sha256")) else "missing" if not now else "changed since"
+            lines.append(pad + f"  module {mod['file']} ({state})")
+        if "inputs" not in obj:
+            lines.append(pad + "  (stamped without a record of its inputs)")
+            return
+        if not obj["inputs"]:
+            lines.append(pad + "  no inputs")
+        for port, entry in obj["inputs"].items():
+            srcs = (entry or {}).get("sources") or {}
+            if not srcs:
+                lines.append(pad + f"  {port} <- written in the code")
+            for ref, h in srcs.items():
+                if "$" in ref:
+                    lines.append(pad + f"  {port} <- {ref} = {h}")
+                elif h is None:
+                    lines.append(pad + f"  {port} <- {ref} (a stream still being written: not checked)")
+                elif str(h).startswith("sha256:"):
+                    now = _file_hash(os.path.join(folder, ref))
+                    lines.append(pad + f"  {port} <- file {ref} ({'unchanged' if now == h else 'missing' if not now else 'changed since'})")
+                elif not h:
+                    lines.append(pad + f"  {port} <- {ref} (not stamped)")
+                else:
+                    lines.append(pad + f"  {port} <-")
+                    walk(ref, depth + 2, h)
+
+    walk(path, 0)
+    return lines
 
 
 def _flat_tok(s: str) -> str:
@@ -2650,6 +3688,12 @@ def _flat_shape(t: str, v):
     if w and w[-1] == "num" and isinstance(v, dict):
         w = w[:-1] + ["complex"]
     scalars = ("int", "float", "real", "num", "hex", "bool", "text")
+    if w[0] == "range" and isinstance(v, dict):         # read as a pair: lo, hi
+        return "v", [_flat_item(v["lo"], w[1:] != ["int"]), _flat_item(v["hi"], w[1:] != ["int"])]
+    if w[0] == "stream" and isinstance(v, dict) and isinstance(v.get("stream"), list):
+        return "st", [_flat_tok(str(p)) for p in v["stream"]]
+    if w[0] == "bits" and isinstance(v, int) and type(v) is not bool:
+        return "s", [str(v)]
     if len(w) == 1 and w[0] in scalars and not isinstance(v, (list, dict)):
         return "s", [_flat_item(v, w[0] == "float")]
     if w == ["complex"] and isinstance(v, dict) and not isinstance(v["re"], list):
@@ -2672,12 +3716,17 @@ def _flat_shape(t: str, v):
 def flat_inputs(inputs: dict) -> str:
     """The run's inputs as plain text, one line per input: name, type, shape, data (tab separated).
     Shapes: s scalar, c complex, v vector, vc complex vector, xs real series, xc complex series (domain, n,
-    x..., values...), json (anything else: the JSON text). Data tokens are separated by spaces; null is nan."""
+    x..., values...), st stream (the .sig files it is read from), json (anything else: the JSON text).
+    Data tokens are separated by spaces; null is nan."""
     lines = []
     for name, obj in inputs.items():
         v = obj.get("value")
         t = str(obj.get("type") or infer_type(v) or "")
         shape, toks = _flat_shape(t, v)
+        if t.startswith("bits::"):            # the compiled languages read bits as an int, a range as two values
+            t = "int"
+        elif t.startswith("range::"):
+            t = "vector::int" if t == "range::int" else "vector::float"
         lines.append("\t".join((name, t or "json", shape, " ".join(toks))))
     return "\n".join(lines) + "\n" if lines else ""
 
@@ -2727,11 +3776,11 @@ def module_env(env: dict, prefix: str, module: str, inputs_path: str = "") -> di
 
 # Module helpers: `from signet import signals` (Python) and `using Signet: signals` (Julia).
 _PY_HELPER = r'''# signet:  SIGNALS FOR MODULES; put on PYTHONPATH by Signet or Starfire
-import json, math, os, re
+import collections, json, math, os, re, time
 
-__all__ = ["signals", "Series", "Bus"]
+__all__ = ["signals", "Series", "Bus", "Stream"]
 _PORT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_WORDS = {"int", "float", "num", "bool", "text", "complex", "vector", "series", "bus"}
+_WORDS = {"int", "float", "num", "bool", "text", "complex", "vector", "series", "bus", "stream", "tuple", "bits", "range"}
 
 
 def _env(key):
@@ -2776,6 +3825,92 @@ class Series:
         return f"Series(domain={self.domain!r}, n={len(self.values)})"
 
 
+class Stream:
+    """A stream input. sample() is the latest (t, value), or None before the first; samples() is the window
+    (the last samples kept); iterating gives each (t, value) as it arrives, and ends when the module writing it
+    has ended. A reader slower than the window misses the samples that fell out of it."""
+
+    def __init__(self, paths):
+        self.paths = list(paths)
+
+    @staticmethod
+    def _read(path):
+        # (window rows, samples ever written, ended)
+        try:
+            with open(path, encoding="utf-8") as f:
+                v = json.load(f)["value"]
+            x, vals = v.get("x") or [], v.get("values") or []
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return [], 0, False
+        vals = _cplx(vals["re"], vals["im"]) if isinstance(vals, dict) else _nan(vals)
+        return list(zip(x, vals)), v.get("count", len(x)), bool(v.get("ended"))
+
+    def samples(self):
+        return sorted((r for p in self.paths for r in self._read(p)[0]), key=lambda r: r[0])
+
+    def sample(self):
+        s = self.samples()
+        return s[-1] if s else None
+
+    @property
+    def ended(self):
+        return all(self._read(p)[2] for p in self.paths)
+
+    def __iter__(self):
+        seen, done = {p: 0 for p in self.paths}, set()
+        while len(done) < len(self.paths):
+            new = []
+            for p in self.paths:
+                rows, count, ended = self._read(p)
+                k = min(count - seen[p], len(rows))
+                if k > 0:
+                    new += rows[-k:]
+                seen[p] = max(seen[p], count)
+                if ended:
+                    done.add(p)
+            yield from sorted(new, key=lambda r: r[0])
+            if not new and len(done) < len(self.paths):
+                time.sleep(0.02)
+
+    def __repr__(self):
+        return f"Stream({', '.join(self.paths)})"
+
+
+class _StreamOut:
+    """An output stream: write(t, value) adds a sample, which readers see at once. Its .sig keeps the last
+    `window` samples, rewritten whole at each write."""
+
+    def __init__(self, path, domain, window):
+        self.path, self.domain, self.window = path, domain, window
+        self.kind, self.count = None, 0
+        self._x, self._v = collections.deque(maxlen=window), collections.deque(maxlen=window)
+
+    def write(self, t, value):
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t):
+            raise ValueError(f"a stream's t must be a finite number, got {t!r}")
+        kind = "complex" if isinstance(value, complex) else "float"
+        if self.kind is None:
+            self.kind = kind
+        elif kind == "complex" and self.kind == "float":
+            raise TypeError(f"stream {self.path}: expected float, got complex")
+        self._x.append(t)
+        self._v.append(complex(value) if self.kind == "complex" else None if value is None else float(value))
+        self.count += 1
+        if self.kind == "complex":
+            vals = {"re": [_fin(z.real) for z in self._v], "im": [_fin(z.imag) for z in self._v]}
+        else:
+            vals = [_fin(e) for e in self._v]
+        sig = {"value": {"domain": self.domain, "x": list(self._x), "values": vals, "window": self.window,
+                         "count": self.count, "ended": False}, "type": f"stream::{self.domain}::{self.kind}"}
+        with open(self.path + ".tmp", "w", encoding="utf-8") as f:
+            f.write(json.dumps(sig, allow_nan=False) + "\n")
+        os.replace(self.path + ".tmp", self.path)
+
+
+def _fin(e):
+    return None if e is None or not math.isfinite(e) else e
+
+
 class Bus(dict):
     """A bundle from multiplex: bus["speed.sig"], or bus.speed by port."""
 
@@ -2787,6 +3922,8 @@ class Bus(dict):
 
 
 def _plain(v):
+    if getattr(v, "ndim", 0) >= 2:    # a numpy array is kept column by column, as Signet keeps arrays
+        v = v.transpose()
     if hasattr(v, "tolist"):          # numpy arrays and scalars
         v = v.tolist()
     if isinstance(v, tuple):
@@ -2881,6 +4018,13 @@ def _ok(words, v):
         return False
     if w == "int":
         return type(v) is int
+    if w == "tuple":
+        return isinstance(v, list)
+    if w == "bits":
+        width = int(rest[0]) if rest and rest[0].isdigit() else 64
+        return type(v) is int and 0 <= v < 1 << width and len(rest) <= 1
+    if w == "range":
+        return isinstance(v, dict) and set(v) == {"lo", "hi"} and all(_is_num(v[k]) for k in v) and v["lo"] <= v["hi"]
     if w in ("float", "real"):
         return v is None or _is_num(v)
     if w == "num":
@@ -2920,6 +4064,12 @@ def _in(entry):
     words = [w for w in t.split("::") if w]
     if words[:1] == ["bus"] and isinstance(v, dict):
         return Bus({k: _in(e) for k, e in v.items()})
+    if words[:1] == ["stream"] and isinstance(v, dict):
+        return Stream(v["stream"])
+    if words[:1] == ["tuple"] and isinstance(v, list):
+        return tuple(v)
+    if words[:1] == ["range"] and isinstance(v, dict):
+        return (v["lo"], v["hi"])
     if words[:1] == ["series"] and isinstance(v, dict):
         vals = v["values"]
         vals = _cplx(vals["re"], vals["im"]) if isinstance(vals, dict) else _nan(vals)
@@ -2958,11 +4108,13 @@ class _Signals:
 
     def write(self, port, value, type=None):
         """Write output `port` as <prefix>-<module>.<port>.sig, checked against `type` if given."""
-        if not _PORT.match(port) or port in ("write", "series"):
+        if not _PORT.match(port) or port in ("write", "series", "stream"):
             raise ValueError(f"{port!r} can't be a port name")
         js = _out(value)
         if type:
             words = [w for w in str(type).split("::") if w]
+            if words[0] == "range" and isinstance(js, list) and len(js) == 2:
+                js = {"lo": js[0], "hi": js[1]}
             depth = len(words) - 1
             if words[-1] == "complex" and all(w == "vector" for w in words[:-1]) \
                     and _cdepth(js) is None and _real(js, depth) is not None:
@@ -2985,6 +4137,19 @@ class _Signals:
         """A series to write: signals.out = signals.series(v, domain="time", start=0.0, step=0.1)."""
         return Series(values, domain, x=x, start=start, step=step)
 
+    def stream(self, port, domain="time", window=1048):
+        """An output stream, <prefix>-<module>.<port>.sig: out = signals.stream("volts"); out.write(t, v).
+        It keeps the last `window` samples; Signet stamps it when the module ends."""
+        if not _PORT.match(port) or port in ("write", "series", "stream"):
+            raise ValueError(f"{port!r} can't be a port name")
+        if not isinstance(domain, str) or not _PORT.match(domain) or domain.lower() in _WORDS:
+            raise ValueError(f"bad stream domain {domain!r}")
+        if isinstance(window, bool) or not isinstance(window, int) or window < 1:
+            raise ValueError(f"a stream's window must be a whole number above 0, got {window!r}")
+        prefix = _env("PREFIX")
+        return _StreamOut(f"{prefix}-{_env('MODULE')}.{port}.sig" if prefix else f"{_env('MODULE')}.{port}.sig",
+                          domain.lower(), window)
+
 
 signals = _Signals()
 '''
@@ -2993,7 +4158,7 @@ _JL_HELPER = r'''# Signet.jl:  SIGNALS FOR MODULES; needs JSON3, put on JULIA_LO
 module Signet
 
 using JSON3
-export signals, series, Series
+export signals, series, Series, stream, Stream, StreamIn, sample, samples, ended
 
 const PORT = r"^[A-Za-z_][A-Za-z0-9_]*$"
 
@@ -3055,12 +4220,74 @@ function invalue(v, t::AbstractString)
         vals = v["values"] isa Dict ? cplx(v["values"]["re"], v["values"]["im"]) : nan(v["values"])
         haskey(v, "x") && return series(vals; domain=v["domain"], x=v["x"])
         return series(vals; domain=v["domain"], start=v["start"], step=v["step"])
-    elseif "complex" in words && v isa Dict
-        return cplx(v["re"], v["im"])
-    elseif "float" in words || "num" in words
-        return nan(v)
+    elseif !isempty(words) && words[1] == "range" && v isa Dict
+        return (v["lo"], v["hi"])
+    elseif !isempty(words) && words[1] == "stream" && v isa Dict
+        return StreamIn(String.(v["stream"]))
     end
-    v
+    r = "complex" in words && v isa Dict ? cplx(v["re"], v["im"]) : ("float" in words || "num" in words) ? nan(v) : v
+    # a 2-D array arrives column by column: a Matrix
+    if length(words) == 3 && words[1] == words[2] == "vector" && r isa AbstractVector && !isempty(r) &&
+       all(e -> e isa AbstractVector && length(e) == length(r[1]), r)
+        return reduce(hcat, r)
+    end
+    r
+end
+
+# A stream input. sample(s) is the newest (t, v), or nothing before the first; samples(s) the samples kept;
+# ended(s) whether its module has ended; for (t, v) in s follows it sample by sample until its module ends.
+struct StreamIn
+    paths::Vector{String}
+end
+
+function readstream(path)
+    v = try
+        native(JSON3.read(read(path, String)))["value"]
+    catch
+        return (Float64[], Any[], 0, false)
+    end
+    x = Float64.(get(v, "x", Float64[]))
+    vals = get(v, "values", Any[])
+    vs = vals isa AbstractDict ? cplx(vals["re"], vals["im"]) : nan(vals)
+    (x, vs, Int(get(v, "count", length(x))), get(v, "ended", false) === true)
+end
+
+function samples(s::StreamIn)
+    rows = Tuple{Float64,Any}[]
+    for p in s.paths
+        x, v, _, _ = readstream(p)
+        length(x) == length(v) && append!(rows, collect(zip(x, v)))
+    end
+    sort!(rows; by=first)
+end
+sample(s::StreamIn) = (r = samples(s); isempty(r) ? nothing : r[end])
+ended(s::StreamIn) = all(p -> readstream(p)[4], s.paths)
+
+Base.IteratorSize(::Type{StreamIn}) = Base.SizeUnknown()
+function Base.iterate(s::StreamIn, state=(zeros(Int, length(s.paths)), Tuple{Float64,Any}[]))
+    seen, queue = state
+    while isempty(queue)
+        done = true
+        got = Tuple{Float64,Any}[]
+        for (k, p) in enumerate(s.paths)
+            x, v, count, en = readstream(p)
+            if length(x) != length(v)        # caught between writes: try again
+                done = false
+                continue
+            end
+            n = min(count - seen[k], length(x))
+            n > 0 && append!(got, collect(zip(x[end-n+1:end], v[end-n+1:end])))
+            seen[k] = max(seen[k], count)
+            done = done && en
+        end
+        sort!(got; by=first)
+        append!(queue, got)
+        if isempty(queue)
+            done && return nothing
+            sleep(0.02)
+        end
+    end
+    (popfirst!(queue), (seen, queue))
 end
 
 function Base.getproperty(::Signals, port::Symbol)
@@ -3087,6 +4314,8 @@ end
 jsonable(v::AbstractFloat) = isfinite(v) ? v : nothing
 jsonable(v::Complex) = Dict("re" => jsonable(real(v)), "im" => jsonable(imag(v)))
 jsonable(v::AbstractVector{<:Complex}) = Dict("re" => jsonable(real.(v)), "im" => jsonable(imag.(v)))
+jsonable(v::AbstractMatrix) = Any[jsonable(collect(c)) for c in eachcol(v)]        # column by column, as Signet keeps arrays
+jsonable(v::AbstractMatrix{<:Complex}) = Dict("re" => jsonable(real.(v)), "im" => jsonable(imag.(v)))
 jsonable(v::AbstractVector) = Any[jsonable(e) for e in v]
 jsonable(v::AbstractDict) = Dict(string(k) => jsonable(e) for (k, e) in v)
 jsonable(v) = v
@@ -3149,6 +4378,10 @@ function Base.write(::Signals, port::AbstractString, v, type::AbstractString="")
     else
         type = infer(js)
     end
+    emit(port, js, type)
+end
+
+function emit(port, js, type)
     sig = Dict{String,Any}("value" => js)
     isempty(type) || (sig["type"] = type)
     prefix = envvar("PREFIX")
@@ -3161,28 +4394,68 @@ function Base.write(::Signals, port::AbstractString, v, type::AbstractString="")
     nothing
 end
 
+# An output stream: s = stream("volts"); write(s, t, v). Its .sig keeps the last `window` samples, rewritten
+# whole at each write.
+mutable struct Stream
+    port::String
+    domain::String
+    window::Int
+    count::Int
+    kind::String
+    x::Vector{Float64}
+    values::Vector{ComplexF64}
+end
+
+function stream(port::AbstractString; domain::AbstractString="time", window::Integer=1048)
+    (occursin(PORT, port) && !(port in ("write", "series", "stream"))) || error("$port can't be a port name")
+    occursin(PORT, domain) || error("bad stream domain $domain")
+    window > 0 || error("a stream's window must be above 0")
+    Stream(port, lowercase(domain), window, 0, "", Float64[], ComplexF64[])
+end
+
+function Base.write(s::Stream, t::Real, v::Number)
+    isfinite(t) || error("a stream's t must be a finite number")
+    kind = v isa Complex ? "complex" : "float"
+    isempty(s.kind) && (s.kind = kind)
+    kind == "complex" && s.kind == "float" && error("stream $(s.port): expected float, got complex")
+    push!(s.x, Float64(t))
+    push!(s.values, ComplexF64(v))
+    if length(s.x) > s.window
+        popfirst!(s.x)
+        popfirst!(s.values)
+    end
+    s.count += 1
+    vals = s.kind == "complex" ? jsonable(s.values) : jsonable(real.(s.values))
+    emit(s.port, Dict{String,Any}("domain" => s.domain, "x" => s.x, "values" => vals, "window" => s.window,
+                                  "count" => s.count, "ended" => false), "stream::$(s.domain)::$(s.kind)")
+end
+
 end # module
 '''
 _CPP_HELPER = r'''// signet.hpp:  SIGNALS FOR C++ MODULES (C++17, standard library only)
 // AUTHOR:      DANIEL DESAI
-// UPDATED:     2026-10-25
-// VERSION:     0.5.0
+// UPDATED:     2026-10-29
+// VERSION:     0.6.0
 //
 // Built into signet.py: Signet and Starfire put this on the include path, so
 // a module just says #include <signet.hpp>. Inputs: signet::in<double>("voltage").
 // Outputs: signet::out("power", power, "float"). The type is optional.
 
 #pragma once
+#include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <exception>
 #include <fstream>
 #include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -3458,20 +4731,175 @@ inline void out(const std::string& name, const ComplexSeries& s, const std::stri
                  type.empty() ? "series::" + s.domain + "::complex" : type);
 }
 
+// An output stream: signet::Stream volts("volts"); volts.write(t, v). Its .sig keeps the last `window` samples
+// (1048 unless given), rewritten whole at each write. signet::ComplexStream takes complex values.
+template <class V> class StreamOf {
+  public:
+    explicit StreamOf(std::string name, std::string domain = "time", size_t window = 1048)
+        : name_(std::move(name)), domain_(std::move(domain)), window_(window) {
+        if (window_ == 0) throw std::invalid_argument("a stream's window must be above 0");
+    }
+    void write(double t, V v) {
+        if (!std::isfinite(t)) throw std::invalid_argument("a stream's t must be a finite number");
+        x_.push_back(t);
+        v_.push_back(v);
+        if (x_.size() > window_) { x_.pop_front(); v_.pop_front(); }
+        count_++;
+        std::string vals;
+        if constexpr (std::is_same_v<V, Complex>) vals = detail::jcomplexes(std::vector<Complex>(v_.begin(), v_.end()));
+        else vals = detail::jlist(detail::map(v_, detail::jnum));
+        detail::emit(name_, "{\"domain\":" + detail::jstr(domain_) + ",\"x\":" + detail::jlist(detail::map(x_, detail::jnum)) +
+                                ",\"values\":" + vals + ",\"window\":" + std::to_string(window_) + ",\"count\":" +
+                                std::to_string(count_) + ",\"ended\":false}",
+                     "stream::" + domain_ + (std::is_same_v<V, Complex> ? "::complex" : "::float"));
+    }
+
+  private:
+    std::string name_, domain_;
+    size_t window_, count_ = 0;
+    std::deque<double> x_;
+    std::deque<V> v_;
+};
+using Stream = StreamOf<double>;
+using ComplexStream = StreamOf<Complex>;
+
+namespace detail {
+// A stream's .sig, read without a JSON library: the window's x and values, count and ended.
+inline size_t key(const std::string& s, const char* k, size_t from = 0) {
+    std::string q = std::string("\"") + k + "\"";
+    for (size_t p = s.find(q, from); p != std::string::npos; p = s.find(q, p + 1)) {
+        size_t i = p + q.size();
+        while (i < s.size() && s[i] == ' ') i++;
+        if (i < s.size() && s[i] == ':') {
+            i++;
+            while (i < s.size() && s[i] == ' ') i++;
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+inline std::vector<double> numbers(const std::string& s, size_t i) {
+    std::vector<double> out;
+    if (i == std::string::npos || s[i] != '[') return out;
+    size_t end = s.find(']', i);
+    std::string body = s.substr(i + 1, end - i - 1);
+    std::stringstream ss(body);
+    for (std::string t; std::getline(ss, t, ',');) {
+        size_t a = t.find_first_not_of(' ');
+        if (a == std::string::npos) continue;
+        out.push_back(t.compare(a, 4, "null") == 0 ? NAN : std::strtod(t.c_str() + a, nullptr));
+    }
+    return out;
+}
+struct StreamRead {
+    std::vector<double> x, v;
+    long long count = 0;
+    bool ended = false;
+};
+inline StreamRead read_stream(const std::string& path) {
+    StreamRead r;
+    std::ifstream f(path);
+    if (!f) return r;
+    std::stringstream ss;
+    ss << f.rdbuf();
+    std::string s = ss.str();
+    size_t vi = key(s, "values");
+    if (vi != std::string::npos && s[vi] == '{') throw std::runtime_error(path + " is a complex stream: read it in Python or Julia");
+    r.x = numbers(s, key(s, "x"));
+    r.v = numbers(s, vi);
+    if (r.v.size() != r.x.size()) return StreamRead{};      // caught between writes: try again
+    size_t c = key(s, "count");
+    r.count = c == std::string::npos ? (long long)r.x.size() : std::strtoll(s.c_str() + c, nullptr, 10);
+    size_t e = key(s, "ended");
+    r.ended = e != std::string::npos && s[e] == 't';
+    return r;
+}
+}  // namespace detail
+
+// A real stream input: auto s = signet::in<signet::StreamIn>("volts").
+// while (s.next(t, v)) follows it sample by sample until its module ends; s.latest(t, v) is the newest sample
+// (false before the first); s.window(x, v) the samples kept; s.ended() whether its module has ended.
+class StreamIn {
+  public:
+    explicit StreamIn(std::vector<std::string> paths) : paths_(std::move(paths)), seen_(paths_.size(), 0) {}
+    bool latest(double& t, double& v) const {
+        std::vector<double> x, y;
+        window(x, y);
+        if (x.empty()) return false;
+        t = x.back();
+        v = y.back();
+        return true;
+    }
+    void window(std::vector<double>& x, std::vector<double>& v) const {
+        std::vector<std::pair<double, double>> rows;
+        for (const auto& p : paths_) {
+            auto r = detail::read_stream(p);
+            for (size_t i = 0; i < r.x.size(); i++) rows.emplace_back(r.x[i], r.v[i]);
+        }
+        std::stable_sort(rows.begin(), rows.end(), [](auto& a, auto& b) { return a.first < b.first; });
+        x.clear();
+        v.clear();
+        for (auto& r : rows) { x.push_back(r.first); v.push_back(r.second); }
+    }
+    bool ended() const {
+        for (const auto& p : paths_) if (!detail::read_stream(p).ended) return false;
+        return true;
+    }
+    bool next(double& t, double& v) {
+        while (queue_.empty()) {
+            bool done = true;
+            std::vector<std::pair<double, double>> got;
+            for (size_t k = 0; k < paths_.size(); k++) {
+                auto r = detail::read_stream(paths_[k]);
+                long long n = std::min<long long>(r.count - seen_[k], (long long)r.x.size());
+                for (long long i = (long long)r.x.size() - n; n > 0 && i < (long long)r.x.size(); i++) got.emplace_back(r.x[i], r.v[i]);
+                seen_[k] = std::max(seen_[k], r.count);
+                done = done && r.ended;
+            }
+            std::stable_sort(got.begin(), got.end(), [](auto& a, auto& b) { return a.first < b.first; });
+            queue_.insert(queue_.end(), got.begin(), got.end());
+            if (queue_.empty()) {
+                if (done) return false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        }
+        t = queue_.front().first;
+        v = queue_.front().second;
+        queue_.pop_front();
+        return true;
+    }
+
+  private:
+    std::vector<std::string> paths_;
+    std::vector<long long> seen_;
+    std::deque<std::pair<double, double>> queue_;
+};
+
+namespace detail {
+template <> struct Reader<StreamIn> {
+    static StreamIn read(const std::string& n, const Record& r) {
+        need(n, r, "st", "a stream");
+        std::vector<std::string> paths;
+        for (const auto& t : r.tok) paths.push_back(unescape(t));
+        return StreamIn(paths);
+    }
+};
+}  // namespace detail
+
 }  // namespace signet
 
 namespace sf = signet;   // for modules written against the older starfire_signals.hpp
 '''
 _RS_HELPER = r'''// signet.rs:  SIGNALS FOR RUST MODULES (standard library only)
 // AUTHOR:     DANIEL DESAI
-// UPDATED:    2026-10-25
-// VERSION:    0.5.0
+// UPDATED:    2026-10-29
+// VERSION:    0.6.0
 //
 // Built into signet.py: Signet and Starfire compile a module against this as the crate `signet`, so a
 // module just says `use signet::{get_f64, put};`. Inputs: get_f64("voltage"). Outputs: put("power", &power, "float").
 // The type is optional (pass ""). Anything wrong stops the module with a message and exit code 2.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3743,7 +5171,10 @@ impl Put for Series<Complex> {
 /// file. `ty` is the Signet type ("float", "vector::float", ...), or "" for the value's own.
 pub fn put<T: Put + ?Sized>(name: &str, value: &T, ty: &str) {
     let (json, own) = value.json(ty);
-    let ty = if ty.is_empty() { own } else { ty.to_string() };
+    emit(name, &json, &if ty.is_empty() { own } else { ty.to_string() });
+}
+
+fn emit(name: &str, json: &str, ty: &str) {
     let module = env("MODULE").unwrap_or_else(|| fail("SIGNET_MODULE is not set (run from Signet or Starfire)"));
     let prefix = env("PREFIX").unwrap_or_default();
     let path = if prefix.is_empty() { format!("{module}.{name}.sig") } else { format!("{prefix}-{module}.{name}.sig") };
@@ -3751,11 +5182,159 @@ pub fn put<T: Put + ?Sized>(name: &str, value: &T, ty: &str) {
     std::fs::write(&tmp, format!("{{\"value\":{json},\"type\":{}}}\n", jstr(&ty))).unwrap_or_else(|e| fail(&format!("can't write {tmp}: {e}")));
     std::fs::rename(&tmp, &path).unwrap_or_else(|e| fail(&format!("can't rename {tmp}: {e}")));
 }
+
+/// What a stream holds: f64 or Complex.
+pub trait StreamValue: Copy {
+    const KIND: &'static str;
+    fn jvalues(v: &[Self]) -> String;
+}
+impl StreamValue for f64 {
+    const KIND: &'static str = "float";
+    fn jvalues(v: &[f64]) -> String { jlist(v, |e| jnum(*e)) }
+}
+impl StreamValue for Complex {
+    const KIND: &'static str = "complex";
+    fn jvalues(v: &[Complex]) -> String { jcomplexes(v) }
+}
+
+/// An output stream: `let mut s = Stream::<f64>::new("volts", "time", 1048); s.write(t, v);`. Its .sig keeps the
+/// last `window` samples, rewritten whole at each write.
+pub struct Stream<V: StreamValue> {
+    name: String,
+    domain: String,
+    window: usize,
+    count: u64,
+    x: VecDeque<f64>,
+    values: VecDeque<V>,
+}
+
+impl<V: StreamValue> Stream<V> {
+    pub fn new(name: &str, domain: &str, window: usize) -> Self {
+        if window == 0 {
+            fail("a stream's window must be above 0");
+        }
+        Stream { name: name.into(), domain: domain.into(), window, count: 0, x: VecDeque::new(), values: VecDeque::new() }
+    }
+
+    pub fn write(&mut self, t: f64, v: V) {
+        if !t.is_finite() {
+            fail("a stream's t must be a finite number");
+        }
+        self.x.push_back(t);
+        self.values.push_back(v);
+        if self.x.len() > self.window {
+            self.x.pop_front();
+            self.values.pop_front();
+        }
+        self.count += 1;
+        let x: Vec<f64> = self.x.iter().copied().collect();
+        let vals: Vec<V> = self.values.iter().copied().collect();
+        emit(&self.name,
+             &format!("{{\"domain\":{},\"x\":{},\"values\":{},\"window\":{},\"count\":{},\"ended\":false}}",
+                      jstr(&self.domain), jlist(&x, |e| jnum(*e)), V::jvalues(&vals), self.window, self.count),
+             &format!("stream::{}::{}", self.domain, V::KIND));
+    }
+}
+
+// A stream's .sig, read without a JSON library: (x, values, count, ended) of the window.
+fn key(s: &str, k: &str) -> Option<usize> {
+    let q = format!("\"{k}\"");
+    let mut from = 0;
+    while let Some(p) = s[from..].find(&q) {
+        let mut i = from + p + q.len();
+        let b = s.as_bytes();
+        while i < b.len() && b[i] == b' ' { i += 1; }
+        if i < b.len() && b[i] == b':' {
+            i += 1;
+            while i < b.len() && b[i] == b' ' { i += 1; }
+            return Some(i);
+        }
+        from += p + 1;
+    }
+    None
+}
+
+fn numbers(s: &str, at: Option<usize>) -> Vec<f64> {
+    let Some(i) = at else { return Vec::new() };
+    if !s[i..].starts_with('[') { return Vec::new(); }
+    let end = s[i..].find(']').map(|e| i + e).unwrap_or(s.len());
+    s[i + 1..end].split(',').map(str::trim).filter(|t| !t.is_empty()).map(|t| if t == "null" { f64::NAN } else { num(t) }).collect()
+}
+
+fn read_stream(path: &str) -> (Vec<f64>, Vec<f64>, u64, bool) {
+    let Ok(s) = std::fs::read_to_string(path) else { return (Vec::new(), Vec::new(), 0, false) };
+    let vi = key(&s, "values");
+    if vi.map_or(false, |i| s[i..].starts_with('{')) {
+        fail(&format!("{path} is a complex stream: read it in Python or Julia"));
+    }
+    let (x, v) = (numbers(&s, key(&s, "x")), numbers(&s, vi));
+    if x.len() != v.len() { return (Vec::new(), Vec::new(), 0, false); }     // caught between writes
+    let count = key(&s, "count").map(|i| s[i..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0))
+        .unwrap_or(x.len() as u64);
+    let ended = key(&s, "ended").map_or(false, |i| s[i..].starts_with('t'));
+    (x, v, count, ended)
+}
+
+/// A real stream input: `let mut s = get_stream("volts");`. `for (t, v) in &mut s` (or `s.next()`) follows it
+/// sample by sample until its module ends; `s.latest()` is the newest sample; `s.window()` the samples kept.
+pub struct StreamIn {
+    paths: Vec<String>,
+    seen: Vec<u64>,
+    queue: VecDeque<(f64, f64)>,
+}
+
+pub fn get_stream(name: &str) -> StreamIn {
+    let r = rec(name, "st", "a stream");
+    let paths: Vec<String> = r.tok.iter().map(|t| unescape(t)).collect();
+    StreamIn { seen: vec![0; paths.len()], paths, queue: VecDeque::new() }
+}
+
+impl StreamIn {
+    pub fn window(&self) -> Vec<(f64, f64)> {
+        let mut rows: Vec<(f64, f64)> = Vec::new();
+        for p in &self.paths {
+            let (x, v, _, _) = read_stream(p);
+            rows.extend(x.into_iter().zip(v));
+        }
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows
+    }
+    pub fn latest(&self) -> Option<(f64, f64)> {
+        self.window().last().copied()
+    }
+    pub fn ended(&self) -> bool {
+        self.paths.iter().all(|p| read_stream(p).3)
+    }
+}
+
+impl Iterator for StreamIn {
+    type Item = (f64, f64);
+    fn next(&mut self) -> Option<(f64, f64)> {
+        while self.queue.is_empty() {
+            let mut done = true;
+            let mut got: Vec<(f64, f64)> = Vec::new();
+            for (k, p) in self.paths.iter().enumerate() {
+                let (x, v, count, ended) = read_stream(p);
+                let n = (count.saturating_sub(self.seen[k]) as usize).min(x.len());
+                got.extend(x[x.len() - n..].iter().copied().zip(v[v.len() - n..].iter().copied()));
+                self.seen[k] = self.seen[k].max(count);
+                done &= ended;
+            }
+            got.sort_by(|a, b| a.0.total_cmp(&b.0));
+            self.queue.extend(got);
+            if self.queue.is_empty() {
+                if done { return None; }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        self.queue.pop_front()
+    }
+}
 '''
 _ADS_HELPER = r'''--  signet.ads:  SIGNALS FOR ADA MODULES (Ada 2012, standard library only)
 --  AUTHOR:      DANIEL DESAI
---  UPDATED:     2026-10-25
---  VERSION:     0.5.0
+--  UPDATED:     2026-10-29
+--  VERSION:     0.6.0
 --
 --  Built into signet.py: Signet and Starfire put this on the compiler's search path, so a module
 --  just says "with Signet;". Inputs: Signet.Get_Float ("voltage"). Outputs: Signet.Put ("power", P, "float").
@@ -3818,15 +5397,49 @@ package Signet is
    procedure Put (Name : String; Value : Series;             Kind : String := "");
    procedure Put (Name : String; Value : Complex_Series;     Kind : String := "");
 
+   --  Output streams: S : Signet.Stream := Signet.Open ("volts"); then Signet.Write (S, T, V). Its .sig keeps
+   --  the last Window samples, rewritten whole at each write.
+   type Stream (Window : Positive) is record
+      Name, Domain : Text;
+      Count        : Natural := 0;
+      X, Values    : Float_Vector (1 .. Window);
+   end record;
+
+   type Complex_Stream (Window : Positive) is record
+      Name, Domain : Text;
+      Count        : Natural := 0;
+      X            : Float_Vector (1 .. Window);
+      Values       : Complex_Vector (1 .. Window);
+   end record;
+
+   function Open (Name : String; Domain : String := "time"; Window : Positive := 1048) return Stream;
+   function Open_Complex (Name : String; Domain : String := "time"; Window : Positive := 1048) return Complex_Stream;
+   procedure Write (S : in out Stream; T : Long_Float; Value : Long_Float);
+   procedure Write (S : in out Complex_Stream; T : Long_Float; Value : Complex);
+
+   --  A real stream input: S : Signet.Stream_In := Signet.Get_Stream ("volts"); then
+   --  while Signet.Next (S, T, V) loop ... end loop follows it sample by sample until its module ends.
+   --  Signet.Latest (S, T, V) is False before the first sample; Signet.Ended (S) once its module has ended.
+   type Stream_In is record
+      Path : Text;
+      Seen : Long_Long_Integer := 0;
+   end record;
+
+   function Get_Stream (Name : String) return Stream_In;
+   function Next   (S : in out Stream_In; T, Value : out Long_Float) return Boolean;
+   function Latest (S : Stream_In; T, Value : out Long_Float) return Boolean;
+   function Ended  (S : Stream_In) return Boolean;
+
 end Signet;
 '''
 _ADB_HELPER = r'''--  signet.adb:  SIGNALS FOR ADA MODULES (body)
 --  AUTHOR:      DANIEL DESAI
---  UPDATED:     2026-10-25
---  VERSION:     0.5.0
+--  UPDATED:     2026-10-29
+--  VERSION:     0.6.0
 
 with Ada.Containers.Vectors;
 with Ada.Environment_Variables;
+with Ada.Strings.Fixed;
 with Ada.Text_IO;
 with Interfaces.C;
 with System;
@@ -4321,12 +5934,227 @@ package body Signet is
             Or_Own (Kind, "series::" & D & "::complex"));
    end Put;
 
+   function Open (Name : String; Domain : String := "time"; Window : Positive := 1048) return Stream is
+   begin
+      return (Window => Window, Name => To_Unbounded_String (Name), Domain => To_Unbounded_String (Domain),
+              Count => 0, X => (others => 0.0), Values => (others => 0.0));
+   end Open;
+
+   function Open_Complex (Name : String; Domain : String := "time"; Window : Positive := 1048) return Complex_Stream is
+   begin
+      return (Window => Window, Name => To_Unbounded_String (Name), Domain => To_Unbounded_String (Domain),
+              Count => 0, X => (others => 0.0), Values => (others => (0.0, 0.0)));
+   end Open_Complex;
+
+   function Stream_Json (Domain : String; X, Values : String; Window, Count : Natural) return String is
+     ("{""domain"":" & JStr (Domain) & ",""x"":" & X & ",""values"":" & Values & ",""window"":" &
+      Ada.Strings.Fixed.Trim (Natural'Image (Window), Ada.Strings.Left) & ",""count"":" &
+      Ada.Strings.Fixed.Trim (Natural'Image (Count), Ada.Strings.Left) & ",""ended"":false}");
+
+   procedure Write (S : in out Stream; T : Long_Float; Value : Long_Float) is
+      N : Positive;
+   begin
+      if not T'Valid or else abs T > Long_Float'Last then
+         raise Error with "a stream's t must be a finite number";
+      end if;
+      S.Count := S.Count + 1;
+      if S.Count > S.Window then                --  the oldest sample falls out of the window
+         S.X (1 .. S.Window - 1) := S.X (2 .. S.Window);
+         S.Values (1 .. S.Window - 1) := S.Values (2 .. S.Window);
+      end if;
+      N := Natural'Min (S.Count, S.Window);
+      S.X (N) := T;
+      S.Values (N) := Value;
+      Emit (To_String (S.Name), Stream_Json (To_String (S.Domain), JFloats (S.X (1 .. N)), JFloats (S.Values (1 .. N)), S.Window, S.Count),
+            "stream::" & To_String (S.Domain) & "::float");
+   end Write;
+
+   procedure Write (S : in out Complex_Stream; T : Long_Float; Value : Complex) is
+      N : Positive;
+   begin
+      if not T'Valid or else abs T > Long_Float'Last then
+         raise Error with "a stream's t must be a finite number";
+      end if;
+      S.Count := S.Count + 1;
+      if S.Count > S.Window then
+         S.X (1 .. S.Window - 1) := S.X (2 .. S.Window);
+         S.Values (1 .. S.Window - 1) := S.Values (2 .. S.Window);
+      end if;
+      N := Natural'Min (S.Count, S.Window);
+      S.X (N) := T;
+      S.Values (N) := Value;
+      Emit (To_String (S.Name), Stream_Json (To_String (S.Domain), JFloats (S.X (1 .. N)), JComplexes (S.Values (1 .. N)), S.Window, S.Count),
+            "stream::" & To_String (S.Domain) & "::complex");
+   end Write;
+
+   --  A stream's .sig, read without a JSON library
+   type Stream_Read (N : Natural) is record
+      X, V  : Float_Vector (1 .. N);
+      Count : Long_Long_Integer;
+      Done  : Boolean;
+   end record;
+
+   function Read_File (Path : String) return String is
+      F : Ada.Text_IO.File_Type;
+      R : Unbounded_String;
+   begin
+      begin
+         Ada.Text_IO.Open (F, Ada.Text_IO.In_File, Path);
+      exception
+         when others => return "";
+      end;
+      while not Ada.Text_IO.End_Of_File (F) loop
+         Append (R, Ada.Text_IO.Get_Line (F));
+      end loop;
+      Ada.Text_IO.Close (F);
+      return To_String (R);
+   end Read_File;
+
+   function Key_At (S, K : String) return Natural is
+      Q : constant String := '"' & K & '"';
+      P : Natural := Ada.Strings.Fixed.Index (S, Q);
+      I : Natural;
+   begin
+      while P /= 0 loop
+         I := P + Q'Length;
+         while I <= S'Last and then S (I) = ' ' loop
+            I := I + 1;
+         end loop;
+         if I <= S'Last and then S (I) = ':' then
+            I := I + 1;
+            while I <= S'Last and then S (I) = ' ' loop
+               I := I + 1;
+            end loop;
+            return I;
+         end if;
+         P := Ada.Strings.Fixed.Index (S, Q, P + 1);
+      end loop;
+      return 0;
+   end Key_At;
+
+   function Numbers (S : String; I : Natural) return Float_Vector is
+      Stop : Natural;
+   begin
+      if I = 0 or else I > S'Last or else S (I) /= '[' then
+         return (1 .. 0 => 0.0);
+      end if;
+      Stop := Ada.Strings.Fixed.Index (S, "]", I);
+      declare
+         List : constant String := S (I + 1 .. Stop - 1);
+      begin
+         if Ada.Strings.Fixed.Trim (List, Ada.Strings.Both)'Length = 0 then
+            return (1 .. 0 => 0.0);
+         end if;
+         declare
+            R     : Float_Vector (1 .. Ada.Strings.Fixed.Count (List, ",") + 1);
+            Start : Positive := List'First;
+            K     : Natural := 0;
+         begin
+            for J in List'First .. List'Last + 1 loop
+               if J > List'Last or else List (J) = ',' then
+                  K := K + 1;
+                  declare
+                     T : constant String := Ada.Strings.Fixed.Trim (List (Start .. J - 1), Ada.Strings.Both);
+                  begin
+                     R (K) := (if T = "null" then Num ("nan") else Num (T));
+                  end;
+                  Start := J + 1;
+               end if;
+            end loop;
+            return R;
+         end;
+      end;
+   end Numbers;
+
+   function Read_Stream (Path : String) return Stream_Read is
+      S  : constant String := Read_File (Path);
+      VI : constant Natural := Key_At (S, "values");
+   begin
+      if VI /= 0 and then S (VI) = '{' then
+         raise Error with Path & " is a complex stream: read it in Python or Julia";
+      end if;
+      declare
+         X   : constant Float_Vector := Numbers (S, Key_At (S, "x"));
+         V   : constant Float_Vector := Numbers (S, VI);
+         CI  : constant Natural := Key_At (S, "count");
+         EI  : constant Natural := Key_At (S, "ended");
+         Cnt : Long_Long_Integer := X'Length;
+         Last : Natural;
+      begin
+         if X'Length /= V'Length then        --  caught between writes: try again
+            return (N => 0, X => (others => 0.0), V => (others => 0.0), Count => 0, Done => False);
+         end if;
+         if CI /= 0 then
+            Last := CI;
+            while Last <= S'Last and then S (Last) in '0' .. '9' loop
+               Last := Last + 1;
+            end loop;
+            Cnt := Long_Long_Integer'Value (S (CI .. Last - 1));
+         end if;
+         return (N => X'Length, X => X, V => V, Count => Cnt, Done => EI /= 0 and then S (EI) = 't');
+      end;
+   end Read_Stream;
+
+   function Get_Stream (Name : String) return Stream_In is
+      It : constant Item := Get (Name, "st", "a stream");
+      T  : constant Text_Vector := Tokens (To_String (It.Data));
+   begin
+      if T'Length /= 1 then
+         raise Error with "input " & Name & " merges streams: read it in Python, Julia, C++ or Rust";
+      end if;
+      return (Path => To_Unbounded_String (Unescape (To_String (T (T'First)))), Seen => 0);
+   end Get_Stream;
+
+   function Next (S : in out Stream_In; T, Value : out Long_Float) return Boolean is
+   begin
+      T := 0.0;
+      Value := 0.0;
+      loop
+         declare
+            R : constant Stream_Read := Read_Stream (To_String (S.Path));
+         begin
+            if R.Count > S.Seen and then R.N > 0 then
+               declare
+                  Behind : constant Long_Long_Integer := Long_Long_Integer'Min (R.Count - S.Seen, Long_Long_Integer (R.N));
+                  I      : constant Positive := R.N - Natural (Behind) + 1;
+               begin
+                  T := R.X (I);
+                  Value := R.V (I);
+                  S.Seen := R.Count - Behind + 1;
+                  return True;
+               end;
+            elsif R.Done then
+               return False;
+            end if;
+         end;
+         delay 0.02;
+      end loop;
+   end Next;
+
+   function Latest (S : Stream_In; T, Value : out Long_Float) return Boolean is
+      R : constant Stream_Read := Read_Stream (To_String (S.Path));
+   begin
+      T := 0.0;
+      Value := 0.0;
+      if R.N = 0 then
+         return False;
+      end if;
+      T := R.X (R.N);
+      Value := R.V (R.N);
+      return True;
+   end Latest;
+
+   function Ended (S : Stream_In) return Boolean is
+   begin
+      return Read_Stream (To_String (S.Path)).Done;
+   end Ended;
+
 end Signet;
 '''
 _F90_HELPER = r'''! signet.f90:  SIGNALS FOR FORTRAN MODULES (Fortran 2008, standard library only)
 ! AUTHOR:      DANIEL DESAI
-! UPDATED:     2026-10-25
-! VERSION:     0.5.0
+! UPDATED:     2026-10-29
+! VERSION:     0.6.0
 !
 ! Built into signet.py: Signet and Starfire compile a module with this on the search path, so a module
 ! just says "use signet". Inputs: call signet_get("voltage", v). Outputs: call signet_put("power", p, "float").
@@ -4338,6 +6166,8 @@ module signet
   implicit none
   private
   public :: signet_has, signet_get, signet_put, signet_text, signet_series, signet_cseries
+  public :: signet_stream, signet_stream_open, signet_stream_write
+  public :: signet_stream_in, signet_get_stream, signet_stream_next, signet_stream_latest, signet_stream_ended
 
   type :: signet_text
     character(:), allocatable :: s
@@ -4350,6 +6180,21 @@ module signet
     character(:), allocatable :: domain
     real(8), allocatable :: x(:)
     complex(8), allocatable :: values(:)
+  end type
+  ! An output stream: call signet_stream_open(s, 'volts'), then call signet_stream_write(s, t, v) with a real(8)
+  ! or complex(8) v. Its .sig keeps the last window samples (1048 unless given), rewritten whole at each write.
+  type :: signet_stream
+    character(:), allocatable :: name, domain
+    integer :: window = 1048, count = 0
+    real(8), allocatable :: x(:), values(:)
+    complex(8), allocatable :: cvalues(:)
+  end type
+  ! A real stream input: call signet_get_stream('volts', s), then do while (signet_stream_next(s, t, v)) ... end do
+  ! follows it sample by sample until its module ends. signet_stream_latest(s, t, v) is .false. before the first
+  ! sample; signet_stream_ended(s) is .true. once its module has ended.
+  type :: signet_stream_in
+    character(:), allocatable :: path
+    integer(8) :: seen = 0
   end type
   type :: rec
     character(:), allocatable :: name, kind, shape, data
@@ -4367,11 +6212,20 @@ module signet
     module procedure put_reals, put_ints4, put_ints8, put_texts, put_complexes, put_series, put_cseries
   end interface
 
+  interface signet_stream_write
+    module procedure stream_write_real, stream_write_complex
+  end interface
+
   interface
     function c_rename(old, new) bind(C, name="rename")
       import :: c_char, c_int
       character(kind=c_char), intent(in) :: old(*), new(*)
       integer(c_int) :: c_rename
+    end function
+    function c_usleep(us) bind(C, name="usleep")
+      import :: c_int
+      integer(c_int), value :: us
+      integer(c_int) :: c_usleep
     end function
   end interface
 
@@ -5003,6 +6857,235 @@ contains
     call emit(name, '{"domain":' // jstr(s%domain) // ',"x":' // jreals(s%x) // ',"values":' // jcomplexes(s%values) // '}', t)
   end subroutine
 
+  subroutine signet_stream_open(s, name, domain, window)
+    type(signet_stream), intent(out) :: s
+    character(*), intent(in) :: name
+    character(*), intent(in), optional :: domain
+    integer, intent(in), optional :: window
+    s%name = name
+    s%domain = 'time'
+    if (present(domain)) s%domain = domain
+    if (present(window)) s%window = window
+    if (s%window < 1) call fail("a stream's window must be above 0")
+    allocate (s%x(s%window), s%values(s%window), s%cvalues(s%window))
+  end subroutine
+
+  function inum(n) result(s)
+    integer, intent(in) :: n
+    character(:), allocatable :: s
+    character(20) :: b
+    write (b, '(I0)') n
+    s = trim(b)
+  end function
+
+  integer function stream_slot(s, t) result(n)   ! makes room for one more sample; its index
+    type(signet_stream), intent(inout) :: s
+    real(8), intent(in) :: t
+    if (.not. allocated(s%x)) call fail('open a stream with signet_stream_open before writing it')
+    if (t /= t .or. abs(t) > huge(t)) call fail("a stream's t must be a finite number")
+    s%count = s%count + 1
+    if (s%count > s%window) then            ! the oldest sample falls out of the window
+      s%x(1:s%window - 1) = s%x(2:s%window)
+      s%values(1:s%window - 1) = s%values(2:s%window)
+      s%cvalues(1:s%window - 1) = s%cvalues(2:s%window)
+    end if
+    n = min(s%count, s%window)
+    s%x(n) = t
+  end function
+
+  function stream_json(s, n, values) result(js)
+    type(signet_stream), intent(in) :: s
+    integer, intent(in) :: n
+    character(*), intent(in) :: values
+    character(:), allocatable :: js
+    js = '{"domain":' // jstr(s%domain) // ',"x":' // jreals(s%x(1:n)) // ',"values":' // values // &
+         ',"window":' // inum(s%window) // ',"count":' // inum(s%count) // ',"ended":false}'
+  end function
+
+  subroutine stream_write_real(s, t, v)
+    type(signet_stream), intent(inout) :: s
+    real(8), intent(in) :: t, v
+    integer :: n
+    n = stream_slot(s, t)
+    s%values(n) = v
+    call emit(s%name, stream_json(s, n, jreals(s%values(1:n))), 'stream::' // s%domain // '::float')
+  end subroutine
+
+  subroutine stream_write_complex(s, t, v)
+    type(signet_stream), intent(inout) :: s
+    real(8), intent(in) :: t
+    complex(8), intent(in) :: v
+    integer :: n
+    n = stream_slot(s, t)
+    s%cvalues(n) = v
+    call emit(s%name, stream_json(s, n, jcomplexes(s%cvalues(1:n))), 'stream::' // s%domain // '::complex')
+  end subroutine
+
+  ! A stream's .sig, read without a JSON library
+  integer function key_at(s, k) result(at)
+    character(*), intent(in) :: s, k
+    integer :: p, from, i
+    at = 0
+    from = 1
+    do
+      p = index(s(from:), '"' // k // '"')
+      if (p == 0) return
+      i = from + p - 1 + len(k) + 2
+      do while (i <= len(s))
+        if (s(i:i) /= ' ') exit
+        i = i + 1
+      end do
+      if (i <= len(s)) then
+        if (s(i:i) == ':') then
+          i = i + 1
+          do while (i <= len(s))
+            if (s(i:i) /= ' ') exit
+            i = i + 1
+          end do
+          at = i
+          return
+        end if
+      end if
+      from = from + p
+    end do
+  end function
+
+  subroutine numbers(s, at, out)
+    character(*), intent(in) :: s
+    integer, intent(in) :: at
+    real(8), allocatable, intent(out) :: out(:)
+    integer :: stop, k, start, j, n
+    character(:), allocatable :: tok
+    allocate (out(0))
+    if (at == 0 .or. at > len(s)) return
+    if (s(at:at) /= '[') return
+    stop = at + index(s(at:), ']') - 1
+    if (len_trim(adjustl(s(at + 1:stop - 1))) == 0) return
+    n = 1
+    do j = at + 1, stop - 1
+      if (s(j:j) == ',') n = n + 1
+    end do
+    deallocate (out)
+    allocate (out(n))
+    k = 0
+    start = at + 1
+    do j = at + 1, stop
+      if (j == stop .or. s(j:j) == ',') then
+        k = k + 1
+        tok = trim(adjustl(s(start:j - 1)))
+        if (tok == 'null') then
+          out(k) = transfer(-2251799813685248_8, out(k))
+        else
+          out(k) = num(tok)
+        end if
+        start = j + 1
+      end if
+    end do
+  end subroutine
+
+  subroutine read_stream(path, x, v, count, ended)
+    character(*), intent(in) :: path
+    real(8), allocatable, intent(out) :: x(:), v(:)
+    integer(8), intent(out) :: count
+    logical, intent(out) :: ended
+    character(:), allocatable :: s
+    integer :: u, ios, vi, ci, ei, last
+    s = ''
+    open (newunit=u, file=path, status='old', action='read', iostat=ios)
+    if (ios == 0) then
+      call read_line(u, s, ios)
+      close (u)
+    end if
+    vi = key_at(s, 'values')
+    if (vi > 0) then
+      if (s(vi:vi) == '{') call fail(path // ' is a complex stream: read it in Python or Julia')
+    end if
+    call numbers(s, key_at(s, 'x'), x)
+    call numbers(s, vi, v)
+    count = size(x)
+    ended = .false.
+    if (size(x) /= size(v)) then               ! caught between writes: try again
+      deallocate (x, v)
+      allocate (x(0), v(0))
+      count = 0
+      return
+    end if
+    ci = key_at(s, 'count')
+    if (ci > 0) then
+      last = ci
+      do while (last <= len(s))
+        if (index('0123456789', s(last:last)) == 0) exit
+        last = last + 1
+      end do
+      if (last > ci) read (s(ci:last - 1), *) count
+    end if
+    ei = key_at(s, 'ended')
+    if (ei > 0) ended = s(ei:ei) == 't'
+  end subroutine
+
+  subroutine signet_get_stream(name, s)
+    character(*), intent(in) :: name
+    type(signet_stream_in), intent(out) :: s
+    type(rec) :: r
+    type(signet_text), allocatable :: t(:)
+    r = find(name, 'st', 'a stream')
+    t = tokens(r%data)
+    if (size(t) /= 1) call fail('input ' // name // ' merges streams: read it in Python, Julia, C++ or Rust')
+    s%path = unescape(t(1)%s)
+    s%seen = 0
+  end subroutine
+
+  logical function signet_stream_next(s, t, v) result(got)
+    type(signet_stream_in), intent(inout) :: s
+    real(8), intent(out) :: t, v
+    real(8), allocatable :: x(:), y(:)
+    integer(8) :: count, behind
+    logical :: ended
+    integer :: i, rc
+    t = 0
+    v = 0
+    do
+      call read_stream(s%path, x, y, count, ended)
+      if (count > s%seen .and. size(x) > 0) then
+        behind = min(count - s%seen, int(size(x), 8))
+        i = size(x) - int(behind) + 1
+        t = x(i)
+        v = y(i)
+        s%seen = count - behind + 1
+        got = .true.
+        return
+      end if
+      if (ended) then
+        got = .false.
+        return
+      end if
+      rc = c_usleep(20000)
+    end do
+  end function
+
+  logical function signet_stream_latest(s, t, v) result(got)
+    type(signet_stream_in), intent(in) :: s
+    real(8), intent(out) :: t, v
+    real(8), allocatable :: x(:), y(:)
+    integer(8) :: count
+    logical :: ended
+    t = 0
+    v = 0
+    call read_stream(s%path, x, y, count, ended)
+    got = size(x) > 0
+    if (got) then
+      t = x(size(x))
+      v = y(size(y))
+    end if
+  end function
+
+  logical function signet_stream_ended(s)
+    type(signet_stream_in), intent(in) :: s
+    real(8), allocatable :: x(:), y(:)
+    integer(8) :: count
+    call read_stream(s%path, x, y, count, signet_stream_ended)
+  end function
+
 end module signet
 '''
 
@@ -5048,7 +7131,7 @@ signet_get() {           # signet_get NAME: one value per line
 
 _signet_path() {         # <prefix>-<module>.<port>.sig, or <module>.<port>.sig without a prefix
   [ -n "${SIGNET_MODULE:-}" ] || { echo "signet: SIGNET_MODULE is not set (run from Signet or Starfire)" >&2; return 2; }
-  case "$1" in ''|[0-9]*|*[!A-Za-z0-9_]*|write|series) echo "signet: '$1' can't be a port name" >&2; return 2 ;; esac
+  case "$1" in ''|[0-9]*|*[!A-Za-z0-9_]*|write|series|stream) echo "signet: '$1' can't be a port name" >&2; return 2 ;; esac
   if [ -n "${SIGNET_PREFIX:-}" ]; then echo "${SIGNET_PREFIX}-${SIGNET_MODULE}.$1.sig"; else echo "${SIGNET_MODULE}.$1.sig"; fi
 }
 
@@ -5122,6 +7205,93 @@ signet_put_series() {    # signet_put_series NAME DOMAIN: reads "x value" lines 
     xs="${xs:+$xs, }$xi"; vs="${vs:+$vs, }$vi"
   done
   _signet_write "$name" "{\"domain\": \"$domain\", \"x\": [$xs], \"values\": [$vs]}" "series::$domain::float"
+}
+
+signet_stream() {        # signet_stream NAME [DOMAIN] [WINDOW]: reads "t value" lines on standard input and writes
+                         # the stream after each, keeping the last WINDOW samples (1048)
+  local name=$1 domain=${2:-time} window=${3:-1048} count=0 t v ti vi xs vs
+  local -a X=() V=()
+  case "$domain" in ''|[0-9]*|*[!A-Za-z0-9_]*) echo "signet: '$domain' can't be a domain" >&2; return 2 ;; esac
+  case "$window" in ''|*[!0-9]*|0) echo "signet: a stream's window must be a whole number above 0" >&2; return 2 ;; esac
+  _signet_path "$name" >/dev/null || return 2
+  while read -r t v; do
+    [ -n "$t" ] || continue
+    ti=$(_signet_json_num "$t" float) && vi=$(_signet_json_num "$v" float) || return 2
+    [ "$ti" != null ] || { echo "signet: a stream's t must be a number" >&2; return 2; }
+    X+=("$ti"); V+=("$vi"); count=$((count + 1))
+    if [ ${#X[@]} -gt "$window" ]; then X=("${X[@]:1}"); V=("${V[@]:1}"); fi
+    xs=$(IFS=,; printf '%s' "${X[*]}"); vs=$(IFS=,; printf '%s' "${V[*]}")
+    _signet_write "$name" "{\"domain\": \"$domain\", \"x\": [$xs], \"values\": [$vs], \"window\": $window, \"count\": $count, \"ended\": false}" \
+      "stream::$domain::float" || return 2
+  done
+}
+
+# A stream's .sig, read without a JSON library: "count ended" on the first line, then "t value" for each sample kept
+_signet_stream_awk='function key(s, k,   p, r) {
+    while ((p = index(s, "\"" k "\"")) > 0) {
+      r = substr(s, p + length(k) + 2); sub(/^ */, "", r)
+      if (substr(r, 1, 1) == ":") { r = substr(r, 2); sub(/^ */, "", r); return r }
+      s = substr(s, p + 1) }
+    return "" }
+  function list(r, out,   e, body) {
+    if (substr(r, 1, 1) != "[") return 0
+    e = index(r, "]"); body = substr(r, 2, e - 2)
+    return body ~ /^ *$/ ? 0 : split(body, out, ",") }
+  { s = s $0 }
+  END {
+    vr = key(s, "values"); if (substr(vr, 1, 1) == "{") exit 3
+    nx = list(key(s, "x"), X); nv = list(vr, V)
+    if (nx != nv) { print "0 0"; exit }
+    c = key(s, "count"); e = key(s, "ended")
+    print (c == "" ? nx : c + 0), (substr(e, 1, 1) == "t" ? 1 : 0)
+    for (i = 1; i <= nx; i++) { gsub(/ /, "", X[i]); gsub(/ /, "", V[i]); print X[i], (V[i] == "null" ? "nan" : V[i]) } }'
+
+_signet_stream_path() {  # the .sig a stream input is read from
+  local row path; row=$(_signet_row "$1") || return 2
+  path=$(printf '%s\n' "$row" | LC_ALL=C awk -F'\t' "$_signet_unescape"'
+    $3 == "st" { if (split($4, t, " ") != 1) exit 3; print u(t[1]); exit } { exit 4 }')
+  case $? in
+    0) printf '%s\n' "$path" ;;
+    3) echo "signet: input $1 merges streams: read it in Python, Julia, C++ or Rust" >&2; return 2 ;;
+    *) echo "signet: input $1 isn't a stream" >&2; return 2 ;;
+  esac
+}
+
+_signet_stream_read() {
+  [ -f "$1" ] || { echo "0 0"; return 0; }
+  LC_ALL=C awk "$_signet_stream_awk" "$1" || { echo "signet: $1 is a complex stream: read it in Python or Julia" >&2; return 2; }
+}
+
+signet_stream_latest() { # signet_stream_latest NAME: "t value" of the newest sample, nothing before the first
+  local p out; p=$(_signet_stream_path "$1") || return 2
+  out=$(_signet_stream_read "$p") || return 2
+  printf '%s\n' "$out" | tail -n +2 | tail -n 1
+}
+
+signet_stream_ended() {  # signet_stream_ended NAME: succeeds once the module writing it has ended
+  local p out; p=$(_signet_stream_path "$1") || return 2
+  out=$(_signet_stream_read "$p") || return 2
+  [ "$(printf '%s\n' "$out" | head -n 1 | cut -d' ' -f2)" = 1 ]
+}
+
+signet_stream_follow() { # signet_stream_follow NAME: prints "t value" for each sample as it arrives, until its module ends
+  local p out head count ended rows n seen=0
+  p=$(_signet_stream_path "$1") || return 2
+  while :; do
+    out=$(_signet_stream_read "$p") || return 2
+    head=$(printf '%s\n' "$out" | head -n 1)
+    count=${head% *}; ended=${head#* }
+    rows=$(printf '%s\n' "$out" | tail -n +2)
+    if [ "$count" -gt "$seen" ] && [ -n "$rows" ]; then
+      n=$((count - seen))
+      printf '%s\n' "$rows" | tail -n "$n"
+      seen=$count
+    elif [ "$ended" = 1 ]; then
+      return 0
+    else
+      sleep 0.02
+    fi
+  done
 }
 '''
 
@@ -5299,7 +7469,7 @@ _INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia"}
 
 # Ports: what a module declares it reads and writes, and the wiring checked against it
 _PORT_LINE = re.compile(r"^[ \t]*(?:#|//|--|!)[ \t]*signet:[ \t]*(.*)$", re.M | re.I)
-_PORT_ITEM = re.compile(r"(in|out)\s+((?:[A-Za-z_][A-Za-z0-9_]*::)*)([A-Za-z_][A-Za-z0-9_]*)$", re.I)
+_PORT_ITEM = re.compile(r"(in|out)\s+((?:[A-Za-z0-9_]+::)*)([A-Za-z_][A-Za-z0-9_]*)$", re.I)
 
 
 def read_ports(text: str):
@@ -5326,7 +7496,8 @@ def read_ports(text: str):
 
 _FITS = {"hex": {"hex"}, "int": {"int", "hex"}, "float": {"float", "real", "int", "hex"},
          "real": {"float", "real", "int", "hex"}, "num": {"float", "real", "int", "hex", "num", "complex"},
-         "bool": {"bool"}, "complex": {"complex"}, "bus": {"bus"}}
+         "bool": {"bool"}, "complex": {"complex"}, "bus": {"bus"}, "stream": {"stream"}, "tuple": {"tuple"}, "series": {"series"},
+         "bits": {"bits"}, "range": {"range"}}
 
 
 def _fits(src, dst) -> bool:
@@ -5345,6 +7516,8 @@ def _fits(src, dst) -> bool:
 def _literal_words(e):
     if e[0] == "num":
         return ["int"] if type(e[1]) is int else ["float"]
+    if e[0] == "bits":
+        return ["bits", str(len(e[1]))]
     return {"imag": ["complex"], "str": ["text"], "bool": ["bool"]}.get(e[0])
 
 
@@ -5486,6 +7659,8 @@ class FolderHost:
         self.params = {k.lower(): v for k, v in (params or {}).items()}
         self.timeout = timeout
         self.states = {}
+        self.going = {}          # module -> a run started in the background because it writes a stream
+        self.errors = {}
 
     def point_param(self, point, name):
         raise LookupError(f"{point}:${name}: points need Starfire; outside it, use $name")
@@ -5494,10 +7669,29 @@ class FolderHost:
         return True             # a folder has no RUN buttons
 
     def state(self, module):
+        if module in self.going:
+            self._poll(module)
         return self.states.get(module, "none")
 
     def break_runs(self):
-        pass                    # runs here finish before run() returns, so none is left going
+        for module, r in list(self.going.items()):
+            r["proc"].kill()
+            r["proc"].wait()
+            for path in r["streams"]:
+                end_stream(path)
+            del self.going[module]
+            self.states[module] = "broken"
+
+    def wait_all(self) -> list:
+        """Waits for runs still going (modules writing streams); the errors of any that failed."""
+        errors = []
+        for module in list(self.going):
+            while module in self.going:
+                self._poll(module)
+                time.sleep(0.05)
+            if self.states[module] == "failed":
+                errors.append(self.errors.get(module, f"{module} failed"))
+        return errors
 
     def resolve(self, text):
         if ":" in text:
@@ -5512,7 +7706,7 @@ class FolderHost:
         stamped = []
         for n in found:
             try:
-                read_sig(n)
+                stream_sig(n) or read_sig(n)        # a stream still being written has no stamp yet
                 stamped.append(n)
             except ValueError:
                 pass
@@ -5538,14 +7732,18 @@ class FolderHost:
             raise LookupError(f"input has no answer for: {prompt}")
 
     def run(self, module, inputs):
-        """Runs the module to its end (this host is sequential: a sequence in a folder waits for each run)."""
+        """Runs the module to its end (a sequence in a folder waits for each run), except a module that declares
+        a stream output: that one runs in the background, so others can read the stream while it is written."""
+        if module in self.going:
+            raise RuntimeError(f"{module} is still running")
         self.states[module] = "running"
         try:
             self._run(module, inputs)
         except BaseException:
             self.states[module] = "failed"
             raise
-        self.states[module] = "complete"
+        if module not in self.going:       # one writing a stream is complete only when its process ends
+            self.states[module] = "complete"
 
     def _run_signet(self, module, name, inputs, ports=None):
         """A module written in Signet: its inputs are variables, output(name, value) writes the Signals."""
@@ -5561,7 +7759,7 @@ class FolderHost:
         written = [n for n, t in {n: os.stat(n).st_mtime_ns for n in os.listdir(".") if n.endswith(".sig") and os.path.isfile(n)}.items()
                    if before.get(n) != t]
         self._contract(module, ports, written=written)
-        res = stamp("", module, written, os.path.basename(os.getcwd()) + ":")
+        res = stamp("", module, written, os.path.basename(os.getcwd()) + ":", inputs or {}, name)
         for e in res["errors"]:
             print(f"{module}: {e}", file=sys.stderr)
 
@@ -5618,19 +7816,61 @@ class FolderHost:
             argv.insert(0, found)
         inputs_path = f"{module}.inputs.json"
         write_inputs(inputs_path, inputs)
-        def state():
-            return {n: os.stat(n).st_mtime_ns for n in os.listdir(".") if n.endswith(".sig") and os.path.isfile(n)}
-        before = state()
+        before = self._files()
         env = module_env(os.environ, "", module, os.path.abspath(inputs_path) if inputs else "")
+        streams = [f"{module}.{p}.sig" for p, w in (ports or {}).get("out", {}).items() if w[:1] == ["stream"]]
+        if streams:
+            for path in streams:            # there from the start, so a reader can connect at once
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps({"value": {"x": [], "values": [], "window": STREAM_WINDOW, "count": 0, "ended": False},
+                                        "type": "stream"}) + "\n")
+            proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL)
+            def ender():               # readers following the stream learn of its end at once
+                proc.wait()
+                for path in streams:
+                    end_stream(path)
+            threading.Thread(target=ender, daemon=True).start()
+            self.going[module] = {"proc": proc, "ports": ports, "before": before, "streams": streams,
+                                  "until": time.monotonic() + self.timeout, "inputs": inputs or {}, "file": name}
+            return
         try:
             code = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, timeout=self.timeout).returncode
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{module} timed out after {self.timeout} s")
+        self._ended(module, code, ports, before, (), inputs or {}, name)
+
+    @staticmethod
+    def _files():
+        return {n: os.stat(n).st_mtime_ns for n in os.listdir(".") if n.endswith(".sig") and os.path.isfile(n)}
+
+    def _poll(self, module):
+        r = self.going[module]
+        code = r["proc"].poll()
+        if code is None and time.monotonic() > r["until"]:
+            r["proc"].kill()
+            code = r["proc"].wait()
+            self.errors[module] = f"{module} timed out after {self.timeout} s"
+        if code is None:
+            return
+        del self.going[module]
+        try:
+            self._ended(module, code, r["ports"], r["before"], r["streams"], r["inputs"], r["file"])
+            self.states[module] = "complete"
+        except (RuntimeError, LookupError) as e:
+            self.errors.setdefault(module, str(e))
+            print(self.errors[module], file=sys.stderr)
+            self.states[module] = "failed"
+
+    def _ended(self, module, code, ports, before, streams=(), inputs=None, file=None):
+        """After a module's process ends: mark its streams ended, then check and stamp what it wrote."""
+        changed = [n for n, t in self._files().items() if before.get(n) != t]
+        for path in sorted(set(streams) | {n for n in changed if n.startswith(module + ".")}):
+            end_stream(path)
         if code != 0:
             raise RuntimeError(f"{module} failed (exit {code})")
-        written = [n for n, t in state().items() if before.get(n) != t]
+        written = [n for n, t in self._files().items() if before.get(n) != t]
         self._contract(module, ports, written=written)
-        res = stamp("", module, written, os.path.basename(os.getcwd()) + ":")
+        res = stamp("", module, written, os.path.basename(os.getcwd()) + ":", inputs, file)
         for e in res["errors"]:
             print(f"{module}: {e}", file=sys.stderr)
 
@@ -5640,6 +7880,7 @@ def main(argv=None) -> int:
     ap.add_argument("file", nargs="?", help="the .signet file")
     ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE", help="a parameter for $NAME")
     ap.add_argument("--check", action="store_true", help="only read the file and report bad lines")
+    ap.add_argument("--lineage", metavar="SIG", help="show the chain that made a Signal in this folder, and stop")
     ap.add_argument("--export-helpers", metavar="DIR", help="write the module helpers (Python, Julia, shell, C++, Rust, Ada, Fortran) into DIR and stop")
     ap.add_argument("--version", action="version", version=f"signet {VERSION} (API {API})")
     a = ap.parse_args(argv)
@@ -5647,6 +7888,13 @@ def main(argv=None) -> int:
         for p in export_helpers(a.export_helpers):
             print(p)
         return 0
+    if a.lineage:
+        if not os.path.isfile(a.lineage):
+            print(f"no Signal {a.lineage} here", file=sys.stderr)
+            return 1
+        lines = lineage(os.path.basename(a.lineage), os.path.dirname(a.lineage) or ".")
+        print("\n".join(lines))
+        return 0 if lines and ", stamp ok" in lines[0] else 1
     if not a.file:
         ap.error("give a .signet file")
     try:
@@ -5675,7 +7923,9 @@ def main(argv=None) -> int:
             st = seq.step(time.monotonic())
             if st.state != "waiting":
                 break
-            time.sleep(0.2)      # only a wait on a condition or delay() gets here: runs finish by themselves
+            time.sleep(0.2)      # a wait on a condition, delay(), or a module writing a stream gets here
+        if st.state != "broken" and host.wait_all():
+            return 1             # wait_all has said why
     except ValueError as e:
         print(e, file=sys.stderr)
         return 1
@@ -5692,7 +7942,7 @@ def __getattr__(name):
     # A module in the same folder as signet.py imports this file rather than the helper package,
     # so `from signet import signals` (and Series, Bus) is answered with the same helper.
     global _HELPER_MODULE
-    if name in ("signals", "Series", "Bus"):
+    if name in ("signals", "Series", "Bus", "Stream"):
         if _HELPER_MODULE is None:
             import types
             _HELPER_MODULE = types.ModuleType("signet_helper")
