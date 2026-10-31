@@ -2,7 +2,7 @@
 
 # signet.py:      SIGNET, A COORDINATION LANGUAGE FOR WIRING MODULES IN ANY LANGUAGE VIA SIGNALS
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-29
+# UPDATED:        2026-10-31
 # VERSION:        26.b.0.1.3
 #
 
@@ -652,7 +652,9 @@ class _LineParser:
                 raise self.err("@ goes before sample: @sample(stream)")
             self.take()
             return ("sample", "@") + tuple(self.args())
-        if kind == "name" and text == "input" and self.peek(1) == ("op", "("):
+        if kind == "name" and text == "input" and self.peek(1) == ("op", "(") and self.peek(2)[0] == "type":
+            raise self.err("unknown function input" + _LISTEN["input"])
+        if kind == "name" and text == "listen" and self.peek(1) == ("op", "("):
             self.take()
             self.take()
             words = self.types()
@@ -662,7 +664,7 @@ class _LineParser:
             if self.peek() != ("op", ")"):
                 prompt = self.expr()
             self.expect_op(")")
-            return ("input", words, prompt)
+            return ("listen", words, prompt)
         if self.callable_name():
             name = self.take()[1]
             return ("call", name) + tuple(self.args())
@@ -683,6 +685,9 @@ class _LineParser:
         if (kind, text) == ("op", "{"):
             self.take()
             lo = self.expr()
+            if self.peek() == ("op", "}"):            # {v}: a vector of two numbers as a range
+                self.take()
+                return ("torange", lo)
             self.expect_op(",")
             hi = self.expr()
             self.expect_op("}")
@@ -875,7 +880,7 @@ def parse_signals(code: str, inputs=()) -> list:
               "escape": "escape", "echo": "echo", "break": "break", "setindex": "index", "output": "output", "lineage": "lineage",
               "callstmt": "a subprocess call"}
     unpure = {"ref": "signals and files", "pref": "signals and files", "param": "parameters", "pparam": "parameters",
-              "column": "files", "state": "run states", "autorun": "AUTORUN", "input": "answers"}
+              "column": "files", "state": "run states", "autorun": "AUTORUN", "listen": "answers"}
     def define(nd):
         name, params, body = nd[2], nd[3], nd[6]
         if name in _BUILTINS:
@@ -1014,7 +1019,7 @@ def parse_signals(code: str, inputs=()) -> list:
             elif f is None and n == scope["name"]:
                 errors.append(f"line {line}: {n} can't call itself")
             elif f is None:
-                errors.append(f"line {line}: unknown function {n}" if n not in names else f"line {line}: {n} isn't a function")
+                errors.append(f"line {line}: unknown function {n}{_LISTEN.get(n, '')}" if n not in names else f"line {line}: {n} isn't a function")
             elif f[0] != "function":
                 errors.append(f"line {line}: {n} is a subprocess and returns nothing: {who} needs a function")
             else:
@@ -1060,7 +1065,7 @@ def parse_signals(code: str, inputs=()) -> list:
             if f is None and e[1] == scope["name"]:
                 errors.append(f"line {line}: {e[1]} can't call itself")
             elif f is None:
-                errors.append(f"line {line}: unknown function {e[1]}" if e[1] not in names else f"line {line}: {e[1]} isn't a function")
+                errors.append(f"line {line}: unknown function {e[1]}{_LISTEN.get(e[1], '')}" if e[1] not in names else f"line {line}: {e[1]} isn't a function")
             elif f[0] != "function":
                 errors.append(f"line {line}: {e[1]} is a subprocess and returns nothing: call it on a line of its own")
             elif f[1] != len(e) - 2:
@@ -1904,7 +1909,45 @@ def _bits_op(op: str, a: _SV, b: _SV, line: int) -> _SV:
     return _SV(Bits(r, w), _bits_type(w))
 
 
-_MORE = {"saturate": _saturate, "excess": _excess, "quantize": _quantize, "popcount": _popcount,
+_UNUM_RE = r"(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?"
+_NUM_RE = r"[+-]?" + _UNUM_RE
+
+
+def _read_number(text: str):
+    """Text read as a number, the way it is written in code: 2, 3.5, 1e3, 1 + 2i, 3i, hex::FF. None if it isn't one."""
+    t = str(text).strip()
+    if re.fullmatch(_NUM_RE, t):
+        return _SV(float(t) if re.search(r"[.eE]", t) else int(t), "float" if re.search(r"[.eE]", t) else "int")
+    m = re.fullmatch(rf"({_NUM_RE})\s*([+-])\s*({_UNUM_RE})(?:i|im)", t) or re.fullmatch(rf"()()({_NUM_RE})(?:i|im)", t)
+    if m:
+        re_, im = float(m.group(1) or 0), float(m.group(3)) * (-1 if m.group(2) == "-" else 1)
+        return _SV({"re": re_, "im": im}, "complex")
+    m = re.fullmatch(r"hex::(?:0[xX])?([0-9A-Fa-f]{1,8})", t)
+    if m:
+        return _SV(Hex(int(m.group(1), 16)), "hex")
+    return None
+
+
+def _text2num(name, args, line, ctx=None) -> _SV:
+    """text2num('2.5') is 2.5: text read as an int, float, complex or hex, as it would be written in code."""
+    t = args[0]
+    if t.file or t.type != "text" or not isinstance(t.value, str):
+        raise SignalError(line, f"text2num takes text, got {_show_type(t)}")
+    n = _read_number(t.value)
+    if n is None:
+        raise SignalError(line, f"text2num can't read {t.value!r} as a number")
+    return n
+
+
+def _num2text(name, args, line, ctx=None) -> _SV:
+    """num2text(2.5) is '2.5': a number as text, written as echo shows it, so text2num reads it back."""
+    x = args[0]
+    if x.file or not (_is_num(x.value) or isinstance(x.value, Hex) or x.type == "complex" and _complex_depth(x.value) == 0):
+        raise SignalError(line, f"num2text takes a number, got {_show_type(x)}")
+    return _SV(_show_value(x), "text")
+
+
+_MORE = {"text2num": _text2num, "num2text": _num2text, "saturate": _saturate, "excess": _excess, "quantize": _quantize, "popcount": _popcount,
          "min": _extreme, "max": _extreme, "argmin": _extreme, "argmax": _extreme,
          "sum": _reduce, "prod": _reduce, "mean": _reduce, "std": _reduce, "rms": _reduce, "norm": _reduce,
          "sort": _sort, "length": _length, "size": _length, "dot": _dot, "cross": _dot, "transpose": _transpose}
@@ -1912,8 +1955,9 @@ _MORE = {"saturate": _saturate, "excess": _excess, "quantize": _quantize, "popco
 _MATH = {"Re": 1, "Im": 1, "abs": 1, "arg": 1, "conj": 1, "power": 2, "root": 2}     # built-in maths, and their argument counts
 _MATH.update({n: (2 if n in ("saturate", "excess", "quantize", "dot", "cross") else 1) for n in _MORE})
 _NO_STREAMS = "a function can't read streams: sample or freeze the stream first and pass in the value"
+_LISTEN = {"input": ": listen(...) asks for a value"}     # the old name, before a port could be called input
 _FNARGS = {"map": 1, "warp": 2}      # built-in calls and how many function arguments they start with
-_BUILTINS = ("map", "warp", "unity", "Re", "Im", "im", "input", "abs", "arg", "conj", "power", "root", "sample", "freeze") \
+_BUILTINS = ("map", "warp", "unity", "Re", "Im", "im", "listen", "abs", "arg", "conj", "power", "root", "sample", "freeze") \
     + tuple(_MORE)
 
 
@@ -2073,6 +2117,9 @@ def _param_value(text, source) -> _SV:
     try:
         v = json.loads(text)
     except ValueError:
+        n = _read_number(t)             # 1 + 2i, hex::FF
+        if n is not None:
+            return _SV(n.value, n.type, source)
         v = text
     v = _denan(v)
     return _SV(v, infer_type(v), source)
@@ -2319,7 +2366,7 @@ def _define_fn(nd, ctx) -> None:
 def _call_function(name, args, line, ctx) -> _SV:
     fn = ctx.get("funcs", {}).get(name)
     if fn is None or fn["kind"] != "function":
-        raise SignalError(line, f"unknown function {name}")
+        raise SignalError(line, f"unknown function {name}{_LISTEN.get(name, '')}")
     frame = dict(fn["snap"])
     frame.update(_bind(fn["params"], args, name, line, ctx))
     ex = _Exec(ctx["host"], None)
@@ -2381,6 +2428,11 @@ def _eval(e, line: int, ctx) -> _SV:
         return _SV(Bits(int(e[1], 2), len(e[1])), _bits_type(len(e[1])))
     if kind == "range":
         return _make_range(_eval(e[1], line, ctx), _eval(e[2], line, ctx), line)
+    if kind == "torange":
+        v = _eval(e[1], line, ctx)
+        if v.file or not isinstance(v.value, list) or len(v.value) != 2 or v.type.count("::") != 1:
+            raise SignalError(line, f"{{v}} makes a range from a vector of 2 numbers, got {_show_value(v) if not v.file else _show_type(v)}")
+        return _make_range(_SV(v.value[0], infer_type(v.value[0])), _SV(v.value[1], infer_type(v.value[1])), line)
     if kind == "bnot":
         return _bits_not(_eval(e[1], line, ctx), line)
     if kind == "call" and e[1] in _MATH:
@@ -2395,6 +2447,9 @@ def _eval(e, line: int, ctx) -> _SV:
         return _call_function(e[1], [_eval(a, line, ctx) for a in e[2:]], line, ctx)
     if kind == "vec":
         items = [_eval(a, line, ctx) for a in e[1:]]
+        if len(items) == 1 and not items[0].file and _is_range(items[0].value):     # [r]: a range as a vector
+            v = [items[0].value["lo"], items[0].value["hi"]]
+            return _SV(v, infer_type(v), "vector")
         for it in items:
             if it.file or it.type in ("bus",) or isinstance(it.value, (dict, type(None))) and not it.type.endswith("complex"):
                 raise SignalError(line, f"a vector holds numbers, bools, text, hex or complex numbers, got {_show_type(it)}")
@@ -2478,17 +2533,17 @@ def _eval(e, line: int, ctx) -> _SV:
         return _note(ctx, sv)
     if kind == "typed":
         return _typed(e[1], _eval(e[2], line, ctx), line)
-    if kind == "input":
+    if kind == "listen":
         if not hasattr(host, "ask"):
-            raise SignalError(line, "input needs a person to ask, and this host has none")
+            raise SignalError(line, "listen needs a person to ask, and this host has none")
         prompt = _eval(e[2], line, ctx).value if e[2] else "Value?"
         if not isinstance(prompt, str):
-            raise SignalError(line, "the prompt of input must be text")
+            raise SignalError(line, "the prompt of listen must be text")
         try:
             text = host.ask(prompt, "::".join(e[1]))
         except LookupError as err:
             raise SignalError(line, err.args[0] if err.args else "no answer was given")
-        sv = _SV(text, "text", "input") if e[1] == ["text"] else _param_value(text, "input")
+        sv = _SV(text, "text", "listen") if e[1] == ["text"] else _param_value(text, "listen")
         return _typed(e[1], sv, line) if e[1] else sv
     if kind == "neg":
         a = _eval(e[1], line, ctx)
@@ -7494,7 +7549,8 @@ def read_ports(text: str):
     return ports
 
 
-_FITS = {"hex": {"hex"}, "int": {"int", "hex"}, "float": {"float", "real", "int", "hex"},
+_KIND_HINT = {"range": ": a range is written {lo, hi}", "vector": ": a vector is written [a, b, ...]"}
+_FITS = {"vector": {"vector"}, "hex": {"hex"}, "int": {"int", "hex"}, "float": {"float", "real", "int", "hex"},
          "real": {"float", "real", "int", "hex"}, "num": {"float", "real", "int", "hex", "num", "complex"},
          "bool": {"bool"}, "complex": {"complex"}, "bus": {"bus"}, "stream": {"stream"}, "tuple": {"tuple"}, "series": {"series"},
          "bits": {"bits"}, "range": {"range"}}
@@ -7518,6 +7574,10 @@ def _literal_words(e):
         return ["int"] if type(e[1]) is int else ["float"]
     if e[0] == "bits":
         return ["bits", str(len(e[1]))]
+    if e[0] in ("range", "torange"):
+        return ["range"]
+    if e[0] == "vec":
+        return ["vector"]
     return {"imag": ["complex"], "str": ["text"], "bool": ["bool"]}.get(e[0])
 
 
@@ -7591,7 +7651,7 @@ def check_wiring(code, ports=lambda m: None, is_file=lambda t: False) -> list:
             want = d["in"][port]
             got = words or src_words
             if want and got and not _fits(got, want):
-                errors.append(f"line {line}: {mod}.{port} takes {'::'.join(want)}, got {'::'.join(got)}")
+                errors.append(f"line {line}: {mod}.{port} takes {'::'.join(want)}, got {'::'.join(got)}" + _KIND_HINT.get(want[0], ""))
     def reads(e, line):
         if isinstance(e, tuple):
             if e and e[0] == "ref":
@@ -7606,7 +7666,7 @@ def check_wiring(code, ports=lambda m: None, is_file=lambda t: False) -> list:
         line = here[0] = nd[1]
         if nd[0] == "connect":
             src = nd[2]
-            w = source(src, line) if src[0] in ("ref", "num", "imag", "str", "bool") else reads(src, line)
+            w = source(src, line) if src[0] in ("ref", "num", "imag", "str", "bool", "range", "torange", "vec") else reads(src, line)
             target(nd[3], nd[4], nd[5], line, w)
         elif nd[0] == "route":
             w = source(nd[3], line) if nd[3][0] == "ref" else reads(nd[3], line)
@@ -7635,6 +7695,10 @@ def contract_errors(module: str, ports, inputs=None, written=None) -> list:
     if inputs is not None:
         missing = sorted(set(ports["in"]) - set(inputs))
         extra = sorted(set(inputs) - set(ports["in"]))
+        for port, v in sorted(inputs.items()):       # a vector is never a range, nor a range a vector
+            want, got = ports["in"].get(port) or [], str(v.get("type") or "").split("::")
+            if want and got[0] and ("vector" in (want[0], got[0]) or "range" in (want[0], got[0])) and not _fits(got, want):
+                errs.append(f"{module}.{port} takes {'::'.join(want)}, got {'::'.join(got)}" + _KIND_HINT.get(want[0], ""))
         if missing:
             errs.append(f"{module} needs input{'s' * (len(missing) > 1)} {', '.join(missing)}: nothing is connected")
         if extra:
@@ -7725,7 +7789,7 @@ class FolderHost:
         print(text, flush=True)
 
     def ask(self, prompt, type_name):
-        """input(): asks on the terminal; answers can also be piped in."""
+        """listen(): asks on the terminal; answers can also be piped in."""
         try:
             return input(f"{prompt} " + (f"[{type_name}] " if type_name else ""))
         except EOFError:
