@@ -758,7 +758,7 @@ function runPinned(p, mod) {
 
 // Signet syntax colours for the Signals box: a coloured copy of the text sits behind the (transparent) textarea.
 const SIG_COMMANDS = new Set(("let where connect if then else end break multiplex demultiplex echo output run when within by finish delay " +
-  "escape for next index route exit merge interchange complete failed broken running column function subprocess return map warp unity input Re Im abs arg conj power root").split(" "));
+  "escape for next index route exit merge interchange complete failed broken running column function subprocess return map warp unity listen Re Im abs arg conj power root text2num num2text").split(" "));
 const SIG_FILE = /\.(sig|csv|txt|tsv|json|png|jpe?g|gif)$/;   // a signal or file reference, not module.port or a parameter
 const SIG_TOKEN = new RegExp([
   "(#.*)", "('[^'\\n]*'|\"[^\"\\n]*\")", "((?:[A-Za-z_]\\w*::)+)", "((?<=hex::)(?:0[xX])?[0-9A-Fa-f]+(?![A-Za-z0-9_]))",
@@ -828,7 +828,7 @@ function bindModulePanel(i) {
   if (btn) btn.addEventListener("click", () => { (moduleState.get(p) || {}).active = ""; runModule(p); });
   const brk = root.querySelector("button[data-modbreak]");
   if (brk) brk.addEventListener("click", () => breakModule(p));
-  // input() in a sequence: send the answer
+  // listen() in a sequence: send the answer
   const ans = root.querySelector("input[data-seqans]"), send = root.querySelector("button[data-seqsend]");
   const answer = async () => {
     const st = moduleState.get(p) || {};
