@@ -7,23 +7,30 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/starfire.css">
+<script>   // dark or mono, as last set in the campaign sidebar (an older "light" counts as mono)
+  const monoTheme = v => v === "mono" || v === "light";
+  try { if (monoTheme(localStorage.getItem("starfire-theme"))) document.documentElement.dataset.theme = "mono"; } catch (e) {}
+  addEventListener("storage", e => { if (e.key === "starfire-theme") {
+    if (monoTheme(e.newValue)) document.documentElement.dataset.theme = "mono"; else delete document.documentElement.dataset.theme; } });
+</script>
 </head>
 <body class="editor-doc">
 <div id="tabbar"></div>
 <div id="panels">
   <div class="panel active split" id="panel-campaign">
     <div class="report-side">
-      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+      <div class="side-title"><h1>STARFIRE</h1></div>
       <div class="side-btns">
         <button class="btn" id="loadCampBtn">import campaign file</button>
         <input type="file" id="loadCampFile" accept=".camp,application/json" style="display:none">
-        <button class="btn" id="saveCampBtn">export campaign file (.camp)</button>
+        <button class="btn" id="saveCampBtn">export campaign file</button>
         <button class="btn" id="printCampBtn">generate .pdf</button>
         <button class="btn" id="docxCampBtn">export .docx</button>
         <button class="btn" id="genVcrmBtn">generate VCRM</button>
         <button class="btn" id="buildSrBtn">build campaign report</button>
-        <button class="btn" id="loadSysBtn">import system file (.sys)</button>
+        <button class="btn" id="loadSysBtn">import system file</button>
         <input type="file" id="loadSysFile" accept=".sys,application/json" style="display:none">
+        <button class="btn" id="themeBtn">mono mode</button>
       </div>
       <div id="saveStatus" class="hint"></div>
     </div>
@@ -156,12 +163,12 @@ document.getElementById("addReqBtn").addEventListener("click", () => {
 // that card; TC-001-20 = that point only.
 let moduleFiles = [];
 // Kind by name, mirroring how the server runs it (case-sensitive, like os.path.splitext):
-// no extension = a binary, .py/.jl/.sh = that language, anything else = "other".
+// no extension = a binary, .py/.jl/.sh/.signet = that language, a source Signet builds = "src", anything else = "other".
 function moduleKind(name) {
   if (!name) return "";
   const dot = name.lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot) : "";
-  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (/^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i.test(ext) ? "bin" : "other");
+  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (/^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i.test(ext) ? "src" : "other");
 }
 function renderModules() {
   const t = document.getElementById("modTable");
@@ -532,6 +539,21 @@ function updateAppendButtons() {
   document.querySelectorAll("iframe.sy-frame").forEach(f => { try { f.contentWindow.setAppendVisible(on); } catch (e) {} });
 }
 
+// Mono mode: the button flips it here; other tabs follow through the storage event, report previews below.
+const isMono = () => document.documentElement.dataset.theme === "mono";
+const themed = html => isMono() ? html.replace("<html>", '<html data-theme="mono">') : html;
+function setTheme(mono) {
+  try { localStorage.setItem("starfire-theme", mono ? "mono" : "dark"); } catch (e) {}
+  for (const root of [document.documentElement, ...[...document.querySelectorAll("iframe.report-frame")].map(f => {
+         try { return f.contentDocument.documentElement; } catch (e) { return null; } })]) {
+    if (!root) continue;
+    if (mono) root.dataset.theme = "mono"; else delete root.dataset.theme;
+  }
+  document.getElementById("themeBtn").textContent = mono ? "dark mode" : "mono mode";
+}
+document.getElementById("themeBtn").addEventListener("click", () => setTheme(!isMono()));
+setTheme(isMono());
+
 function switchTab(key) {
   activeTab = key;
   if (key === "campaign") refreshStatuses();
@@ -636,8 +658,8 @@ function openSrTab() {
     panel.id = "panel-" + SR_KEY;
     panel.innerHTML = `
       <div class="report-side">
-        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
-        <div class="report-box"><div class="report-label">Campaign report for</div><div class="report-for sr-for"></div></div>
+        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Campaign Report</div></div>
+        <div class="report-box"><div class="report-for sr-for"></div></div>
         <div class="report-box">
           <div class="report-label">Contents</div>
           <div class="sr-items"></div>
@@ -692,7 +714,7 @@ async function renderSrPreview() {
   const res = await fetch("/export/campaign_report/print", {method: "POST", body: JSON.stringify({campaign: camp, preview: true})});
   const scroll = frame.contentWindow ? frame.contentWindow.scrollY : 0;
   frame.onload = () => frame.contentWindow.scrollTo(0, scroll);
-  frame.srcdoc = await res.text();
+  frame.srcdoc = themed(await res.text());
 }
 
 async function printSr() {
@@ -794,7 +816,7 @@ function openReportTab(testId) {
     panel.id = "panel-" + key;
     panel.innerHTML = `
       <div class="report-side">
-        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+        <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Report</div></div>
         <div class="report-box"><div class="report-label">Report for</div><div class="report-for"></div></div>
         <div class="report-box">
           <div class="report-label report-files-title">Files for point</div>
@@ -847,7 +869,7 @@ function reportCols(card) {
   return t.cols = t.cols || {};
 }
 
-const PLOT_COLORS = ["#39ff14", "#0077C8", "#ff2800", "#FFB300"];   // the preview's trace colors in starfire.css
+const PLOT_COLORS = ["var(--nvg)", "var(--bl)", "var(--rd)", "var(--amb)"];   // the preview's trace colors in starfire.css, dark or mono
 
 // Checkboxes for a plotted csv with more than one column to trace (x is always the first numeric column).
 function plotColsHtml(st, f, j) {
@@ -944,7 +966,7 @@ async function renderReportPreview(key) {
       });
     });
   };
-  frame.srcdoc = await res.text();
+  frame.srcdoc = themed(await res.text());
 }
 
 async function printReport(key) {
@@ -1033,11 +1055,11 @@ async function generateVcrm() {
     `<td>${r.event === "NONE" ? `<input type="checkbox" class="vcrm-pick" value="${esc(r.requirement)}">` : ""}</td></tr>`).join("");
   panel.innerHTML = `
     <div class="report-side">
-      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
-      <div class="report-box"><div class="report-label">Verification Cross-Reference Matrix for Test Campaign</div>
+      <div class="side-title"><h1>STARFIRE</h1><div class="sub">Verification Cross-Reference Matrix</div></div>
+      <div class="report-box">
         <div class="report-for">${esc([camp.id, camp.title, camp.revision ? "REV " + camp.revision.toUpperCase() : ""].filter(Boolean).join(" "))}</div></div>
       <div class="side-btns">
-        <button class="btn" id="saveVcrmBtn">export .vcrm file</button>
+        <button class="btn" id="saveVcrmBtn">export VCRM file</button>
         <button class="btn" id="printVcrmBtn">generate .pdf</button>
         <button class="btn" id="docxVcrmBtn">export .docx</button>
         <button class="btn" id="csvVcrmBtn">export .csv</button>
