@@ -7,16 +7,22 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/starfire.css">
+<script>   // dark or mono, as last set in the campaign sidebar (an older "light" counts as mono)
+  const monoTheme = v => v === "mono" || v === "light";
+  try { if (monoTheme(localStorage.getItem("starfire-theme"))) document.documentElement.dataset.theme = "mono"; } catch (e) {}
+  addEventListener("storage", e => { if (e.key === "starfire-theme") {
+    if (monoTheme(e.newValue)) document.documentElement.dataset.theme = "mono"; else delete document.documentElement.dataset.theme; } });
+</script>
 </head>
 <body class="editor-doc">
 <div id="panels"><div class="panel active split">
 <div class="report-side">
-<div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Campaign Designer</div></div>
+<div class="side-title"><h1>STARFIRE</h1><div class="sub">Test Card</div></div>
 <div class="side-btns" id="exportRow">
   <button class="btn" id="loadJsonBtn">import test file</button>
   <input type="file" id="loadJsonFile" accept=".test,.json,application/json" style="display:none">
-  <button class="btn" id="saveUnlockedBtn">export unlocked test file (.test)</button>
-  <button class="btn" id="saveLockedBtn">export locked test file (.test)</button>
+  <button class="btn" id="saveUnlockedBtn">export unlocked test file</button>
+  <button class="btn" id="saveLockedBtn">export locked test file</button>
   <button class="btn" id="exportCsvBtn">export .csv</button>
   <button class="btn" id="exportPrintBtn">generate card</button>
   <button class="btn" id="exportDocxBtn">export .docx</button>
@@ -166,9 +172,11 @@ const QUALITY_OPTIONS = [
   ["CAUTION", "🟠 CAUTION"],
   ["FAIL", "🔴 FAIL"],
 ];
+addEventListener("storage", e => { if (e.key === "starfire-theme") renderPoints(); });   // after the theme is set in <head>
 function qualitySelect(i, current) {
+  const mono = document.documentElement.dataset.theme === "mono";   // mono: the word alone, no coloured circle
   const opts = QUALITY_OPTIONS.map(([v, label]) =>
-    `<option value="${v}"${v === current ? " selected" : ""}>${label}</option>`).join("");
+    `<option value="${v}"${v === current ? " selected" : ""}>${mono && v ? v : label}</option>`).join("");
   return `<select data-i="${i}" data-f="quality">${opts}</select>`;
 }
 
@@ -444,12 +452,23 @@ function schedulePortMap() { clearTimeout(portMapTimer); portMapTimer = setTimeo
 
 const RE_SIG_CONNECT = /^(\s*)connect\(\s*([^,()\s]+)\s*,\s*((?:[A-Za-z0-9_-]+\.|\d+:)[A-Za-z_]\w*)\s*\)\s*(#.*)?$/i;   // to module.input or point:input
 const RE_SIG_ROUTE = /^(\s*)route\(\s*([^,()\s]+)\s*,\s*(exit|merge)\s*,\s*\[([^\]]*)\]\s*\)\s*(#.*)?$/i;
+const sigKey = s => s.endsWith("!") ? s.slice(0, -1) + ".sig" : s;   // x! is x.sig
 function sigLine(text) {
   let m = text.match(RE_SIG_CONNECT);
   if (m) return {kind: "connect", indent: m[1], src: m[2], items: [m[3]], comment: m[4] || ""};
   m = text.match(RE_SIG_ROUTE);
   if (m) return {kind: m[3].toLowerCase(), indent: m[1], src: m[2], items: m[4].split(",").map(t => t.trim()).filter(Boolean), comment: m[5] || ""};
   return null;
+}
+// sigLine for each line, skipping comment ... end comment blocks.
+function sigParse(lines) {
+  let block = false;
+  return lines.map(t => {
+    const w = t.replace(/#.*/, "").trim().replace(/\s+/g, " ").toLowerCase();
+    if (block) { block = w !== "end comment"; return null; }
+    if (w === "comment") { block = true; return null; }
+    return sigLine(t);
+  });
 }
 function sigFormat(x) {
   const stmt = x.kind === "connect" ? `connect(${x.src}, ${x.items[0]})` : `route(${x.src}, ${x.kind}, [${x.items.join(", ")}])`;
@@ -461,12 +480,12 @@ function sigDelivery(parsed, T) {
 }
 // How many lines other than those in `skip` read source `src`.
 function sigUses(parsed, src, skip) {
-  return parsed.filter((x, k) => x && !skip.includes(k) && x.src === src).length;
+  return parsed.filter((x, k) => x && !skip.includes(k) && sigKey(x.src) === sigKey(src)).length;
 }
 // The Signals text with source S connected to input T (same(ref): a ref naming S's output), or null.
 function sigAddLink(text, S, T, same) {
   const lines = text === "" ? [] : text.split("\n");
-  const parsed = lines.map(sigLine);
+  const parsed = sigParse(lines);
   const d = sigDelivery(parsed, T);
   if (d < 0) {   // T is free: one more input for a source already here, else a new connect
     const ex = parsed.findIndex(x => x && x.kind === "exit" && same(x.src));
@@ -478,8 +497,8 @@ function sigAddLink(text, S, T, same) {
   }
   const head = parsed[d].src;   // T has a source: merge S into it
   if (same(head)) return text;
-  if (!head.endsWith(".sig") || parsed[d].items.length > 1) return null;   // a merge would change the other inputs too
-  const mi = parsed.findIndex((x, k) => k < d && x && x.kind === "merge" && x.src === head);
+  if (!sigKey(head).endsWith(".sig") || parsed[d].items.length > 1) return null;   // a merge would change the other inputs too
+  const mi = parsed.findIndex((x, k) => k < d && x && x.kind === "merge" && sigKey(x.src) === sigKey(head));
   if (sigUses(parsed, head, [d, mi])) return null;
   if (mi >= 0) {
     if (parsed[mi].items.some(same)) return text;
@@ -493,11 +512,11 @@ function sigAddLink(text, S, T, same) {
 // The Signals text with the source naming one output (same) taken off input T, or null.
 function sigRemoveLink(text, T, same) {
   const lines = text.split("\n");
-  const parsed = lines.map(sigLine);
+  const parsed = sigParse(lines);
   const d = sigDelivery(parsed, T);
   if (d < 0) return null;
   const x = parsed[d], head = x.src;
-  const mi = parsed.findIndex((y, k) => k < d && y && y.kind === "merge" && y.src === head);
+  const mi = parsed.findIndex((y, k) => k < d && y && y.kind === "merge" && sigKey(y.src) === sigKey(head));
   const drop = [];
   if (!same(head)) {   // one of the merged sources
     if (mi < 0) return null;
@@ -508,7 +527,7 @@ function sigRemoveLink(text, T, same) {
   } else if (mi >= 0) {   // the first of merged sources: the next one leads
     if (x.kind !== "connect" || sigUses(parsed, head, [d, mi])) return null;
     const [next, ...rest] = parsed[mi].items;
-    if (!next.endsWith(".sig")) return null;
+    if (!sigKey(next).endsWith(".sig")) return null;
     x.src = next; lines[d] = sigFormat(x);
     if (rest.length) { parsed[mi].src = next; parsed[mi].items = rest; lines[mi] = sigFormat(parsed[mi]); } else drop.push(mi);
   } else if (x.kind === "connect") {
@@ -574,11 +593,11 @@ function connHtml(i, p) {
 }
 function connRef(row, out) { return `${row.seq}:${row.stem}.${out}.sig`; }
 function connSame(row, out) {
-  return ref => { const m = ref.match(/^(?:(\d+):)?([A-Za-z0-9_-]+)\.([A-Za-z_]\w*)\.sig$/); return !!m && (m[1] === undefined || m[1] === row.seq) && m[2] === row.stem && m[3] === out; };
+  return ref => { const m = ref.match(/^(?:(\d+):)?([A-Za-z0-9_-]+)\.([A-Za-z_]\w*)(?:\.sig|!)$/); return !!m && (m[1] === undefined || m[1] === row.seq) && m[2] === row.stem && m[3] === out; };
 }
 function connPoint(seq) { return card.points.find(x => String(x.seq) === String(seq)); }
 function connRow(seq) { return (portMap.points || []).find(r => r.seq === String(seq)) || {}; }
-function connParsed(q) { return (q.signals || "").split("\n").map(sigLine); }
+function connParsed(q) { return sigParse((q.signals || "").split("\n")); }
 // The line feeding input `inp` of point drow: {seq, T} (whose box, and the input as written there),
 // {many: true} if several boxes feed it, or null.
 function connFeed(drow, inp) {
@@ -612,8 +631,8 @@ function connEdit(row, out, drow, inp, on) {
   // fed from another point's box: the input moves to the receiving box, as a merge
   const X = connPoint(feed.seq), parsed = connParsed(X), d = sigDelivery(parsed, T2), head = parsed[d].src;
   if (same(head)) return {};
-  if (!head.endsWith(".sig") || parsed.some((y, k) => k < d && y && y.kind === "merge" && y.src === head)) return hand(feed.seq);
-  const tx = sigRemoveLink(X.signals || "", T2, ref => ref === head);
+  if (!sigKey(head).endsWith(".sig") || parsed.some((y, k) => k < d && y && y.kind === "merge" && sigKey(y.src) === sigKey(head))) return hand(feed.seq);
+  const tx = sigRemoveLink(X.signals || "", T2, ref => sigKey(ref) === sigKey(head));
   if (tx === null) return hand(feed.seq);
   const tb = B.signals || "";
   return {[feed.seq]: tx, [drow.seq]: tb + (tb === "" || tb.endsWith("\n") ? "" : "\n") + `route(${head}, merge, [${S}])\nconnect(${head}, ${T1})`};
@@ -710,7 +729,7 @@ function modulePanelHtml(i, p) {
     ${SIGNET_AVAILABLE ? `<div class="mod-conn" id="pt-conn-${i}">${connHtml(i, p)}</div>
     <div class="mod-args"><label>Signals</label>
     <div class="sig-wrap"><pre class="sig-hl" aria-hidden="true">${sigHtml(p.signals || "")}</pre>
-    <textarea data-modsig="${i}" rows="${Math.min(14, Math.max(3, (p.signals || "").split("\n").length))}" spellcheck="false" style="resize:vertical"${p.locked || !pointCampaign() ? " disabled" : ""} title="${pointCampaign() ? "Signet code, run before the module: connect(source, module.input); see README.md" : "Signals need a campaign"}">${esc(p.signals || "")}</textarea></div></div>` : ""}
+    <textarea data-modsig="${i}" rows="${Math.max(Math.ceil(1.5 * Math.min(10, Math.max(3, (p.args || "").split("\n").length))), Math.min(14, Math.max(3, (p.signals || "").split("\n").length)))}" spellcheck="false" style="resize:vertical"${p.locked || !pointCampaign() ? " disabled" : ""} title="${pointCampaign() ? "Signet code, run before the module: connect(source, module.input); see README.md" : "Signals need a campaign"}">${esc(p.signals || "")}</textarea></div></div>` : ""}
     <div class="module-status failed">${esc(st.fileMsg || "")}</div>
     ${none}
     <div class="module-status ${esc(st.status || "")}">${esc(st.text || "")}</div>
@@ -725,7 +744,7 @@ const SOURCE_EXT = /^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i;   // sources Signet b
 function moduleKind(name) {
   const dot = (name || "").lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot) : "";
-  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (SOURCE_EXT.test(ext) ? "src" : "other");
+  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg", ".sg": "sg"})[ext] || (SOURCE_EXT.test(ext) ? "src" : "other");
 }
 function pinnedFor(p) {
   return campaignModules().filter(m => m.pinned && (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module).slice(0, 4);
@@ -758,24 +777,39 @@ function runPinned(p, mod) {
 
 // Signet syntax colours for the Signals box: a coloured copy of the text sits behind the (transparent) textarea.
 const SIG_COMMANDS = new Set(("let where connect if then else end break multiplex demultiplex echo output run when within by finish delay " +
-  "escape for next index route exit merge interchange complete failed broken running column function subprocess return map warp unity listen Re Im abs arg conj power root text2num num2text").split(" "));
-const SIG_FILE = /\.(sig|csv|txt|tsv|json|png|jpe?g|gif)$/;   // a signal or file reference, not module.port or a parameter
+  "escape for next index route exit merge interchange belongs befits comment complete failed broken running column function subprocess return map warp unity listen Re Im abs arg conj power root text2num num2text ex ab ad").split(" "));
+const SIG_FILE = /\.(sig|csv|txt|tsv|json|png|jpe?g|gif)$|!$/;   // a signal (x.sig, or x! for short) or file, not module.port or a parameter
+const SIG_AFFIX = /(\.(?:sta|lta|lle))(?=[.!:]|$)/g;          // case endings, coloured as commands
 const SIG_TOKEN = new RegExp([
-  "(#.*)", "('[^'\\n]*'|\"[^\"\\n]*\")", "((?:[A-Za-z_]\\w*::)+)", "((?<=hex::)(?:0[xX])?[0-9A-Fa-f]+(?![A-Za-z0-9_]))",
-  "([A-Za-z0-9_-]+:\\$?[A-Za-z_][\\w.-]*)", "((?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?(?![A-Za-z0-9_.]))",
-  "([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*\\.[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*)", "(\\$[A-Za-z_]\\w*)", "([A-Za-z_]\\w*)"].join("|"), "g");
+  "(#.*)", "('[^'\\n]*'|\"[^\"\\n]*\")", "((?:[A-Za-z_]\\w*::)+(?:\\d+::)?)", "((?<=hex::)(?:0[xX])?[0-9A-Fa-f]+(?![A-Za-z0-9_]))",
+  "([A-Za-z0-9_-]+:\\$?[A-Za-z_][\\w.-]*!?)", "((?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?(?![A-Za-z0-9_.]))",
+  "([A-Za-z0-9_-]+(?:\\.[A-Za-z0-9_-]+)*\\.[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*!?)", "(\\$[A-Za-z_]\\w*(?:\\.(?:sta|lta|lle)\\b)?)",
+  "([A-Za-z_]\\w*!?)"].join("|"), "g");
 function sigHtml(text) {
+  let block = false;                                   // comment ... end comment, all dim
+  return text.split("\n").map(line => {
+    const w = line.replace(/#.*/, "").trim().replace(/\s+/g, " ").toLowerCase();
+    if (block || w === "comment") { block = !(block && w === "end comment"); return `<span class="sg-c">${esc(line)}</span>`; }
+    return sigTokens(line);
+  }).join("\n") + "\n";
+}
+function sigTokens(text) {
   let out = "", at = 0;
-  const put = (s, cls) => { s = esc(s); out += cls ? `<span class="${cls}">${s}</span>` : s; };
+  const put = (s, cls) => { if (!s) return; s = esc(s); out += cls ? `<span class="${cls}">${s}</span>` : s; };
   for (const m of text.matchAll(SIG_TOKEN)) {
     put(text.slice(at, m.index));
     const w = m[0].toLowerCase();
-    put(m[0], m[1] ? "sg-c" : m[2] ? "sg-s" : m[3] ? "sg-t" : m[4] || m[6] ? "sg-n" : m[9] ? (w === "true" || w === "false" ? "sg-n"
-              : SIG_COMMANDS.has(w) ? "sg-k" : /^(and|or|not)$/.test(w) ? "" : "sg-v") : SIG_FILE.test(w) ? (w.endsWith(".sig") ? "sg-g" : "sg-f") : "sg-v");
+    const cls = m[1] ? "sg-c" : m[2] ? "sg-s" : m[3] ? "sg-t" : m[4] || m[6] ? "sg-n" : m[9] && !w.endsWith("!") ? (w === "true" || w === "false" ? "sg-n"
+              : SIG_COMMANDS.has(w) ? "sg-k" : /^(and|or|not)$/.test(w) ? "" : "sg-v") : SIG_FILE.test(w) ? (/(\.sig|!)$/.test(w) ? "sg-g" : "sg-f") : "sg-v";
+    if (m[5] || m[7] || m[8] || m[9]) {                // a name with a case ending: the ending as a command
+      let k = 0;
+      for (const a of m[0].matchAll(SIG_AFFIX)) { put(m[0].slice(k, a.index), cls); put(a[1], "sg-k"); k = a.index + a[1].length; }
+      put(m[0].slice(k), cls);
+    } else put(m[0], cls);
     at = m.index + m[0].length;
   }
   put(text.slice(at));
-  return out + "\n";
+  return out;
 }
 function sigSync(ta, hl) { hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft; }
 
