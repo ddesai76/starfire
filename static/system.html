@@ -7,6 +7,12 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/static/starfire.css">
+<script>   // dark or mono, as last set in the campaign sidebar (an older "light" counts as mono)
+  const monoTheme = v => v === "mono" || v === "light";
+  try { if (monoTheme(localStorage.getItem("starfire-theme"))) document.documentElement.dataset.theme = "mono"; } catch (e) {}
+  addEventListener("storage", e => { if (e.key === "starfire-theme") {
+    if (monoTheme(e.newValue)) document.documentElement.dataset.theme = "mono"; else delete document.documentElement.dataset.theme; } });
+</script>
 </head>
 <body class="editor-doc system-doc">
 <div id="panels"><div class="panel active split">
@@ -16,7 +22,7 @@
   <button class="btn" id="refreshBtn">refresh</button>
   <button class="btn" id="printBtn">print / pdf</button>
   <button class="btn" id="pngBtn">export .png</button>
-  <button class="btn" id="sysBtn">export .sys</button>
+  <button class="btn" id="sysBtn">export system file</button>
   <button class="btn" id="appendBtn" style="display:none">+ append</button>
 </div>
 <div class="sy-legend">
@@ -25,6 +31,7 @@
   <div><i class="box failed"></i>last run FAILED or BROKEN</div>
   <div><i class="amber"></i>signal has data</div>
   <div><i class="dim"></i>no data yet</div>
+  <div><i class="amber stepped"></i>from the pass before</div>
 </div>
 <div id="status" class="hint"></div>
 </div>
