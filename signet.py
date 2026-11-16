@@ -2,21 +2,21 @@
 
 # signet.py:      SIGNET, A COORDINATION LANGUAGE FOR WIRING MODULES IN ANY LANGUAGE VIA SIGNALS
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-31
-# VERSION:        26.b.0.1.3
+# UPDATED:        2026-11-16
+# VERSION:        26.b.0.1.6
 #
 
 """
 Signet: the language of Starfire's Signals boxes, and the .sig files modules pass between them.
 Standard library only. See Starfire's README.md, Signals and Signet.
 
-    python3 signet.py runner.signet [--param NAME=VALUE ...] [--check]
+    python3 signet.py runner.signet (or runner.sg) [--param NAME=VALUE ...] [--check]
 
 Code runs against a host object (API 2): resolve, param and optionally echo; a Sequence also uses
 point_param, autorun, run, state and break_runs. FolderHost is a complete example.
 
-Module helpers for Python, Julia, shell, C++, Rust, Ada and Fortran are inside this file; a module in C++, Rust, Ada or Fortran
-is built by Signet itself (build_module), and --export-helpers DIR writes the helpers out.
+Module helpers for Python, Julia, shell, C, C++, Rust, Ada, Fortran and ALGOL 68 are inside this file; a module in C, C++, Rust,
+Ada or Fortran is built by Signet itself (build_module), and --export-helpers DIR writes the helpers out.
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -40,7 +41,7 @@ import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = "26.b.0.1.3"
+VERSION = "26.b.0.1.6"
 API = 2                       # the interface Starfire uses; raised when it changes
 
 _PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -53,11 +54,13 @@ _KEYWORDS = {"let", "where", "connect", "if", "then", "else", "end", "and", "or"
              "break", "multiplex", "demultiplex", "true", "false", "echo", "run",
              "when", "within", "by", "finish", "delay", "escape", "complete", "failed", "broken",
              "running", "column", "autorun", "for", "next", "index", "route", "exit", "merge", "interchange", "output",
-             "function", "subprocess", "return", "in", "xor", "lineage"}
+             "function", "subprocess", "return", "in", "belongs", "befits", "comment", "xor", "lineage", "ex", "ab", "ad",
+             "elseif", "while", "per", "last"}          # elseif, while and per are reserved for a future version
 _MAX_NEST = 32                  # deepest vector of vectors that can be written
 _TYPE_WORDS = {"int", "float", "real", "num", "bool", "text", "complex", "vector", "series", "bus", "hex", "stream", "tuple",
-               "range", "bits"}
-_RESERVED_PORTS = {"write", "series", "stream"}
+               "range", "bits", "fixed", "quaternion", "units"}      # the last three are reserved for a future version
+_RESERVED_PORTS = {"write", "series", "stream", "sta", "lta", "lle", "lla"}
+_AFFIX = {"sta": "ex", "lta": "ab", "lle": "ad"}      # Finnish case endings and the Latin prefixes they stand for
 _SIG_TOKEN = re.compile(r"""
    (?P<ws>\s+)
  | (?P<string>'[^'\n]*'|"[^"\n]*")
@@ -70,7 +73,8 @@ _SIG_TOKEN = re.compile(r"""
  | (?P<imag>(?:\d+(?:\.(?![*/+\-])\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?:im|i)(?![A-Za-z0-9_]))
  | (?P<num>(?:\d+(?:\.(?![*/+\-])\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![A-Za-z0-9_]|\.(?![*/+\-])))
  | (?P<path>[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.[A-Za-z0-9_-]*[A-Za-z][A-Za-z0-9_-]*)
- | (?P<param>\$[A-Za-z_][A-Za-z0-9_]*)
+ | (?P<param>\$[A-Za-z_][A-Za-z0-9_]*(?:\.(?:sta|lta|lle)(?![A-Za-z0-9_]))?)
+ | (?P<bang>!)
  | (?P<name>[A-Za-z_][A-Za-z0-9_]*)
  | (?P<op>\.[*/+\-]|\*\*|\\\\|‾|==|/=|<=|>=|<<|>>|[-+*/()<>=,\[\]:|@{};&~])
 """, re.X)
@@ -155,8 +159,39 @@ def _sig_tokens(text: str, line: int) -> list:
         if not m:
             raise SignalError(line, f"can't read this line (at {text[i:i + 12]!r})")
         i = m.end()
-        if m.lastgroup not in ("ws", "comment"):
-            out.append((m.lastgroup, m.group()))
+        kind, tok = m.lastgroup, m.group()
+        if kind in ("ws", "comment"):
+            continue
+        if kind == "bang":              # name! is name.sig
+            if not out or out[-1][0] not in ("name", "path", "ref") or text[m.start() - 1:m.start()].isspace():
+                raise SignalError(line, "! stands for .sig and goes straight after a Signal's name, as in messenger.output!")
+            k, t = out.pop()
+            out.append(("ref" if k == "ref" else "path", t + ".sig"))
+            continue
+        out.append((kind, tok))
+    return _case_tokens(out, line)
+
+
+def _case_tokens(toks: list, line: int) -> list:
+    """messenger.output.sta.sig, response.lle.input, $volts.lta: a case ending becomes the Latin prefix
+    before the name (ex, ad, ab), so both spellings parse the same."""
+    out = []
+    for kind, tok in toks:
+        if kind in ("path", "ref", "param") and re.search(r"\.(?:sta|lta|lle)(?![A-Za-z0-9_])", tok):
+            head, sep, rest = tok.rpartition(":") if kind == "ref" else ("", "", tok)
+            parts = rest.split(".")
+            found = [p for p in parts[1:] if p in _AFFIX]
+            if len(found) > 1:
+                raise SignalError(line, f"{tok} has more than one case ending")
+            parts.remove(found[0])
+            rest = ".".join(parts)
+            if out and out[-1][0] == "name" and out[-1][1].lower() in ("ex", "ab", "ad"):
+                raise SignalError(line, f"{tok} has a case ending and a prefix: use one")
+            out.append(("name", _AFFIX[found[0]]))
+            tok = head + sep + rest
+            if kind == "path" and "." not in rest:
+                kind = "name"
+        out.append((kind, tok))
     return out
 
 
@@ -241,8 +276,29 @@ class _LineParser:
         kind, text = self.peek()
         return kind == "name" and text.lower() not in _KEYWORDS and text not in _TYPE_WORDS and self.peek(1) == ("op", "(")
 
+    def case_marked(self):
+        """ex <Signal> (elative) or ab <parameter, file or value> (ablative): a check on what the source is; the value is the same."""
+        word = self.take()[1].lower()
+        if word == "ad":
+            raise self.err("ad marks a module input, which only connect and route take")
+        a = self.unary()
+        n = a[2] if a[0] == "typed" else a
+        sig = n[0] == "ref" and n[1].endswith(".sig") or n[0] == "pref" and n[2].endswith(".sig")
+        given = n[0] in ("param", "pparam", "num", "imag", "str", "bool", "bits", "hexraw", "vec", "range", "torange") \
+            or n[0] in ("ref", "pref") and not sig
+        if word == "ex" and not sig:
+            raise self.err("ex marks a Signal (the elative, out of): such as ex messenger.output.sig")
+        if word == "ab" and not given:
+            raise self.err("ab marks a parameter, a file or a value written in the code (the ablative, from)" +
+                           (": a Signal takes ex" if sig else ""))
+        return a
+
     def target(self):
-        """An input to connect or route to: (words, module, port, point)."""
+        """An input to connect or route to: (words, module, port, point). ad before it marks it (the allative, toward)."""
+        if self.kw("ad"):
+            self.take()
+        elif self.kw("ex") or self.kw("ab"):
+            raise self.err(f"{self.peek()[1]} marks a source, which goes first: connect(source, input), or mark both")
         words = self.types()
         kind, text = self.peek()
         if kind == "ref" and re.fullmatch(r"[A-Za-z0-9_-]+:[A-Za-z_][A-Za-z0-9_]*", text):
@@ -300,9 +356,17 @@ class _LineParser:
         elif self.kw("connect"):
             self.take()
             self.expect_op("(")
-            src = self.expr()
-            self.expect_op(",")
-            words, mod, port, point = self.target()
+            if self.kw("ad"):                   # connect(ad input, ex source): both marked, in either order
+                words, mod, port, point = self.target()
+                self.expect_op(",")
+                if not (self.kw("ex") or self.kw("ab")):
+                    raise self.err("arguments out of order: the input is marked ad, so mark the source too "
+                                   "(ex for a Signal, ab for a parameter, file or value), or put the source first")
+                src = self.expr()
+            else:
+                src = self.expr()
+                self.expect_op(",")
+                words, mod, port, point = self.target()
             self.expect_op(")")
             node = ("connect", self.line, src, words, mod, port, point)
         elif self.kw("if"):
@@ -513,9 +577,11 @@ class _LineParser:
 
     def compare(self):
         a = self.bit_or()
-        if self.kw("in"):
-            self.take()
-            a = ("bin", "in", a, self.bit_or())
+        if self.kw("belongs") or self.kw("befits"):
+            op = self.take()[1].lower()
+            a = ("bin", op, a, self.bit_or())
+        elif self.kw("in"):
+            raise self.err("use belongs for a range: x belongs {lo, hi}")
         elif self.peek()[0] == "op" and self.peek()[1] in ("<", "<=", ">", ">=", "==", "/="):
             a = ("bin", self.take()[1], a, self.bit_or())
         return a
@@ -560,18 +626,32 @@ class _LineParser:
         return a
 
     def unary(self):
+        if self.kw("ex") or self.kw("ab") or self.kw("ad"):
+            return self.case_marked()
         if self.peek() == ("op", "-"):
             self.take()
             return ("neg", self.unary())
         if self.peek() == ("op", "~"):
             self.take()
             return ("bnot", self.unary())
-        words = self.types()
+        words, lit, outer = self.types(), None, []
         if words == ["hex"] and self.peek()[0] == "hexval":
             return ("hexraw", self.take()[1])
+        if "bits" in words[1:]:                        # int::bits::4::1010: a cast of a bits value
+            k = words.index("bits")
+            outer, words = words[:k], words[k:]
+        if words[:1] == ["bits"]:
+            nxt = self.peek()
+            if len(words) != 2 or nxt[0] in ("end", "op") and nxt[1] in ("", ")", ",", "]", "}"):
+                raise self.err("write bits as bits::<n>::<value>, such as bits::8::5 or bits::4::1010")
+            if nxt[0] == "num" and re.fullmatch(r"[01]+", nxt[1]) and len(nxt[1]) == int(words[1]):
+                self.take()
+                lit, words = ("bits", nxt[1]), []           # bits::4::1010: the bits themselves
         if words and self.peek()[0] == "type":          # int::hex::FF, bits::12 hex::FF
             return ("typed", words, self.unary())
-        if self.peek() == ("op", "|"):                # |z|: the absolute value
+        if lit:
+            a = lit
+        elif self.peek() == ("op", "|"):                # |z|: the absolute value
             self.take()
             inner = self.sum()
             self.expect_op("|")
@@ -598,11 +678,12 @@ class _LineParser:
         if self.peek() in (("op", "**"), ("op", "\\\\")):     # x**p and x\\n, right to left
             op = self.take()[1]
             a = ("call", "power" if op == "**" else "root", a, self.unary())
-        return ("typed", words, a) if words else a
+        a = ("typed", words, a) if words else a
+        return ("typed", outer, a) if outer else a
 
     def index(self):
         depth, j = 0, self.i
-        while j < len(self.t):         # v[0:3] and v[k:end] read 0:3 and k:end as one token: split them
+        while j < len(self.t):         # v[0:3] and v[k:last] read 0:3 and k:last as one token: split them
             kind, text = self.t[j]
             if (kind, text) in (("op", "["), ("op", "(")):
                 depth += 1
@@ -632,7 +713,7 @@ class _LineParser:
         return lo
 
     def index_end(self):
-        if self.kw("end"):
+        if self.kw("last"):
             self.take()
             off = None
             if self.peek() == ("op", "-"):
@@ -678,10 +759,7 @@ class _LineParser:
             self.take()
             return ("imag", float(text[:-2] if text.endswith("im") else text[:-1]))
         if kind == "bitsval":
-            self.take()
-            if len(text) - 2 > _BITS_MAX:
-                raise self.err(f"bits can be {_BITS_MAX} wide at most, got {len(text) - 2}")
-            return ("bits", text[2:])
+            raise self.err(f"write bits as bits::<n>::<value>: bits::{len(text) - 2}::{text[2:]}")
         if (kind, text) == ("op", "{"):
             self.take()
             lo = self.expr()
@@ -796,8 +874,18 @@ def parse_signals(code: str, inputs=()) -> list:
     ("when", line, cond, within, by, text, body). `inputs` are names already declared (a module's input ports).
     Raises ValueError listing every bad line."""
     errors, flat = [], []
-    in_where = False
+    in_where, cblock = False, 0                      # cblock: the line a comment block opened on
     for n, text in enumerate(str(code or "").splitlines(), 1):
+        word = " ".join(_code_part(text).split()).lower()
+        if cblock:
+            cblock = 0 if word == "end comment" else cblock
+            continue
+        if word in ("comment", "end comment"):
+            if word == "comment":
+                cblock = n
+            else:
+                errors.append(f"line {n}: end comment without a comment before it")
+            continue
         try:
             toks = _sig_tokens(text, n)
             if not toks:
@@ -816,6 +904,8 @@ def parse_signals(code: str, inputs=()) -> list:
         except RecursionError:
             errors.append(f"line {n}: too deeply nested to read")
             in_where = False
+    if cblock:
+        errors.append(f"line {cblock}: comment has no end comment")
     root = []
     stack = [(None, root)]
     inside = {"if": "an if", "when": "a when", "for": "a loop", "function": "a function", "subprocess": "a subprocess"}
@@ -1014,6 +1104,9 @@ def parse_signals(code: str, inputs=()) -> list:
             if n == "unity":
                 if who == "map" and len(args) != 2:
                     errors.append(f"line {line}: unity takes 1 value, map gives it {len(args) - 1}")
+            elif n in _ELEMENTWISE and f is None:
+                if who == "map" and len(args) != 2:
+                    errors.append(f"line {line}: {n} takes 1 value, map gives it {len(args) - 1}")
             elif n is None:
                 errors.append(f"line {line}: {who} needs a function name where a function goes")
             elif f is None and n == scope["name"]:
@@ -1452,6 +1545,15 @@ def _isnan(x) -> bool:
 
 def _maths_scalar(name, args, line) -> _SV:
     x = _real_or_complex(name, args[0], line)
+    if name in _TRIG:                 # radians; a complex result where a real one doesn't exist, as for root
+        if _isnan(x):
+            return _SV(None, "float")
+        try:
+            if isinstance(x, complex) or (name in ("asin", "acos") and abs(x) > 1):
+                return _cres(getattr(cmath, name)(x))
+            return _fres(getattr(math, name)(x))
+        except (OverflowError, ValueError):
+            raise SignalError(line, f"{name} gives a result too large to hold")
     if name in ("abs", "arg", "conj"):
         if name == "abs":
             return _fres(abs(x))
@@ -1502,7 +1604,9 @@ def _root(x, n, line) -> _SV:
 
 
 def _maths(name, args, line) -> _SV:
-    """Re, Im, abs, arg, conj, power and root, on a real or complex number; on every value of a vector."""
+    """Re, Im, abs, arg, conj, power, root and the trig functions, on a real or complex number; on every value of a vector."""
+    if name in _ELEMENTWISE and isinstance(args[0].value, dict) and _series_parts(args[0].value):
+        raise SignalError(line, f"{name} works on numbers and vectors; for a series use warp(unity, {name}, series)")
     if name in ("Re", "Im"):
         return _re_im(name, args[0], line)
     if len(args) > 1 and _is_vec(args[1]):
@@ -1547,13 +1651,49 @@ def _range_arg(name: str, sv: _SV, line: int):
     return sv.value["lo"], sv.value["hi"]
 
 
+_RANK = {"hex": 0, "int": 1, "float": 2, "real": 2, "complex": 3, "num": 4}
+
+
+def _type_of(sv: _SV) -> str:
+    return (_bits_type(sv.value.width) if isinstance(sv.value, Bits) else sv.type) or infer_type(sv.value) or ""
+
+
+def _fits_in(a: str, b: str) -> bool:
+    """Type a is type b or a subtype of it, read as sets: Z within R within C."""
+    if a == b:
+        return True
+    pa, pb = a.split("::"), b.split("::")
+    if len(pa) == len(pb) == 1 and pa[0] in _RANK and pb[0] in _RANK:
+        return _RANK[pa[0]] <= _RANK[pb[0]]
+    if pa[0] == pb[0] == "bits" and len(pa) == len(pb) == 2:
+        return int(pa[1]) <= int(pb[1])
+    if pa[0] == pb[0] and pa[0] in ("vector", "range", "stream"):
+        return len(pb) == 1 or len(pa) > 1 and _fits_in("::".join(pa[1:]), "::".join(pb[1:]))
+    if pa[0] == pb[0] == "series" and len(pa) == len(pb) == 3:
+        return pa[1] == pb[1] and _fits_in(pa[2], pb[2])
+    return False
+
+
+def _befits(a: _SV, b: _SV) -> bool:
+    """a befits b: b's type can express a, as itself or as one of b's elements."""
+    ta, tb = _type_of(a), _type_of(b)
+    if _fits_in(ta, tb):
+        return True
+    pb = tb.split("::")
+    if pb[0] in ("vector", "range"):
+        return len(pb) == 1 or _fits_in(ta, "::".join(pb[1:]))
+    if pb[0] == "series" and len(pb) == 3:
+        return _fits_in(ta, pb[2])
+    return False
+
+
 def _in_range(a: _SV, r: _SV, line: int) -> _SV:
-    """x in {lo, hi}: true when x is within the range, ends included; a vector or series only if every value is."""
-    lo, hi = _range_arg("in", r, line)
+    """x belongs {lo, hi}: true when x is within the range, ends included; a vector or series only if every value is."""
+    lo, hi = _range_arg("belongs", r, line)
     v = _unhex(a).value
     if isinstance(v, dict) and _series_parts(v):
         if _series_parts(v)[1] != "float":
-            raise SignalError(line, "in needs real values, not complex ones")
+            raise SignalError(line, "belongs needs real values, not complex ones")
         v = v["values"]
     def ok(x):
         if isinstance(x, list):
@@ -1561,10 +1701,10 @@ def _in_range(a: _SV, r: _SV, line: int) -> _SV:
         if isinstance(x, Hex):
             x = int(x)
         if x is not None and not _is_num(x):
-            raise SignalError(line, f"in needs numbers, got {_show_type(a)}")
+            raise SignalError(line, f"belongs needs numbers, got {_show_type(a)}")
         return x is not None and lo <= x <= hi
     if a.file or type(v) is bool or isinstance(v, dict):
-        raise SignalError(line, f"in needs numbers, got {_show_type(a)}")
+        raise SignalError(line, f"belongs needs numbers, got {_show_type(a)}")
     return _SV(ok(v), "bool")
 
 
@@ -1634,10 +1774,11 @@ def _quantize(name, args, line, ctx=None) -> _SV:
     return _each_real(name, args[0], line, f)
 
 
-def _popcount(name, args, line, ctx=None) -> _SV:
+def _hamming(name, args, line, ctx=None) -> _SV:
+    """The Hamming weight: how many bits are 1."""
     v = args[0].value
     if not isinstance(v, Bits):
-        raise SignalError(line, f"popcount needs bits, got {_show_type(args[0])}")
+        raise SignalError(line, f"hamming needs bits, got {_show_type(args[0])}")
     return _SV(bin(v).count("1"), "int")
 
 
@@ -1678,7 +1819,7 @@ def _reduce(name, args, line, ctx=None) -> _SV:
     vals, _ = _vec_values(name, args[0], line)
     if name == "sum":
         return _SV(None, "float") if None in vals else _num_sv(sum(vals, 0))
-    if name == "prod":
+    if name == "product":
         if None in vals:
             return _SV(None, "float")
         r = 1
@@ -1757,6 +1898,21 @@ def _dims(n) -> list:
         out.append(len(n))
         n = n[0] if n else None
     return out[::-1]
+
+
+def _ragged(n):
+    """For an array whose columns (at any depth) differ in length: the two lengths that differ, else None."""
+    if not isinstance(n, list) or not n or not isinstance(n[0], list):
+        return None
+    lens = [len(e) if isinstance(e, list) else None for e in n]
+    if len(set(lens)) > 1:
+        a = lens[0]
+        return a, next(x for x in lens if x != a)
+    for e in n:
+        r = _ragged(e)
+        if r:
+            return r
+    return None
 
 
 def _flat(n) -> list:
@@ -1947,18 +2103,23 @@ def _num2text(name, args, line, ctx=None) -> _SV:
     return _SV(_show_value(x), "text")
 
 
-_MORE = {"text2num": _text2num, "num2text": _num2text, "saturate": _saturate, "excess": _excess, "quantize": _quantize, "popcount": _popcount,
+_DISPATCH = {"text2num": _text2num, "num2text": _num2text, "saturate": _saturate, "excess": _excess, "quantize": _quantize, "hamming": _hamming,
          "min": _extreme, "max": _extreme, "argmin": _extreme, "argmax": _extreme,
-         "sum": _reduce, "prod": _reduce, "mean": _reduce, "std": _reduce, "rms": _reduce, "norm": _reduce,
+         "sum": _reduce, "product": _reduce, "mean": _reduce, "std": _reduce, "rms": _reduce, "norm": _reduce,
          "sort": _sort, "length": _length, "size": _length, "dot": _dot, "cross": _dot, "transpose": _transpose}
 
+_TRIG = ("sin", "cos", "tan", "asin", "acos", "atan")
+_ELEMENTWISE = ("Re", "Im", "abs", "arg", "conj") + _TRIG     # one value in, one out: map and warp can use them too
 _MATH = {"Re": 1, "Im": 1, "abs": 1, "arg": 1, "conj": 1, "power": 2, "root": 2}     # built-in maths, and their argument counts
-_MATH.update({n: (2 if n in ("saturate", "excess", "quantize", "dot", "cross") else 1) for n in _MORE})
+_MATH.update({n: 1 for n in _TRIG})
+_MATH.update({n: (2 if n in ("saturate", "excess", "quantize", "dot", "cross") else 1) for n in _DISPATCH})
 _NO_STREAMS = "a function can't read streams: sample or freeze the stream first and pass in the value"
-_LISTEN = {"input": ": listen(...) asks for a value"}     # the old name, before a port could be called input
+_FUTURE = ("base", "melt")      # built-ins reserved for a future version
+_LISTEN = {"input": ": listen(...) asks for a value",     # the old name, before a port could be called input
+           **{n: ": reserved for a future version" for n in _FUTURE}}
 _FNARGS = {"map": 1, "warp": 2}      # built-in calls and how many function arguments they start with
 _BUILTINS = ("map", "warp", "unity", "Re", "Im", "im", "listen", "abs", "arg", "conj", "power", "root", "sample", "freeze") \
-    + tuple(_MORE)
+    + _TRIG + tuple(_DISPATCH) + _FUTURE
 
 
 def _fn_name(node) -> str:
@@ -1967,7 +2128,11 @@ def _fn_name(node) -> str:
 
 
 def _apply(name: str, args: list, line: int, ctx) -> _SV:
-    return args[0] if name == "unity" else _call_function(name, args, line, ctx)
+    if name == "unity":
+        return args[0]
+    if name in _ELEMENTWISE and name not in ctx.get("funcs", {}):
+        return _maths(name, args, line)
+    return _call_function(name, args, line, ctx)
 
 
 def _scalar(r: _SV, who: str, line: int) -> _SV:
@@ -2103,8 +2268,12 @@ def _is_live(e, ctx) -> bool:
 
 def _param_value(text, source) -> _SV:
     t = str(text).strip()
-    if re.fullmatch(r"0[bB][01]{1,64}", t):
-        return _SV(Bits(int(t[2:], 2), len(t) - 2), _bits_type(len(t) - 2), source)
+    m = re.fullmatch(r"bits::(\d+)::(\d+)", t)
+    if m and 1 <= int(m.group(1)) <= _BITS_MAX:
+        n, d = int(m.group(1)), m.group(2)
+        v = int(d, 2) if re.fullmatch(r"[01]+", d) and len(d) == n else int(d)
+        if v < 1 << n:
+            return _SV(Bits(v, n), _bits_type(n), source)
     m = re.fullmatch(r"\{\s*([^,{}]+?)\s*,\s*([^,{}]+?)\s*\}", t)
     if m:
         try:
@@ -2180,7 +2349,7 @@ def _read_column(path: str, name: str, line: int) -> dict:
 # series), how many were ever written, and whether its module has ended. The module rewrites the whole file at
 # each sample; Signet marks it ended when the module stops, and stamps it if the run went well. A stream's value
 # in Signet code is {"stream": [path, ...]}, read again at each use: more than one path after a merge.
-STREAM_WINDOW = 1048
+STREAM_WINDOW = 1024
 
 
 def _stream_paths(v):
@@ -2422,8 +2591,8 @@ def _eval(e, line: int, ctx) -> _SV:
         if n > _HEX_MAX:
             raise SignalError(line, f"hex::{raw} is over hex::FFFFFFFF")
         return _SV(Hex(n), "hex")
-    if kind == "call" and e[1] in _MORE:
-        return _MORE[e[1]](e[1], [_eval(a, line, ctx) for a in e[2:]], line, ctx)
+    if kind == "call" and e[1] in _DISPATCH:
+        return _DISPATCH[e[1]](e[1], [_eval(a, line, ctx) for a in e[2:]], line, ctx)
     if kind == "bits":
         return _SV(Bits(int(e[1], 2), len(e[1])), _bits_type(len(e[1])))
     if kind == "range":
@@ -2465,6 +2634,9 @@ def _eval(e, line: int, ctx) -> _SV:
         t = infer_type(vals)
         if items and t in ("vector", ""):
             raise SignalError(line, "a vector's values must all be of one type, got " + ", ".join(sorted({_show_type(i) for i in items})))
+        bad = _ragged(vals)
+        if bad:
+            raise SignalError(line, f"the columns of an array must all be the same length, got {bad[0]} and {bad[1]} values")
         if t.endswith("float") and t.count("::") > 1:
             vals = _floats(vals)
         return _SV(vals, t or "vector", "vector")
@@ -2587,8 +2759,10 @@ def _eval(e, line: int, ctx) -> _SV:
         return _broadcast(op[1], op, a, b, line)
     if op in ("&", "|", "xor", "<<", ">>"):
         return _bits_op(op, a, b, line)
-    if op == "in":
+    if op == "belongs":
         return _in_range(a, b, line)
+    if op == "befits":
+        return _SV(_befits(a, b), "bool")
     if op in ("and", "or"):
         for x in (a, b):
             if type(x.value) is not bool:
@@ -2626,7 +2800,7 @@ def _eval(e, line: int, ctx) -> _SV:
 
 
 def _position(spec, n: int, label: str, line: int, ctx) -> int:
-    """The 0-based place an index names: a number (counted from index(), 0 by default) or end, end-k."""
+    """The 0-based place an index names: a number (counted from index(), 0 by default) or last, last-k."""
     if spec[0] == "end":
         back = 0
         if spec[1] is not None:
@@ -2822,7 +2996,7 @@ def _expr_sources(e, names: dict, seen=()) -> tuple:
     elif kind in ("num", "bool"):
         consts.append(str(e[1]).lower() if kind == "bool" else str(e[1]))
     elif kind == "bits":
-        consts.append("0b" + e[1])
+        consts.append(f"bits::{len(e[1])}::{e[1]}")
     elif kind == "name" and e[1] not in seen:
         for sub in names.get(e[1], []):
             r, c, b = _expr_sources(sub, names, seen + (e[1],))
@@ -2878,7 +3052,7 @@ def _show_value(sv: _SV) -> str:
     if isinstance(sv.value, Hex):
         return f"hex::{sv.value:X}"
     if isinstance(sv.value, Bits):
-        return "0b" + format(int(sv.value), f"0{sv.value.width}b")
+        return f"bits::{sv.value.width}::" + format(int(sv.value), f"0{sv.value.width}b")
     if _is_range(sv.value):
         return "{" + json.dumps(sv.value["lo"]) + ", " + json.dumps(sv.value["hi"]) + "}"
     if sv.type == "complex" and isinstance(sv.value, dict) and not isinstance(sv.value["re"], list):
@@ -3092,7 +3266,7 @@ class _Exec:
                     raise SignalError(line, f"lineage takes a Signal, got {_show_type(sv)}")
                 folder = getattr(ctx["host"], "folder", ".")
                 say = seq.say if seq is not None else lambda t, ln: (ctx["host"].echo if hasattr(ctx["host"], "echo") else print)(t)
-                say(f"line {line}: lineage of {text}", line)
+                say(f"line {line}: lineage of {_bang(text)}", line)
                 for ln in lineage(os.path.basename(path), os.path.dirname(path) or folder, getattr(ctx["host"], "module_dirs", ())):
                     say("  " + ln, line)
             elif kind == "echo":
@@ -3108,7 +3282,7 @@ class _Exec:
                 yield from self.block(nd[3] if c.value else (nd[4] or []))
             elif kind == "output":
                 if ctx.get("out") is None:
-                    raise SignalError(line, "output is for a module written in Signet (a .signet file), not the Signals box")
+                    raise SignalError(line, "output is for a module written in Signet (a .signet or .sg file), not the Signals box")
                 sv = _eval(nd[4], line, ctx)
                 if nd[2]:
                     sv = _typed(nd[2], sv, line)
@@ -3530,9 +3704,25 @@ def _pshow(p):
 
 def connections(code: str, points: bool = False) -> list:
     """Every connect() in the code, without running it: [{line, module, port, types, refs, constants, buses,
-    conditional, point}]. Cross-point connects (module "") only with points=True. Raises ValueError."""
+    conditional, point, stepped}]. Stepped refs reach the connect only from a later line of its loop, so
+    from the pass before. Cross-point connects (module "") only with points=True. Raises ValueError."""
     prog = parse_signals(code)
-    names, out, subs = {}, [], {}
+    names, out, subs, ahead = {}, [], {}, set()
+    def name(n, e):
+        ahead.discard((n, id(e)))
+        if e not in names.setdefault(n, []):
+            names[n].append(e)
+    def collect(nodes):     # A loop's sets reach its earlier connects on the next pass
+        for nd in nodes:
+            if nd[0] in ("let", "set"):
+                n, e = (nd[3], nd[4]) if nd[0] == "let" else (nd[2], nd[3])
+                if e not in names.setdefault(n, []):
+                    names[n].append(e)
+                    ahead.add((n, id(e)))
+            elif nd[0] == "if":
+                collect(nd[3]); collect(nd[4] or [])
+            elif nd[0] == "for":
+                collect(nd[6])
     def walk(nodes, cond):
         for nd in nodes:
             if nd[0] == "subprocess":
@@ -3543,18 +3733,22 @@ def connections(code: str, points: bool = False) -> list:
                     names.setdefault(p, []).append(a)
                 walk(d[6], True)
             elif nd[0] == "let":
-                names.setdefault(nd[3], []).append(nd[4])
+                name(nd[3], nd[4])
             elif nd[0] == "set":
-                names.setdefault(nd[2], []).append(nd[3])
+                name(nd[2], nd[3])
             elif nd[0] == "if":
                 walk(nd[3], True)
                 walk(nd[4] or [], True)
             elif nd[0] in ("when", "for"):
+                if nd[0] == "for":
+                    collect(nd[6])
                 walk(nd[6], True)
             elif nd[0] == "connect" and (nd[4] is not None or points):
                 refs, consts, buses = _expr_sources(nd[2], names)
+                now = _expr_sources(nd[2], {n: [e for e in es if (n, id(e)) not in ahead] for n, es in names.items()})[0]
                 out.append({"line": nd[1], "module": nd[4] or "", "port": nd[5], "types": nd[3], "refs": refs,
-                            "constants": consts, "buses": buses, "conditional": cond, "point": _pshow(nd[6])})
+                            "constants": consts, "buses": buses, "conditional": cond, "point": _pshow(nd[6]),
+                            "stepped": [r for r in refs if r not in now]})
             elif nd[0] == "route" and nd[2] == "exit":
                 refs, consts, buses = _expr_sources(nd[3], names)
                 for words, mod, port, point in nd[4]:
@@ -3652,6 +3846,11 @@ def _edited(path: str) -> bool:
         return False
 
 
+def _bang(name: str) -> str:
+    """A Signal's name as code writes it: name! for name.sig."""
+    return name[:-4] + "!" if name.endswith(".sig") else name
+
+
 def lineage(path: str, folder: str = ".", module_dirs=()) -> list:
     """The chain that made a Signal, as lines of text: each Signal checked against its stamp, the module that
     wrote it checked against the hash it had then, and each input followed back to the Signals, files and
@@ -3663,7 +3862,7 @@ def lineage(path: str, folder: str = ".", module_dirs=()) -> list:
         pad = "  " * depth
         full = os.path.join(folder, name)
         if depth > 32:
-            lines.append(pad + f"{name}: too deep to follow")
+            lines.append(pad + f"{_bang(name)}: too deep to follow")
             return
         try:
             obj = read_sig(full)
@@ -3672,18 +3871,18 @@ def lineage(path: str, folder: str = ".", module_dirs=()) -> list:
                 name, full = index[want], os.path.join(folder, index[want])
                 obj = read_sig(full)
             else:
-                lines.append(pad + f"{name}: " + ("missing" if not os.path.isfile(full) else
+                lines.append(pad + f"{_bang(name)}: " + ("missing" if not os.path.isfile(full) else
                                                   "edited after it was stamped" if _edited(full) else str(e)))
                 return
         if want and obj["hash"] != want:
             if want in index:          # the one that was used is still here under another name
                 return walk(index[want], depth, want)
-            lines.append(pad + f"{name}: replaced by a later run; the one used ({want[:12]}) is gone")
+            lines.append(pad + f"{_bang(name)}: replaced by a later run; the one used ({want[:12]}) is gone")
             return
         shown = _show_value(_SV(_bits_from(str(obj.get("type") or ""), obj["value"]), str(obj.get("type") or "")))
         if len(shown) > 60:
             shown = shown[:57] + "..."
-        lines.append(pad + f"{name} = {shown}  {obj.get('type') or ''}  made by {obj.get('origin', '?')} at {obj.get('generated', '?')}, stamp ok")
+        lines.append(pad + f"{_bang(name)} = {shown}  {obj.get('type') or ''}  made by {obj.get('origin', '?')} at {obj.get('generated', '?')}, stamp ok")
         if obj["hash"] in seen:
             lines.append(pad + "  (shown above)")
             return
@@ -3706,12 +3905,12 @@ def lineage(path: str, folder: str = ".", module_dirs=()) -> list:
                 if "$" in ref:
                     lines.append(pad + f"  {port} <- {ref} = {h}")
                 elif h is None:
-                    lines.append(pad + f"  {port} <- {ref} (a stream still being written: not checked)")
+                    lines.append(pad + f"  {port} <- {_bang(ref)} (a stream still being written: not checked)")
                 elif str(h).startswith("sha256:"):
                     now = _file_hash(os.path.join(folder, ref))
                     lines.append(pad + f"  {port} <- file {ref} ({'unchanged' if now == h else 'missing' if not now else 'changed since'})")
                 elif not h:
-                    lines.append(pad + f"  {port} <- {ref} (not stamped)")
+                    lines.append(pad + f"  {port} <- {_bang(ref)} (not stamped)")
                 else:
                     lines.append(pad + f"  {port} <-")
                     walk(ref, depth + 2, h)
@@ -4192,7 +4391,7 @@ class _Signals:
         """A series to write: signals.out = signals.series(v, domain="time", start=0.0, step=0.1)."""
         return Series(values, domain, x=x, start=start, step=step)
 
-    def stream(self, port, domain="time", window=1048):
+    def stream(self, port, domain="time", window=1024):
         """An output stream, <prefix>-<module>.<port>.sig: out = signals.stream("volts"); out.write(t, v).
         It keeps the last `window` samples; Signet stamps it when the module ends."""
         if not _PORT.match(port) or port in ("write", "series", "stream"):
@@ -4461,7 +4660,7 @@ mutable struct Stream
     values::Vector{ComplexF64}
 end
 
-function stream(port::AbstractString; domain::AbstractString="time", window::Integer=1048)
+function stream(port::AbstractString; domain::AbstractString="time", window::Integer=1024)
     (occursin(PORT, port) && !(port in ("write", "series", "stream"))) || error("$port can't be a port name")
     occursin(PORT, domain) || error("bad stream domain $domain")
     window > 0 || error("a stream's window must be above 0")
@@ -4787,10 +4986,10 @@ inline void out(const std::string& name, const ComplexSeries& s, const std::stri
 }
 
 // An output stream: signet::Stream volts("volts"); volts.write(t, v). Its .sig keeps the last `window` samples
-// (1048 unless given), rewritten whole at each write. signet::ComplexStream takes complex values.
+// (1024 unless given), rewritten whole at each write. signet::ComplexStream takes complex values.
 template <class V> class StreamOf {
   public:
-    explicit StreamOf(std::string name, std::string domain = "time", size_t window = 1048)
+    explicit StreamOf(std::string name, std::string domain = "time", size_t window = 1024)
         : name_(std::move(name)), domain_(std::move(domain)), window_(window) {
         if (window_ == 0) throw std::invalid_argument("a stream's window must be above 0");
     }
@@ -5252,7 +5451,7 @@ impl StreamValue for Complex {
     fn jvalues(v: &[Complex]) -> String { jcomplexes(v) }
 }
 
-/// An output stream: `let mut s = Stream::<f64>::new("volts", "time", 1048); s.write(t, v);`. Its .sig keeps the
+/// An output stream: `let mut s = Stream::<f64>::new("volts", "time", 1024); s.write(t, v);`. Its .sig keeps the
 /// last `window` samples, rewritten whole at each write.
 pub struct Stream<V: StreamValue> {
     name: String,
@@ -5467,8 +5666,8 @@ package Signet is
       Values       : Complex_Vector (1 .. Window);
    end record;
 
-   function Open (Name : String; Domain : String := "time"; Window : Positive := 1048) return Stream;
-   function Open_Complex (Name : String; Domain : String := "time"; Window : Positive := 1048) return Complex_Stream;
+   function Open (Name : String; Domain : String := "time"; Window : Positive := 1024) return Stream;
+   function Open_Complex (Name : String; Domain : String := "time"; Window : Positive := 1024) return Complex_Stream;
    procedure Write (S : in out Stream; T : Long_Float; Value : Long_Float);
    procedure Write (S : in out Complex_Stream; T : Long_Float; Value : Complex);
 
@@ -5989,13 +6188,13 @@ package body Signet is
             Or_Own (Kind, "series::" & D & "::complex"));
    end Put;
 
-   function Open (Name : String; Domain : String := "time"; Window : Positive := 1048) return Stream is
+   function Open (Name : String; Domain : String := "time"; Window : Positive := 1024) return Stream is
    begin
       return (Window => Window, Name => To_Unbounded_String (Name), Domain => To_Unbounded_String (Domain),
               Count => 0, X => (others => 0.0), Values => (others => 0.0));
    end Open;
 
-   function Open_Complex (Name : String; Domain : String := "time"; Window : Positive := 1048) return Complex_Stream is
+   function Open_Complex (Name : String; Domain : String := "time"; Window : Positive := 1024) return Complex_Stream is
    begin
       return (Window => Window, Name => To_Unbounded_String (Name), Domain => To_Unbounded_String (Domain),
               Count => 0, X => (others => 0.0), Values => (others => (0.0, 0.0)));
@@ -6237,10 +6436,10 @@ module signet
     complex(8), allocatable :: values(:)
   end type
   ! An output stream: call signet_stream_open(s, 'volts'), then call signet_stream_write(s, t, v) with a real(8)
-  ! or complex(8) v. Its .sig keeps the last window samples (1048 unless given), rewritten whole at each write.
+  ! or complex(8) v. Its .sig keeps the last window samples (1024 unless given), rewritten whole at each write.
   type :: signet_stream
     character(:), allocatable :: name, domain
-    integer :: window = 1048, count = 0
+    integer :: window = 1024, count = 0
     real(8), allocatable :: x(:), values(:)
     complex(8), allocatable :: cvalues(:)
   end type
@@ -7263,8 +7462,8 @@ signet_put_series() {    # signet_put_series NAME DOMAIN: reads "x value" lines 
 }
 
 signet_stream() {        # signet_stream NAME [DOMAIN] [WINDOW]: reads "t value" lines on standard input and writes
-                         # the stream after each, keeping the last WINDOW samples (1048)
-  local name=$1 domain=${2:-time} window=${3:-1048} count=0 t v ti vi xs vs
+                         # the stream after each, keeping the last WINDOW samples (1024)
+  local name=$1 domain=${2:-time} window=${3:-1024} count=0 t v ti vi xs vs
   local -a X=() V=()
   case "$domain" in ''|[0-9]*|*[!A-Za-z0-9_]*) echo "signet: '$domain' can't be a domain" >&2; return 2 ;; esac
   case "$window" in ''|*[!0-9]*|0) echo "signet: a stream's window must be a whole number above 0" >&2; return 2 ;; esac
@@ -7350,9 +7549,1156 @@ signet_stream_follow() { # signet_stream_follow NAME: prints "t value" for each 
 }
 '''
 
+_C_HELPER = r'''// signet.h:    SIGNALS FOR C MODULES (C11, standard library only)
+// AUTHOR:      DANIEL DESAI
+// UPDATED:     2026-11-11
+// VERSION:     0.6.0
+//
+// Built into signet.py: Signet and Starfire put this on the include path, so a module
+// just says #include <signet.h>. Inputs: signet_get_double("voltage").
+// Outputs: signet_put_double("power", power, "float"). The type is optional (pass NULL).
+// Anything wrong stops the module with "signet: message" and exit code 2. Values read are
+// kept until the module ends: a module runs once, so nothing needs freeing.
+
+#ifndef SIGNET_H
+#define SIGNET_H
+
+#include <math.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+int nanosleep(const struct timespec *req, struct timespec *rem);     // POSIX, declared for -std=c11
+
+typedef struct { double re, im; } signet_complex;     // No <complex.h>: its I macro would clash
+typedef struct { size_t n; double *v; } signet_doubles;
+typedef struct { size_t n; long long *v; } signet_ints;
+typedef struct { size_t n; char **v; } signet_texts;
+typedef struct { size_t n; signet_complex *v; } signet_complexes;
+typedef struct { const char *domain; size_t n; double *x; double *values; } signet_series;
+typedef struct { const char *domain; size_t n; double *x; signet_complex *values; } signet_cseries;
+
+// Errors: one message, then exit code 2
+static inline void signet_fail(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("signet: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    exit(2);
+}
+
+static inline void *signet__alloc(size_t n) {
+    void *p = calloc(n ? n : 1, 1);
+    if (!p) signet_fail("out of memory");
+    return p;
+}
+
+static inline char *signet__dup(const char *s, size_t n) {
+    char *d = (char *)signet__alloc(n + 1);
+    memcpy(d, s, n);
+    return d;
+}
+
+static inline const char *signet__env(const char *key, bool need) {
+    char k[96];
+    snprintf(k, sizeof k, "SIGNET_%s", key);
+    const char *v = getenv(k);
+    if (!v) {
+        snprintf(k, sizeof k, "STARFIRE_%s", key);
+        v = getenv(k);
+    }
+    if (!v && need) signet_fail("SIGNET_%s is not set (run from Signet or Starfire)", key);
+    return v;
+}
+
+// Inputs: one line each, name<TAB>type<TAB>shape<TAB>space-separated words
+typedef struct { char *name, *type, *shape; size_t n; char **tok; } signet__rec;
+static signet__rec *signet__recs;
+static size_t signet__nrecs;
+static bool signet__loaded;
+
+static inline void signet__load(void) {
+    if (signet__loaded) return;
+    signet__loaded = true;
+    const char *path = signet__env("SIGNALS_TXT", false);
+    if (!path) return;                          // a module with no inputs
+    FILE *f = fopen(path, "rb");
+    if (!f) signet_fail("can't read %s", path);
+    size_t cap = 0, len = 0;
+    char *line = NULL;
+    for (int c = 0; c != EOF;) {
+        len = 0;
+        while ((c = fgetc(f)) != EOF && c != '\n') {
+            if (len + 1 >= cap) {
+                cap = cap ? 2 * cap : 256;
+                line = (char *)realloc(line, cap);
+                if (!line) signet_fail("out of memory");
+            }
+            line[len++] = (char)c;
+        }
+        if (len == 0) continue;
+        line[len] = 0;
+        char *field[4];
+        size_t nf = 0;
+        char *a = line;
+        while (nf < 3) {
+            char *b = strchr(a, '\t');
+            if (!b) break;
+            field[nf++] = signet__dup(a, (size_t)(b - a));
+            a = b + 1;
+        }
+        if (nf != 3) continue;
+        field[3] = a;
+        signet__rec r = {field[0], field[1], field[2], 0, NULL};
+        for (char *w = strtok(field[3], " "); w; w = strtok(NULL, " ")) {
+            r.tok = (char **)realloc(r.tok, (r.n + 1) * sizeof *r.tok);
+            if (!r.tok) signet_fail("out of memory");
+            r.tok[r.n++] = signet__dup(w, strlen(w));
+        }
+        signet__recs = (signet__rec *)realloc(signet__recs, (signet__nrecs + 1) * sizeof *signet__recs);
+        if (!signet__recs) signet_fail("out of memory");
+        signet__recs[signet__nrecs++] = r;
+    }
+    free(line);
+    fclose(f);
+}
+
+static inline const signet__rec *signet__find(const char *name) {
+    signet__load();
+    for (size_t i = 0; i < signet__nrecs; i++)
+        if (strcmp(signet__recs[i].name, name) == 0) return &signet__recs[i];
+    return NULL;
+}
+
+static inline const signet__rec *signet__get(const char *name) {
+    const signet__rec *r = signet__find(name);
+    if (!r) signet_fail("no input %s (see the point's Signet code)", name);
+    return r;
+}
+
+static inline void signet__need(const char *name, const signet__rec *r, const char *shape, const char *want) {
+    if (strcmp(r->shape, shape) != 0) signet_fail("input %s is %s, not %s", name, r->type, want);
+}
+
+static inline const char *signet__tok(const char *name, const signet__rec *r, size_t i) {
+    if (i >= r->n) signet_fail("input %s is cut short", name);
+    return r->tok[i];
+}
+
+static inline double signet__num(const char *t) { return strtod(t, NULL); }   // "nan" reads as NaN
+
+static inline char *signet__unescape(const char *t) {
+    if (strcmp(t, "\\e") == 0) return signet__dup("", 0);
+    size_t n = strlen(t), k = 0;
+    char *s = (char *)signet__alloc(n + 1);
+    for (size_t i = 0; i < n; i++) {
+        if (t[i] != '\\' || i + 1 == n) { s[k++] = t[i]; continue; }
+        char c = t[++i];
+        s[k++] = c == 's' ? ' ' : c == 't' ? '\t' : c == 'n' ? '\n' : c == 'r' ? '\r' : c;
+    }
+    return s;
+}
+
+static inline bool signet_has(const char *name) { return signet__find(name) != NULL; }
+
+// Inputs by type
+static inline double signet_get_double(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "s", "a number");
+    if (!strcmp(r->type, "bool") || !strcmp(r->type, "text")) signet_fail("input %s is %s, not a number", name, r->type);
+    return signet__num(signet__tok(name, r, 0));
+}
+
+static inline long long signet_get_int(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "s", "an integer");
+    if (strcmp(r->type, "int") && strcmp(r->type, "hex")) signet_fail("input %s is %s, not an integer", name, r->type);
+    return strtoll(signet__tok(name, r, 0), NULL, 10);
+}
+
+static inline bool signet_get_bool(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "s", "a bool");
+    if (strcmp(r->type, "bool")) signet_fail("input %s is %s, not a bool", name, r->type);
+    return strcmp(signet__tok(name, r, 0), "true") == 0;
+}
+
+static inline const char *signet_get_text(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "s", "text");
+    if (strcmp(r->type, "text")) signet_fail("input %s is %s, not text", name, r->type);
+    return r->n ? signet__unescape(r->tok[0]) : "";
+}
+
+static inline signet_complex signet_get_complex(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "c", "a complex number");
+    signet_complex z = {signet__num(signet__tok(name, r, 0)), signet__num(signet__tok(name, r, 1))};
+    return z;
+}
+
+static inline signet_doubles signet_get_doubles(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "v", "a vector of numbers");
+    if (!strcmp(r->type, "vector::text") || !strcmp(r->type, "vector::bool"))
+        signet_fail("input %s is %s, not a vector of numbers", name, r->type);
+    signet_doubles d = {r->n, (double *)signet__alloc(r->n * sizeof(double))};
+    for (size_t i = 0; i < r->n; i++) d.v[i] = signet__num(r->tok[i]);
+    return d;
+}
+
+static inline signet_ints signet_get_ints(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "v", "a vector of numbers");
+    if (!strcmp(r->type, "vector::text") || !strcmp(r->type, "vector::bool"))
+        signet_fail("input %s is %s, not a vector of numbers", name, r->type);
+    signet_ints d = {r->n, (long long *)signet__alloc(r->n * sizeof(long long))};
+    for (size_t i = 0; i < r->n; i++) d.v[i] = strtoll(r->tok[i], NULL, 10);
+    return d;
+}
+
+static inline signet_texts signet_get_texts(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "v", "a vector of text");
+    if (strcmp(r->type, "vector::text")) signet_fail("input %s is %s, not a vector of text", name, r->type);
+    signet_texts d = {r->n, (char **)signet__alloc(r->n * sizeof(char *))};
+    for (size_t i = 0; i < r->n; i++) d.v[i] = signet__unescape(r->tok[i]);
+    return d;
+}
+
+static inline signet_complexes signet_get_complexes(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "vc", "a vector of complex numbers");
+    signet_complexes d = {r->n / 2, (signet_complex *)signet__alloc(r->n / 2 * sizeof(signet_complex))};
+    for (size_t i = 0; i < d.n; i++) {
+        d.v[i].re = signet__num(r->tok[2 * i]);
+        d.v[i].im = signet__num(r->tok[2 * i + 1]);
+    }
+    return d;
+}
+
+static inline signet_series signet_get_series(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "xs", "a real series");
+    size_t k = strtoul(signet__tok(name, r, 1), NULL, 10);
+    signet__tok(name, r, 1 + 2 * k);
+    signet_series s = {signet__unescape(r->tok[0]), k, (double *)signet__alloc(k * sizeof(double)),
+                       (double *)signet__alloc(k * sizeof(double))};
+    for (size_t i = 0; i < k; i++) {
+        s.x[i] = signet__num(r->tok[2 + i]);
+        s.values[i] = signet__num(r->tok[2 + k + i]);
+    }
+    return s;
+}
+
+static inline signet_cseries signet_get_cseries(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "xc", "a complex series");
+    size_t k = strtoul(signet__tok(name, r, 1), NULL, 10);
+    signet__tok(name, r, 1 + 3 * k);
+    signet_cseries s = {signet__unescape(r->tok[0]), k, (double *)signet__alloc(k * sizeof(double)),
+                        (signet_complex *)signet__alloc(k * sizeof(signet_complex))};
+    for (size_t i = 0; i < k; i++) {
+        s.x[i] = signet__num(r->tok[2 + i]);
+        s.values[i].re = signet__num(r->tok[2 + k + 2 * i]);
+        s.values[i].im = signet__num(r->tok[3 + k + 2 * i]);
+    }
+    return s;
+}
+
+// JSON text for a .sig, built in a growing buffer
+typedef struct { char *s; size_t n, cap; } signet__buf;
+
+static inline void signet__add(signet__buf *b, const char *t, size_t n) {
+    if (b->n + n + 1 > b->cap) {
+        b->cap = (b->n + n + 1) * 2;
+        b->s = (char *)realloc(b->s, b->cap);
+        if (!b->s) signet_fail("out of memory");
+    }
+    memcpy(b->s + b->n, t, n);
+    b->n += n;
+    b->s[b->n] = 0;
+}
+
+static inline void signet__puts(signet__buf *b, const char *t) { signet__add(b, t, strlen(t)); }
+
+static inline void signet__jnum(signet__buf *b, double d) {    // NaN and infinity as null; a float always shows a "."
+    if (!isfinite(d)) { signet__puts(b, "null"); return; }
+    char t[40];
+    for (int p = 15; p <= 17; p++) {
+        snprintf(t, sizeof t, "%.*g", p, d);
+        if (strtod(t, NULL) == d) break;
+    }
+    if (!strpbrk(t, ".eE")) strcat(t, ".0");
+    signet__puts(b, t);
+}
+
+static inline bool signet__floaty(const char *type) {
+    size_t n = type ? strlen(type) : 0;
+    return n >= 5 && strcmp(type + n - 5, "float") == 0;
+}
+
+static inline void signet__jint(signet__buf *b, long long v, const char *type) {
+    if (signet__floaty(type)) { signet__jnum(b, (double)v); return; }
+    char t[32];
+    snprintf(t, sizeof t, "%lld", v);
+    signet__puts(b, t);
+}
+
+static inline void signet__jstr(signet__buf *b, const char *t) {
+    signet__puts(b, "\"");
+    for (const unsigned char *c = (const unsigned char *)t; *c; c++) {
+        char e[8];
+        if (*c == '"' || *c == '\\') { e[0] = '\\'; e[1] = (char)*c; signet__add(b, e, 2); }
+        else if (*c == '\n') signet__puts(b, "\\n");
+        else if (*c == '\r') signet__puts(b, "\\r");
+        else if (*c == '\t') signet__puts(b, "\\t");
+        else if (*c < 0x20) { snprintf(e, sizeof e, "\\u%04x", *c); signet__puts(b, e); }
+        else signet__add(b, (const char *)c, 1);
+    }
+    signet__puts(b, "\"");
+}
+
+static inline void signet__jnums(signet__buf *b, const double *v, size_t n) {
+    signet__puts(b, "[");
+    for (size_t i = 0; i < n; i++) {
+        if (i) signet__puts(b, ",");
+        signet__jnum(b, v[i]);
+    }
+    signet__puts(b, "]");
+}
+
+static inline void signet__jcomplexes(signet__buf *b, const signet_complex *v, size_t n) {
+    signet__puts(b, "{\"re\":[");
+    for (size_t i = 0; i < n; i++) { if (i) signet__puts(b, ","); signet__jnum(b, v[i].re); }
+    signet__puts(b, "],\"im\":[");
+    for (size_t i = 0; i < n; i++) { if (i) signet__puts(b, ","); signet__jnum(b, v[i].im); }
+    signet__puts(b, "]}");
+}
+
+// <prefix>-<module>.<name>.sig, written whole and then renamed: a reader never sees half a file
+static inline void signet__emit(const char *name, signet__buf *value, const char *type) {
+    const char *prefix = signet__env("PREFIX", false), *module = signet__env("MODULE", true);
+    size_t n = strlen(module) + strlen(name) + (prefix ? strlen(prefix) : 0) + 16;
+    char *path = (char *)signet__alloc(n), *tmp = (char *)signet__alloc(n + 4);
+    snprintf(path, n, "%s%s%s.%s.sig", prefix && *prefix ? prefix : "", prefix && *prefix ? "-" : "", module, name);
+    snprintf(tmp, n + 4, "%s.tmp", path);
+    signet__buf t = {0};
+    signet__jstr(&t, type ? type : "");
+    FILE *f = fopen(tmp, "wb");
+    if (!f || fprintf(f, "{\"value\":%s,\"type\":%s}\n", value->s ? value->s : "null", t.s) < 0 || fclose(f) != 0)
+        signet_fail("can't write %s", tmp);
+    if (rename(tmp, path) != 0) signet_fail("can't rename %s", tmp);
+    free(t.s);
+    free(value->s);
+    free(path);
+    free(tmp);
+}
+
+#define SIGNET__TYPE(type, dflt) ((type) && *(type) ? (type) : (dflt))
+
+// Outputs. The type is optional ("float", "vector::float", ...); a float type turns whole numbers into floats.
+static inline void signet_put_double(const char *name, double v, const char *type) {
+    signet__buf b = {0};
+    signet__jnum(&b, v);
+    signet__emit(name, &b, SIGNET__TYPE(type, "float"));
+}
+
+static inline void signet_put_int(const char *name, long long v, const char *type) {
+    signet__buf b = {0};
+    signet__jint(&b, v, type);
+    signet__emit(name, &b, SIGNET__TYPE(type, "int"));
+}
+
+static inline void signet_put_bool(const char *name, bool v, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, v ? "true" : "false");
+    signet__emit(name, &b, SIGNET__TYPE(type, "bool"));
+}
+
+static inline void signet_put_text(const char *name, const char *v, const char *type) {
+    signet__buf b = {0};
+    signet__jstr(&b, v);
+    signet__emit(name, &b, SIGNET__TYPE(type, "text"));
+}
+
+static inline void signet_put_complex(const char *name, signet_complex v, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, "{\"re\":");
+    signet__jnum(&b, v.re);
+    signet__puts(&b, ",\"im\":");
+    signet__jnum(&b, v.im);
+    signet__puts(&b, "}");
+    signet__emit(name, &b, SIGNET__TYPE(type, "complex"));
+}
+
+static inline void signet_put_doubles(const char *name, const double *v, size_t n, const char *type) {
+    signet__buf b = {0};
+    signet__jnums(&b, v, n);
+    signet__emit(name, &b, SIGNET__TYPE(type, "vector::float"));
+}
+
+static inline void signet_put_ints(const char *name, const long long *v, size_t n, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, "[");
+    for (size_t i = 0; i < n; i++) {
+        if (i) signet__puts(&b, ",");
+        signet__jint(&b, v[i], type);
+    }
+    signet__puts(&b, "]");
+    signet__emit(name, &b, SIGNET__TYPE(type, "vector::int"));
+}
+
+static inline void signet_put_texts(const char *name, const char *const *v, size_t n, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, "[");
+    for (size_t i = 0; i < n; i++) {
+        if (i) signet__puts(&b, ",");
+        signet__jstr(&b, v[i]);
+    }
+    signet__puts(&b, "]");
+    signet__emit(name, &b, SIGNET__TYPE(type, "vector::text"));
+}
+
+static inline void signet_put_complexes(const char *name, const signet_complex *v, size_t n, const char *type) {
+    signet__buf b = {0};
+    signet__jcomplexes(&b, v, n);
+    signet__emit(name, &b, SIGNET__TYPE(type, "vector::complex"));
+}
+
+static inline void signet_put_series(const char *name, signet_series s, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, "{\"domain\":");
+    signet__jstr(&b, s.domain);
+    signet__puts(&b, ",\"x\":");
+    signet__jnums(&b, s.x, s.n);
+    signet__puts(&b, ",\"values\":");
+    signet__jnums(&b, s.values, s.n);
+    signet__puts(&b, "}");
+    char t[160];
+    snprintf(t, sizeof t, "series::%s::float", s.domain);
+    signet__emit(name, &b, SIGNET__TYPE(type, t));
+}
+
+static inline void signet_put_cseries(const char *name, signet_cseries s, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, "{\"domain\":");
+    signet__jstr(&b, s.domain);
+    signet__puts(&b, ",\"x\":");
+    signet__jnums(&b, s.x, s.n);
+    signet__puts(&b, ",\"values\":");
+    signet__jcomplexes(&b, s.values, s.n);
+    signet__puts(&b, "}");
+    char t[160];
+    snprintf(t, sizeof t, "series::%s::complex", s.domain);
+    signet__emit(name, &b, SIGNET__TYPE(type, t));
+}
+
+// An output stream: signet_stream *s = signet_stream_open("volts", "time", 1024); signet_stream_write(s, t, v).
+// Its .sig keeps the last `window` samples (1024 if 0), rewritten whole at each write.
+// signet_cstream_open and signet_cstream_write take complex values.
+typedef struct {
+    char *name, *domain;
+    bool complex;
+    size_t window, len, count;
+    double *x;
+    signet_complex *v;
+} signet_stream;
+
+static inline signet_stream *signet__stream_open(const char *name, const char *domain, size_t window, bool complex) {
+    signet_stream *s = (signet_stream *)signet__alloc(sizeof *s);
+    s->name = signet__dup(name, strlen(name));
+    domain = domain && *domain ? domain : "time";
+    s->domain = signet__dup(domain, strlen(domain));
+    s->complex = complex;
+    s->window = window ? window : 1024;
+    s->x = (double *)signet__alloc(s->window * sizeof(double));
+    s->v = (signet_complex *)signet__alloc(s->window * sizeof(signet_complex));
+    return s;
+}
+
+static inline signet_stream *signet_stream_open(const char *name, const char *domain, size_t window) {
+    return signet__stream_open(name, domain, window, false);
+}
+
+static inline signet_stream *signet_cstream_open(const char *name, const char *domain, size_t window) {
+    return signet__stream_open(name, domain, window, true);
+}
+
+static inline void signet__stream_write(signet_stream *s, double t, signet_complex v) {
+    if (!isfinite(t)) signet_fail("a stream's t must be a finite number");
+    if (s->len == s->window) {
+        memmove(s->x, s->x + 1, (s->len - 1) * sizeof(double));
+        memmove(s->v, s->v + 1, (s->len - 1) * sizeof(signet_complex));
+        s->len--;
+    }
+    s->x[s->len] = t;
+    s->v[s->len++] = v;
+    s->count++;
+    signet__buf b = {0};
+    signet__puts(&b, "{\"domain\":");
+    signet__jstr(&b, s->domain);
+    signet__puts(&b, ",\"x\":");
+    signet__jnums(&b, s->x, s->len);
+    signet__puts(&b, ",\"values\":");
+    if (s->complex) {
+        signet__jcomplexes(&b, s->v, s->len);
+    } else {
+        signet__puts(&b, "[");
+        for (size_t i = 0; i < s->len; i++) { if (i) signet__puts(&b, ","); signet__jnum(&b, s->v[i].re); }
+        signet__puts(&b, "]");
+    }
+    char t2[96];
+    snprintf(t2, sizeof t2, ",\"window\":%zu,\"count\":%zu,\"ended\":false}", s->window, s->count);
+    signet__puts(&b, t2);
+    char type[160];
+    snprintf(type, sizeof type, "stream::%s::%s", s->domain, s->complex ? "complex" : "float");
+    signet__emit(s->name, &b, type);
+}
+
+static inline void signet_stream_write(signet_stream *s, double t, double v) {
+    signet_complex z = {v, 0.0};
+    signet__stream_write(s, t, z);
+}
+static inline void signet_cstream_write(signet_stream *s, double t, signet_complex v) { signet__stream_write(s, t, v); }
+
+// A stream's .sig, read without a JSON library: the window's x and values, count and ended
+typedef struct { size_t n; double *x, *v; long long count; bool ended; } signet__sread;
+
+static inline const char *signet__key(const char *s, const char *k) {
+    char q[32];
+    snprintf(q, sizeof q, "\"%s\"", k);
+    for (const char *p = strstr(s, q); p; p = strstr(p + 1, q)) {
+        const char *i = p + strlen(q);
+        while (*i == ' ') i++;
+        if (*i == ':') {
+            i++;
+            while (*i == ' ') i++;
+            return i;
+        }
+    }
+    return NULL;
+}
+
+static inline size_t signet__numbers(const char *i, double **out) {
+    size_t n = 0, cap = 0;
+    *out = NULL;
+    if (!i || *i != '[') return 0;
+    for (i++; *i && *i != ']';) {
+        while (*i == ' ' || *i == ',') i++;
+        if (*i == ']' || !*i) break;
+        if (n == cap) {
+            cap = cap ? 2 * cap : 64;
+            *out = (double *)realloc(*out, cap * sizeof(double));
+            if (!*out) signet_fail("out of memory");
+        }
+        char *end;
+        if (strncmp(i, "null", 4) == 0) { (*out)[n++] = NAN; end = (char *)i + 4; }
+        else (*out)[n++] = strtod(i, &end);
+        if (end == i) break;
+        i = end;
+    }
+    return n;
+}
+
+static inline signet__sread signet__read_stream(const char *path) {
+    signet__sread r = {0};
+    FILE *f = fopen(path, "rb");
+    if (!f) return r;
+    signet__buf b = {0};
+    char chunk[4096];
+    for (size_t k; (k = fread(chunk, 1, sizeof chunk, f)) > 0;) signet__add(&b, chunk, k);
+    fclose(f);
+    if (!b.s) return r;
+    const char *vi = signet__key(b.s, "values");
+    if (vi && *vi == '{') signet_fail("%s is a complex stream: read it in Python or Julia", path);
+    double *x, *v;
+    size_t nx = signet__numbers(signet__key(b.s, "x"), &x), nv = signet__numbers(vi, &v);
+    if (nx != nv) { free(x); free(v); free(b.s); return r; }      // caught between writes: try again
+    r.n = nx;
+    r.x = x;
+    r.v = v;
+    const char *c = signet__key(b.s, "count");
+    r.count = c ? strtoll(c, NULL, 10) : (long long)nx;
+    const char *e = signet__key(b.s, "ended");
+    r.ended = e && *e == 't';
+    free(b.s);
+    return r;
+}
+
+// A real stream input: signet_stream_in *s = signet_get_stream("volts").
+// while (signet_stream_next(s, &t, &v)) follows it sample by sample until its module ends;
+// signet_stream_latest(s, &t, &v) is the newest sample (false before the first);
+// signet_stream_ended(s) whether its module has ended.
+typedef struct {
+    size_t npaths;
+    char **paths;
+    long long *seen;
+    size_t qn, qhead;
+    double *qt, *qv;
+} signet_stream_in;
+
+static inline signet_stream_in *signet_get_stream(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "st", "a stream");
+    signet_stream_in *s = (signet_stream_in *)signet__alloc(sizeof *s);
+    s->npaths = r->n;
+    s->paths = (char **)signet__alloc(r->n * sizeof(char *));
+    s->seen = (long long *)signet__alloc(r->n * sizeof(long long));
+    for (size_t i = 0; i < r->n; i++) s->paths[i] = signet__unescape(r->tok[i]);
+    return s;
+}
+
+static inline int signet__by_t(const void *a, const void *b) {
+    double x = ((const double *)a)[0], y = ((const double *)b)[0];
+    return (x > y) - (x < y);
+}
+
+static inline bool signet_stream_latest(const signet_stream_in *s, double *t, double *v) {
+    bool any = false;
+    for (size_t k = 0; k < s->npaths; k++) {
+        signet__sread r = signet__read_stream(s->paths[k]);
+        for (size_t i = 0; i < r.n; i++)
+            if (!any || r.x[i] >= *t) { *t = r.x[i]; *v = r.v[i]; any = true; }
+        free(r.x);
+        free(r.v);
+    }
+    return any;
+}
+
+static inline bool signet_stream_ended(const signet_stream_in *s) {
+    for (size_t k = 0; k < s->npaths; k++) {
+        signet__sread r = signet__read_stream(s->paths[k]);
+        free(r.x);
+        free(r.v);
+        if (!r.ended) return false;
+    }
+    return true;
+}
+
+static inline bool signet_stream_next(signet_stream_in *s, double *t, double *v) {
+    while (s->qhead == s->qn) {
+        bool done = true;
+        size_t n = 0;
+        double *pairs = NULL;
+        for (size_t k = 0; k < s->npaths; k++) {
+            signet__sread r = signet__read_stream(s->paths[k]);
+            long long fresh = r.count - s->seen[k];
+            if (fresh > (long long)r.n) fresh = (long long)r.n;
+            if (fresh > 0) {
+                pairs = (double *)realloc(pairs, (n + (size_t)fresh) * 2 * sizeof(double));
+                if (!pairs) signet_fail("out of memory");
+                for (size_t i = r.n - (size_t)fresh; i < r.n; i++) {
+                    pairs[2 * n] = r.x[i];
+                    pairs[2 * n + 1] = r.v[i];
+                    n++;
+                }
+            }
+            if (r.count > s->seen[k]) s->seen[k] = r.count;
+            done = done && r.ended;
+            free(r.x);
+            free(r.v);
+        }
+        if (n) {
+            qsort(pairs, n, 2 * sizeof(double), signet__by_t);
+            free(s->qt);
+            free(s->qv);
+            s->qt = (double *)signet__alloc(n * sizeof(double));
+            s->qv = (double *)signet__alloc(n * sizeof(double));
+            for (size_t i = 0; i < n; i++) { s->qt[i] = pairs[2 * i]; s->qv[i] = pairs[2 * i + 1]; }
+            s->qn = n;
+            s->qhead = 0;
+        }
+        free(pairs);
+        if (!n) {
+            if (done) return false;
+            struct timespec ts = {0, 20000000};
+            nanosleep(&ts, NULL);
+        }
+    }
+    *t = s->qt[s->qhead];
+    *v = s->qv[s->qhead++];
+    return true;
+}
+
+#endif
+'''
+
+_A68_HELPER = r'''# signet.a68:  SIGNALS FOR ALGOL 68 MODULES (Algol 68 Genie, a68g 3) #
+# AUTHOR:      DANIEL DESAI #
+# UPDATED:     2026-11-11 #
+# VERSION:     0.6.0 #
+#
+  Built into signet.py: Signet runs a .a68 module with this placed before it, so a module
+  calls the procedures directly. Inputs: signet get real ("voltage").
+  Outputs: signet put real ("power", p, "float"). The type is optional (pass "").
+  Anything wrong stops the module with "signet: message" and exit code 2. Numbers are read
+  and written exactly, through LONG LONG INT, so a value survives the trip unchanged.
+#
+
+PR precision=800 PR
+
+MODE SIGNETREC = STRUCT (STRING name, type, shape, FLEX [1:0] STRING tok);
+MODE SIGNETSERIES = STRUCT (STRING domain, FLEX [1:0] REAL x, values);
+MODE SIGNETCSERIES = STRUCT (STRING domain, FLEX [1:0] REAL x, FLEX [1:0] COMPL values);
+
+FLEX [1:0] SIGNETREC signet recs;
+BOOL signet loaded := FALSE;
+
+PROC signet fail = (STRING msg) VOID:
+   BEGIN
+      put (stand error, ("signet: ", msg, newline));
+      VOID (system ("kill -TERM $PPID"))         # Signet reads this as exit code 2 #
+   END;
+
+PROC signet env = (STRING key) STRING:
+   (STRING v = getenv ("SIGNET_" + key); v /= "" | v | getenv ("STARFIRE_" + key));
+
+# Text: split on one character #
+PROC signet split = (STRING s, CHAR sep) FLEX [] STRING:
+   BEGIN
+      FLEX [1:0] STRING out;
+      INT start := LWB s;
+      PROC add = (STRING w) VOID:
+         BEGIN
+            [UPB out + 1] STRING more;
+            more[: UPB out] := out;
+            more[UPB more] := w;
+            out := more
+         END;
+      FOR i FROM LWB s TO UPB s DO
+         IF s[i] = sep THEN add (s[start : i - 1]); start := i + 1 FI
+      OD;
+      add (s[start : UPB s]);
+      out
+   END;
+
+PROC signet unescape = (STRING t) STRING:
+   IF t = "\e" THEN ""
+   ELSE
+      STRING s := "";
+      INT i := LWB t;
+      WHILE i <= UPB t DO
+         IF t[i] = "\" AND i < UPB t THEN
+            CHAR c = t[i + 1];
+            s +:= (c = "s" | " " |: c = "t" | REPR 9 |: c = "n" | REPR 10 |: c = "r" | REPR 13 | c);
+            i +:= 2
+         ELSE
+            s +:= t[i];
+            i +:= 1
+         FI
+      OD;
+      s
+   FI;
+
+# Inputs: one line each, name TAB type TAB shape TAB space-separated words #
+PROC signet load = VOID:
+   IF NOT signet loaded THEN
+      signet loaded := TRUE;
+      STRING path = signet env ("SIGNALS_TXT");
+      IF path /= "" THEN
+         FILE f;
+         IF open (f, path, stand in channel) /= 0 THEN signet fail ("can't read " + path) FI;
+         on logical file end (f, (REF FILE g) BOOL: GOTO end of signals);
+         DO
+            STRING line;
+            get (f, (line, newline));
+            [] STRING field = signet split (line, REPR 9);
+            IF UPB field >= 4 THEN
+               STRING rest := field[4];
+               FOR k FROM 5 TO UPB field DO rest +:= REPR 9 + field[k] OD;
+               FLEX [1:0] STRING words;
+               IF rest /= "" THEN
+                  FOR k FROM 1 TO UPB signet split (rest, " ") DO
+                     STRING w = signet split (rest, " ")[k];
+                     IF w /= "" THEN
+                        [UPB words + 1] STRING m;
+                        m[: UPB words] := words;
+                        m[UPB m] := w;
+                        words := m
+                     FI
+                  OD
+               FI;
+               [UPB signet recs + 1] SIGNETREC m;
+               m[: UPB signet recs] := signet recs;
+               m[UPB m] := (field[1], field[2], field[3], words);
+               signet recs := m
+            FI
+         OD;
+      end of signals:
+         close (f)
+      FI
+   FI;
+
+PROC signet find = (STRING name) INT:
+   BEGIN
+      signet load;
+      INT at := 0;
+      FOR i TO UPB signet recs WHILE at = 0 DO
+         IF name OF signet recs[i] = name THEN at := i FI
+      OD;
+      at
+   END;
+
+PROC signet has = (STRING name) BOOL: signet find (name) /= 0;
+
+PROC signet get = (STRING name, shape, want) SIGNETREC:
+   BEGIN
+      INT i = signet find (name);
+      IF i = 0 THEN signet fail ("no input " + name + " (see the point's Signet code)") FI;
+      SIGNETREC r = signet recs[i];
+      IF shape OF r /= shape THEN signet fail ("input " + name + " is " + type OF r + ", not " + want) FI;
+      r
+   END;
+
+PROC signet tok = (SIGNETREC r, INT i) STRING:
+   (i > UPB tok OF r | signet fail ("input " + name OF r + " is cut short"); "0" | (tok OF r)[i]);
+
+# Exact numbers: a REAL is m * 2^e, held as LONG LONG INT for decimal work #
+PROC signet bits = (LONG LONG INT n) INT:
+   BEGIN
+      INT b := 0;
+      LONG LONG INT p := LENG LENG 1;
+      WHILE p <= n DO p *:= LENG LENG 2; b +:= 1 OD;
+      b
+   END;
+
+PROC signet pow = (INT base, k) LONG LONG INT:
+   BEGIN
+      LONG LONG INT p := LENG LENG 1;
+      TO k DO p *:= LENG LENG base OD;
+      p
+   END;
+
+PROC signet scale = (REAL x, INT e) REAL:         # x * 2^e, exact while normal #
+   BEGIN
+      REAL y := x;
+      IF e > 0 THEN TO e DO y *:= 2.0 OD ELSE TO -e DO y /:= 2.0 OD FI;
+      y
+   END;
+
+PROC signet short = (LONG LONG INT n) INT: SHORTEN SHORTEN n;
+
+PROC signet read real = (STRING t0, STRING name) REAL:
+   BEGIN
+      STRING t := t0;
+      IF t = "nan" OR t = "inf" OR t = "-inf" THEN
+         signet fail ("input " + name + " is " + t + ", which ALGOL 68 can't hold")
+      FI;
+      BOOL neg := FALSE;
+      INT i := LWB t, k := 0;
+      IF t[i] = "-" THEN neg := TRUE; i +:= 1 ELIF t[i] = "+" THEN i +:= 1 FI;
+      LONG LONG INT d := LENG LENG 0;
+      BOOL frac := FALSE;
+      WHILE (i <= UPB t | t[i] /= "e" AND t[i] /= "E" | FALSE) DO
+         IF t[i] = "." THEN frac := TRUE
+         ELSE
+            d := d * LENG LENG 10 + LENG LENG (ABS t[i] - ABS "0");
+            IF frac THEN k -:= 1 FI
+         FI;
+         i +:= 1
+      OD;
+      IF i <= UPB t THEN
+         INT ex := 0;
+         BOOL eneg := FALSE;
+         i +:= 1;
+         IF t[i] = "-" THEN eneg := TRUE; i +:= 1 ELIF t[i] = "+" THEN i +:= 1 FI;
+         WHILE i <= UPB t DO ex := ex * 10 + (ABS t[i] - ABS "0"); i +:= 1 OD;
+         k +:= (eneg | -ex | ex)
+      FI;
+      IF d = LENG LENG 0 THEN 0.0
+      ELSE
+         LONG LONG INT q;
+         INT sh := 0;
+         BOOL sticky := FALSE;
+         IF k >= 0 THEN q := d * signet pow (10, k)
+         ELSE
+            LONG LONG INT p = signet pow (10, -k);
+            sh := 55 + signet bits (p) - signet bits (d);
+            IF sh < 0 THEN sh := 0 FI;
+            LONG LONG INT n = d * signet pow (2, sh);
+            q := n OVER p;
+            sticky := n MOD p /= LENG LENG 0
+         FI;
+         INT b = signet bits (q);
+         INT drop := 0;
+         IF b > 53 THEN
+            drop := b - 53;
+            LONG LONG INT unit = signet pow (2, drop);
+            LONG LONG INT r = q MOD unit, half = unit OVER LENG LENG 2;
+            q := q OVER unit;
+            IF r > half OR (r = half AND (sticky OR q MOD LENG LENG 2 = LENG LENG 1)) THEN q +:= LENG LENG 1 FI
+         FI;
+         REAL x = signet scale (signet short (q), drop - sh);
+         (neg | -x | x)
+      FI
+   END;
+
+PROC signet read int = (STRING t) INT:
+   BEGIN
+      INT v := 0, i := LWB t;
+      BOOL neg = t[i] = "-";
+      IF neg OR t[i] = "+" THEN i +:= 1 FI;
+      WHILE i <= UPB t DO v := v * 10 + (ABS t[i] - ABS "0"); i +:= 1 OD;
+      (neg | -v | v)
+   END;
+
+# A REAL as JSON: the fewest digits that read back as the same REAL #
+PROC signet json real = (REAL x0) STRING:
+   IF x0 = 0.0 THEN "0.0"
+   ELSE
+      BOOL neg = x0 < 0.0;
+      REAL m := ABS x0;
+      INT e := 0;
+      WHILE m >= 2.0 DO m /:= 2.0; e +:= 1 OD;
+      WHILE m < 1.0 DO m *:= 2.0; e -:= 1 OD;
+      INT mi = ENTIER (m * 4503599627370496.0), ee = e - 52;
+      LONG LONG INT n = (ee >= 0 | LENG LENG mi * signet pow (2, ee) | LENG LENG mi * signet pow (5, -ee));
+      LONG LONG INT bound = (ee >= 0 | signet pow (2, ee) | signet pow (5, -ee));
+      BOOL edge = mi = 4503599627370496;          # a power of 2: the gap below is half the gap above #
+      STRING ds = whole (n, 0);
+      INT nd = UPB ds, s = (ee >= 0 | 0 | -ee);
+      STRING rs := ds;
+      INT dexp := nd - 1 - s;
+      BOOL done := FALSE;
+      FOR p FROM 15 TO 17 WHILE NOT done DO      # fewer digits show as trailing zeros at 15 #
+         IF p >= nd THEN rs := ds; done := TRUE
+         ELSE
+            LONG LONG INT unit = signet pow (10, nd - p);
+            LONG LONG INT r := (n + unit OVER LENG LENG 2) OVER unit;
+            LONG LONG INT c = r * unit, diff = ABS (c - n);
+            IF (c < n AND edge | LENG LENG 4 | LENG LENG 2) * diff < bound OR p = 17 THEN
+               rs := whole (r, 0);
+               IF UPB rs > p THEN rs := rs[: p]; dexp +:= 1 FI;
+               done := TRUE
+            FI
+         FI
+      OD;
+      WHILE UPB rs > 1 AND rs[UPB rs] = "0" DO rs := rs[: UPB rs - 1] OD;
+      STRING out;
+      IF dexp >= 16 OR dexp < -4 THEN
+         out := rs[1] + "." + (UPB rs > 1 | rs[2:] | "0") + "e" + whole (dexp, 0)
+      ELIF dexp >= 0 THEN
+         STRING whole part := rs[: (UPB rs < dexp + 1 | UPB rs | dexp + 1)];
+         TO dexp + 1 - UPB whole part DO whole part +:= "0" OD;
+         out := whole part + "." + (UPB rs > dexp + 1 | rs[dexp + 2:] | "0")
+      ELSE
+         out := "0.";
+         TO -dexp - 1 DO out +:= "0" OD;
+         out +:= rs
+      FI;
+      (neg | "-" + out | out)
+   FI;
+
+PROC signet json int = (INT v, STRING type) STRING:
+   BEGIN
+      STRING w = whole (v, 0);
+      INT n = UPB type;
+      (n >= 5 ANDTH type[n - 4:] = "float" | w + ".0" | w)
+   END;
+
+PROC signet json text = (STRING t) STRING:
+   BEGIN
+      STRING s := """";
+      STRING hex = "0123456789abcdef";
+      FOR i FROM LWB t TO UPB t DO
+         CHAR c = t[i];
+         INT a = ABS c;
+         s +:= (c = """" | "\""" |: c = "\" | "\\" |: a = 10 | "\n" |: a = 13 | "\r" |: a = 9 | "\t"
+               |: a < 32 | "\u00" + hex[a OVER 16 + 1] + hex[a MOD 16 + 1] | c)
+      OD;
+      s + """"
+   END;
+
+PROC signet json reals = ([] REAL v) STRING:
+   BEGIN
+      STRING s := "[";
+      FOR i FROM LWB v TO UPB v DO s +:= (i > LWB v | "," | "") + signet json real (v[i]) OD;
+      s + "]"
+   END;
+
+PROC signet json compls = ([] COMPL v) STRING:
+   BEGIN
+      [LWB v : UPB v] REAL re, im;
+      FOR i FROM LWB v TO UPB v DO re[i] := RE v[i]; im[i] := IM v[i] OD;
+      "{""re"":" + signet json reals (re) + ",""im"":" + signet json reals (im) + "}"
+   END;
+
+# <prefix>-<module>.<name>.sig, written whole and then renamed: a reader never sees half a file #
+PROC signet emit = (STRING name, value, type) VOID:
+   BEGIN
+      STRING prefix = signet env ("PREFIX"), module = signet env ("MODULE");
+      IF module = "" THEN signet fail ("SIGNET_MODULE is not set (run from Signet or Starfire)") FI;
+      STRING path = (prefix = "" | "" | prefix + "-") + module + "." + name + ".sig", tmp = path + ".tmp";
+      VOID (system ("rm -f '" + tmp + "'"));
+      FILE f;
+      IF establish (f, tmp, stand out channel) /= 0 THEN signet fail ("can't write " + tmp) FI;
+      put (f, ("{""value"":" + value + ",""type"":" + signet json text (type) + "}", newline));
+      close (f);
+      IF system ("mv -f '" + tmp + "' '" + path + "'") /= 0 THEN signet fail ("can't rename " + tmp) FI
+   END;
+
+PROC signet type = (STRING type, dflt) STRING: (type = "" | dflt | type);
+
+# Inputs by type #
+PROC signet get real = (STRING name) REAL:
+   BEGIN
+      SIGNETREC r = signet get (name, "s", "a number");
+      IF type OF r = "bool" OR type OF r = "text" THEN signet fail ("input " + name + " is " + type OF r + ", not a number") FI;
+      signet read real (signet tok (r, 1), name)
+   END;
+
+PROC signet get int = (STRING name) INT:
+   BEGIN
+      SIGNETREC r = signet get (name, "s", "an integer");
+      IF type OF r /= "int" AND type OF r /= "hex" THEN signet fail ("input " + name + " is " + type OF r + ", not an integer") FI;
+      signet read int (signet tok (r, 1))
+   END;
+
+PROC signet get bool = (STRING name) BOOL:
+   BEGIN
+      SIGNETREC r = signet get (name, "s", "a bool");
+      IF type OF r /= "bool" THEN signet fail ("input " + name + " is " + type OF r + ", not a bool") FI;
+      signet tok (r, 1) = "true"
+   END;
+
+PROC signet get text = (STRING name) STRING:
+   BEGIN
+      SIGNETREC r = signet get (name, "s", "text");
+      IF type OF r /= "text" THEN signet fail ("input " + name + " is " + type OF r + ", not text") FI;
+      (UPB tok OF r = 0 | "" | signet unescape ((tok OF r)[1]))
+   END;
+
+PROC signet get compl = (STRING name) COMPL:
+   BEGIN
+      SIGNETREC r = signet get (name, "c", "a complex number");
+      signet read real (signet tok (r, 1), name) I signet read real (signet tok (r, 2), name)
+   END;
+
+PROC signet get reals = (STRING name) [] REAL:
+   BEGIN
+      SIGNETREC r = signet get (name, "v", "a vector of numbers");
+      IF type OF r = "vector::text" OR type OF r = "vector::bool" THEN
+         signet fail ("input " + name + " is " + type OF r + ", not a vector of numbers")
+      FI;
+      [UPB tok OF r] REAL v;
+      FOR i TO UPB v DO v[i] := signet read real ((tok OF r)[i], name) OD;
+      v
+   END;
+
+PROC signet get ints = (STRING name) [] INT:
+   BEGIN
+      SIGNETREC r = signet get (name, "v", "a vector of numbers");
+      IF type OF r = "vector::text" OR type OF r = "vector::bool" THEN
+         signet fail ("input " + name + " is " + type OF r + ", not a vector of numbers")
+      FI;
+      [UPB tok OF r] INT v;
+      FOR i TO UPB v DO v[i] := signet read int ((tok OF r)[i]) OD;
+      v
+   END;
+
+PROC signet get texts = (STRING name) [] STRING:
+   BEGIN
+      SIGNETREC r = signet get (name, "v", "a vector of text");
+      IF type OF r /= "vector::text" THEN signet fail ("input " + name + " is " + type OF r + ", not a vector of text") FI;
+      [UPB tok OF r] STRING v;
+      FOR i TO UPB v DO v[i] := signet unescape ((tok OF r)[i]) OD;
+      v
+   END;
+
+PROC signet get compls = (STRING name) [] COMPL:
+   BEGIN
+      SIGNETREC r = signet get (name, "vc", "a vector of complex numbers");
+      [UPB tok OF r OVER 2] COMPL v;
+      FOR i TO UPB v DO
+         v[i] := signet read real ((tok OF r)[2 * i - 1], name) I signet read real ((tok OF r)[2 * i], name)
+      OD;
+      v
+   END;
+
+PROC signet get series = (STRING name) SIGNETSERIES:
+   BEGIN
+      SIGNETREC r = signet get (name, "xs", "a real series");
+      INT k = signet read int (signet tok (r, 2));
+      VOID (signet tok (r, 2 + 2 * k));
+      [k] REAL x, v;
+      FOR i TO k DO
+         x[i] := signet read real ((tok OF r)[2 + i], name);
+         v[i] := signet read real ((tok OF r)[2 + k + i], name)
+      OD;
+      (signet unescape ((tok OF r)[1]), x, v)
+   END;
+
+PROC signet get cseries = (STRING name) SIGNETCSERIES:
+   BEGIN
+      SIGNETREC r = signet get (name, "xc", "a complex series");
+      INT k = signet read int (signet tok (r, 2));
+      VOID (signet tok (r, 2 + 3 * k));
+      [k] REAL x;
+      [k] COMPL v;
+      FOR i TO k DO
+         x[i] := signet read real ((tok OF r)[2 + i], name);
+         v[i] := signet read real ((tok OF r)[1 + k + 2 * i], name) I signet read real ((tok OF r)[2 + k + 2 * i], name)
+      OD;
+      (signet unescape ((tok OF r)[1]), x, v)
+   END;
+
+# Outputs. The type is optional ("" for the default); a float type turns whole numbers into floats. #
+PROC signet put real = (STRING name, REAL v, STRING type) VOID:
+   signet emit (name, signet json real (v), signet type (type, "float"));
+
+PROC signet put int = (STRING name, INT v, STRING type) VOID:
+   signet emit (name, signet json int (v, type), signet type (type, "int"));
+
+PROC signet put bool = (STRING name, BOOL v, STRING type) VOID:
+   signet emit (name, (v | "true" | "false"), signet type (type, "bool"));
+
+PROC signet put text = (STRING name, STRING v, STRING type) VOID:
+   signet emit (name, signet json text (v), signet type (type, "text"));
+
+PROC signet put compl = (STRING name, COMPL v, STRING type) VOID:
+   signet emit (name, "{""re"":" + signet json real (RE v) + ",""im"":" + signet json real (IM v) + "}",
+                signet type (type, "complex"));
+
+PROC signet put reals = (STRING name, [] REAL v, STRING type) VOID:
+   signet emit (name, signet json reals (v), signet type (type, "vector::float"));
+
+PROC signet put ints = (STRING name, [] INT v, STRING type) VOID:
+   BEGIN
+      STRING s := "[";
+      FOR i FROM LWB v TO UPB v DO s +:= (i > LWB v | "," | "") + signet json int (v[i], type) OD;
+      signet emit (name, s + "]", signet type (type, "vector::int"))
+   END;
+
+PROC signet put texts = (STRING name, [] STRING v, STRING type) VOID:
+   BEGIN
+      STRING s := "[";
+      FOR i FROM LWB v TO UPB v DO s +:= (i > LWB v | "," | "") + signet json text (v[i]) OD;
+      signet emit (name, s + "]", signet type (type, "vector::text"))
+   END;
+
+PROC signet put compls = (STRING name, [] COMPL v, STRING type) VOID:
+   signet emit (name, signet json compls (v), signet type (type, "vector::complex"));
+
+PROC signet put series = (STRING name, SIGNETSERIES s, STRING type) VOID:
+   signet emit (name, "{""domain"":" + signet json text (domain OF s) + ",""x"":" + signet json reals (x OF s)
+                + ",""values"":" + signet json reals (values OF s) + "}",
+                signet type (type, "series::" + domain OF s + "::float"));
+
+PROC signet put cseries = (STRING name, SIGNETCSERIES s, STRING type) VOID:
+   signet emit (name, "{""domain"":" + signet json text (domain OF s) + ",""x"":" + signet json reals (x OF s)
+                + ",""values"":" + signet json compls (values OF s) + "}",
+                signet type (type, "series::" + domain OF s + "::complex"));
+'''
+
 _HELPER_FILES = lambda: {os.path.join("signet", "__init__.py"): _PY_HELPER, "Signet.jl": _JL_HELPER, "signet.hpp": _CPP_HELPER,
                          "signet.rs": _RS_HELPER, "signet.ads": _ADS_HELPER, "signet.adb": _ADB_HELPER, "signet.f90": _F90_HELPER,
-                         "signet.sh": _SH_HELPER}
+                         "signet.sh": _SH_HELPER, "signet.h": _C_HELPER, "signet.a68": _A68_HELPER}
 _HELPER_DIR = None
 
 
@@ -7401,9 +8747,10 @@ def export_helpers(dest: str) -> list:
 
 # Modules written in compiled languages: Signet builds <module>.cpp, .rs, .adb or .f90 itself, with the
 # helper above on the compiler's search path, and keeps the binary in the cache until the source changes.
-SOURCE_TYPES = {".cpp": "cpp", ".cc": "cpp", ".rs": "rust", ".adb": "ada",
+SOURCE_TYPES = {".c": "c", ".cpp": "cpp", ".cc": "cpp", ".rs": "rust", ".adb": "ada",
                 ".f90": "fortran", ".f95": "fortran", ".f03": "fortran", ".f08": "fortran"}
-_COMPILERS = {"cpp": ("g++", "c++", "clang++"), "rust": ("rustc",), "ada": ("gnatmake",), "fortran": ("gfortran",)}
+SIGNET_TYPES = (".signet", ".sg")      # a module written in Signet
+_COMPILERS = {"c": ("gcc", "cc", "clang"), "cpp": ("g++", "c++", "clang++"), "rust": ("rustc",), "ada": ("gnatmake",), "fortran": ("gfortran",)}
 _BUILD_TIMEOUT = 600          # seconds for one compile
 _NEIGHBOURS = (".h", ".hpp", ".hh", ".ads", ".adb", ".rs", ".inc") + tuple(SOURCE_TYPES)
 _TOOL_IDS = {}
@@ -7495,7 +8842,9 @@ def build_module(path: str, log=None) -> list:
     tmp = tempfile.mkdtemp(dir=base, prefix="build-")
     try:
         exe = os.path.join(tmp, "module")
-        if lang == "cpp":
+        if lang == "c":
+            cmd = [cc, "-O2", "-std=c11", "-I", helpers, "-I", srcdir, path, "-o", exe, "-lm"]
+        elif lang == "cpp":
             cmd = [cc, "-O2", "-std=c++17", "-I", helpers, "-I", srcdir, path, "-o", exe]
         elif lang == "rust":
             crate = re.sub(r"\W", "_", stem)
@@ -7519,23 +8868,59 @@ def build_module(path: str, log=None) -> list:
 
 
 # The standalone runner: python3 signet.py runner.signet
-_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia"}
+_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia", ".a68": "a68g"}
+
+
+def a68_source(path: str) -> str:
+    """The file a68g runs for an ALGOL 68 module: the helper on one line, then the module on that same line,
+    so a68g's line numbers are the module's own. Kept under the cache, one per module version."""
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    helper = " ".join(_A68_HELPER.split("\n"))
+    tag = hashlib.sha256((helper + text).encode()).hexdigest()[:16]
+    out = os.path.join(_cache_base(), "a68", f"{os.path.splitext(os.path.basename(path))[0]}-{tag}.a68")
+    if not os.path.isfile(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        tmp = f"{out}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(helper + " " + text)
+        os.replace(tmp, out)
+    return out
 
 
 # Ports: what a module declares it reads and writes, and the wiring checked against it
 _PORT_LINE = re.compile(r"^[ \t]*(?:#|//|--|!)[ \t]*signet:[ \t]*(.*)$", re.M | re.I)
-_PORT_ITEM = re.compile(r"(in|out)\s+((?:[A-Za-z0-9_]+::)*)([A-Za-z_][A-Za-z0-9_]*)$", re.I)
+_PORT_BLOCK = re.compile(r"^[ \t]*comment[ \t]*$(.*?)^[ \t]*end[ \t]+comment[ \t]*$", re.M | re.S | re.I)
+_PORT_BARE = re.compile(r"^[ \t]*signet:[ \t]*(.*)$", re.M | re.I)
+_PORT_ITEM = re.compile(r"(in|out)\s+((?:[A-Za-z0-9_]+::)*)([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*(\S.*?))?$", re.I)
 
 
 def read_ports(text: str):
     """A module's declared ports from its `signet: in float::volts, out float::watts` comment lines
-    (after #, //, -- or !): {"in": {name: words}, "out": {name: words}}, or None if it declares none.
+    (after #, //, -- or !): {"in": {name: words}, "out": {name: words}, "default": {name: input entry}}, or None if
+    it declares none. An input given a value, `in float::c = 0.0`, is optional: unconnected, it gets that value.
     Raises ValueError for a bad declaration."""
     lines = _PORT_LINE.findall(text)
+    for block in _PORT_BLOCK.findall(text):        # in a comment block, signet: lines need no comment mark,
+        decl = None                                 # and one ending in a comma goes on to the next line
+        for ln in block.splitlines():
+            m = _PORT_BARE.match(ln)
+            if decl is not None and decl.rstrip().endswith(","):
+                decl += " " + ln.strip()
+            elif m:
+                if decl is not None:
+                    lines.append(decl)
+                decl = m.group(1)
+            elif decl is not None:
+                lines.append(decl)
+                decl = None
+        if decl is not None:
+            lines.append(decl)
     if not lines:
         return None
-    ports = {"in": {}, "out": {}}
+    ports = {"in": {}, "out": {}, "default": {}}
     for line in lines:
+        line = re.sub(r"\s*#\s*$", "", line)       # ALGOL 68: # signet: in float::volts #
         for item in (s.strip() for s in line.split(",")):
             m = _PORT_ITEM.match(item)
             if not m:
@@ -7546,6 +8931,17 @@ def read_ports(text: str):
             if name in _RESERVED_PORTS:
                 raise ValueError(f"{name} can't be a port name")
             ports[way][name] = words
+            if m.group(4) is not None:
+                if way == "out":
+                    raise ValueError(f"output {name} can't have a default: only an input can")
+                sv = _param_value(m.group(4), f"default of {name}")
+                try:
+                    sv = _typed(words, sv, 0) if words else sv
+                except SignalError as e:
+                    raise ValueError(f"default of {name}: {str(e).split(': ', 1)[-1]}")
+                if words == ["float"] and type(sv.value) is int:
+                    sv = _SV(float(sv.value), "float", sv.source)
+                ports["default"][name] = {"value": sv.value, "type": sv.type or infer_type(sv.value), "source": sv.source}
     return ports
 
 
@@ -7687,13 +9083,21 @@ def check_wiring(code, ports=lambda m: None, is_file=lambda t: False) -> list:
     return sorted(set(errors), key=lambda s: int(s.split()[1].rstrip(":")))
 
 
+def with_defaults(ports, inputs: dict) -> dict:
+    """The inputs for a run, with the default of each optional input left unconnected."""
+    out = dict(inputs or {})
+    for port, entry in (ports or {}).get("default", {}).items():
+        out.setdefault(port, dict(entry))
+    return out
+
+
 def contract_errors(module: str, ports, inputs=None, written=None) -> list:
     """Run-time checks against a module's declared ports: before a run (inputs), after it (written .sig names)."""
     if not ports:
         return []
     errs = []
     if inputs is not None:
-        missing = sorted(set(ports["in"]) - set(inputs))
+        missing = sorted(set(ports["in"]) - set(inputs) - set(ports.get("default", {})))
         extra = sorted(set(inputs) - set(ports["in"]))
         for port, v in sorted(inputs.items()):       # a vector is never a range, nor a range a vector
             want, got = ports["in"].get(port) or [], str(v.get("type") or "").split("::")
@@ -7829,7 +9233,7 @@ class FolderHost:
 
     def _hits(self, module):
         return [n for n in sorted(os.listdir("."))
-                if n != "signet.py" and os.path.isfile(n) and (n in (module + e for e in (*_INTERPRETERS, *SOURCE_TYPES, ".signet"))
+                if n != "signet.py" and os.path.isfile(n) and (n in (module + e for e in (*_INTERPRETERS, *SOURCE_TYPES, *SIGNET_TYPES))
                                                                or (n == module and os.access(n, os.X_OK)))]
 
     @staticmethod
@@ -7866,8 +9270,9 @@ class FolderHost:
             ports = self._file_ports(name)
         except ValueError as e:
             raise RuntimeError(str(e))
-        self._contract(module, ports, inputs=inputs or {})
-        if name.endswith(".signet"):
+        inputs = with_defaults(ports, inputs)
+        self._contract(module, ports, inputs=inputs)
+        if name.endswith(SIGNET_TYPES):
             return self._run_signet(module, name, inputs, ports)
         argv = [os.path.join(".", name)]
         interp = _INTERPRETERS.get(os.path.splitext(name)[1])
@@ -7877,7 +9282,7 @@ class FolderHost:
             found = shutil.which(interp)
             if not found:
                 raise LookupError(f"{interp} not found on PATH (needed to run {name})")
-            argv.insert(0, found)
+            argv = [found, "--quiet", a68_source(name)] if interp == "a68g" else [found] + argv
         inputs_path = f"{module}.inputs.json"
         write_inputs(inputs_path, inputs)
         before = self._files()
@@ -7899,6 +9304,8 @@ class FolderHost:
             return
         try:
             code = subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, timeout=self.timeout).returncode
+            if interp == "a68g" and code == -signal.SIGTERM:
+                code = 2                # the ALGOL 68 helper's way to stop with an error
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"{module} timed out after {self.timeout} s")
         self._ended(module, code, ports, before, (), inputs or {}, name)
@@ -7940,12 +9347,13 @@ class FolderHost:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="signet", description="Run a .signet file in the current folder.")
-    ap.add_argument("file", nargs="?", help="the .signet file")
+    ap = argparse.ArgumentParser(prog="signet", description="Run a .signet (or .sg) file in the current folder.")
+    ap.add_argument("file", nargs="?", help="the .signet or .sg file")
     ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE", help="a parameter for $NAME")
     ap.add_argument("--check", action="store_true", help="only read the file and report bad lines")
-    ap.add_argument("--lineage", metavar="SIG", help="show the chain that made a Signal in this folder, and stop")
-    ap.add_argument("--export-helpers", metavar="DIR", help="write the module helpers (Python, Julia, shell, C++, Rust, Ada, Fortran) into DIR and stop")
+    ap.add_argument("--lineage", metavar="SIG", help="show the chain that made a Signal (name.sig or name!) in this folder, and stop")
+    ap.add_argument("--export-helpers", metavar="DIR", help="write the module helpers (Python, Julia, shell, C, C++, Rust, Ada, Fortran, ALGOL 68) into DIR and stop")
+    ap.add_argument("--connections", action="store_true", help="print the file's connect()s as JSON, without running it, and stop")
     ap.add_argument("--version", action="version", version=f"signet {VERSION} (API {API})")
     a = ap.parse_args(argv)
     if a.export_helpers:
@@ -7953,6 +9361,8 @@ def main(argv=None) -> int:
             print(p)
         return 0
     if a.lineage:
+        if a.lineage.endswith("!"):              # name! is name.sig, as in code
+            a.lineage = a.lineage[:-1] + ".sig"
         if not os.path.isfile(a.lineage):
             print(f"no Signal {a.lineage} here", file=sys.stderr)
             return 1
@@ -7960,13 +9370,20 @@ def main(argv=None) -> int:
         print("\n".join(lines))
         return 0 if lines and ", stamp ok" in lines[0] else 1
     if not a.file:
-        ap.error("give a .signet file")
+        ap.error("give a .signet or .sg file")
     try:
         with open(a.file, encoding="utf-8") as f:
             code = f.read()
     except OSError as e:
         print(f"can't read {a.file}: {e.strerror}", file=sys.stderr)
         return 1
+    if a.connections:            # For tools such as visualizer.py, which can't import a binary
+        try:
+            print(json.dumps(connections(code, points=True)))
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 1
+        return 0
     params = {}
     for p in a.param:
         name, eq, value = p.partition("=")
@@ -7976,7 +9393,9 @@ def main(argv=None) -> int:
         params[name.strip()] = value
     try:
         host = FolderHost(params)
-        wiring = check_wiring(parse_signals(code), host.module_ports, os.path.isfile)
+        ports = read_ports(code) or {}             # a module's own inputs are known names when it is checked
+        tree = parse_signals(code, tuple(ports.get("in", {})) if a.check else ())
+        wiring = check_wiring(tree, host.module_ports, os.path.isfile)
         if wiring:
             raise ValueError("\n".join(wiring))
         if a.check:
