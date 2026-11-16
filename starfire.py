@@ -2,8 +2,8 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-10-29
-# VERSION:        4.1.0
+# UPDATED:        2026-11-09
+# VERSION:        4.5.0 (ALTAIR)
 #
 
 """
@@ -1020,6 +1020,11 @@ def _point_file_pattern(campaign_id: str, card_id: str):
     return re.compile(r"^" + re.escape(_point_prefix(campaign_id, card_id)) + r"-(\d+)(?:-[^/]*)?\.(?!tmp\Z)[A-Za-z0-9]+$")   # not a .tmp: a helper's file before its rename
 
 
+def _is_inputs_file(name: str) -> bool:
+    """A run's .inputs.json / .inputs.txt: Signet's own hand-off to the module, not shown on the point."""
+    return name.endswith((".inputs.json", ".inputs.txt"))
+
+
 def list_point_files(campaign_id: str, card_id: str, attached: dict = None) -> dict:
     """{seq: [{"name", "kind"}]}. With `attached` ({seq: [names]}, a point's own list) it
     returns those that are files of this card. Without it, every file in the working folder
@@ -1028,7 +1033,7 @@ def list_point_files(campaign_id: str, card_id: str, attached: dict = None) -> d
     if attached is not None:
         for seq, names in attached.items():
             for n in names if isinstance(names, list) else []:
-                if _own_file(campaign_id, card_id, n):
+                if _own_file(campaign_id, card_id, n) and not _is_inputs_file(n):
                     f = {"name": n, "kind": _file_kind(n)}
                     if f["kind"] == "csv":
                         f["cols"] = csv_y_columns(_cwd_file(n))
@@ -1042,7 +1047,7 @@ def list_point_files(campaign_id: str, card_id: str, attached: dict = None) -> d
         return out
     for n in names:
         m = pat.match(n)
-        if m and os.path.isfile(n):
+        if m and os.path.isfile(n) and not _is_inputs_file(n):
             out.setdefault(m.group(1), []).append({"name": n, "kind": _file_kind(n)})
     return out
 
@@ -1629,7 +1634,7 @@ _RESERVED_MODULES = {"starfire"}
 # A file with one of these extensions is run by its interpreter, so it needs
 # no execute bit or shebang. Anything else must be an executable file (a
 # compiled binary, or a script with a shebang and chmod +x) and is run directly.
-_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia", ".signet": ""}   # .signet runs inside Starfire, no interpreter
+_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia", ".signet": "", ".sg": ""}   # Signet runs inside Starfire, no interpreter
 _MODULE_TIMEOUT_S = 3600      # a module may legitimately run a whole test
 _MODULE_OUTPUT_LINES = 4096   # output lines kept; a longer run keeps its first and last half
 _RUNS: dict = {}              # (card, point) -> running Popen, so BREAK can find it
@@ -1657,7 +1662,7 @@ def _is_module(d: str, name: str) -> bool:
 
 def list_modules() -> list:
     """Names of runnable files in dist/: regular, not hidden, not Starfire's
-    own, and either an interpreted type (.py, .sh, .jl, .signet), a source Signet builds (.cpp, .rs, .adb, .f90)
+    own, and either an interpreted type (.py, .sh, .jl, .signet, .sg), a source Signet builds (.cpp, .rs, .adb, .f90)
     or executable."""
     d = _modules_dir()
     try:
@@ -1779,14 +1784,14 @@ class _PointHost:
         self.params = {k.lower(): v for k, v in params}
         self.pts = pts if isinstance(pts, dict) else {}   # the card's points, for a sequence box
         self.lines = []    # echo output, shown above the module's own
-        self.point = None  # set for a module's own run, so input() can find the point's sequence
+        self.point = None  # set for a module's own run, so listen() can find the point's sequence
 
     def ask(self, prompt, type_name):
-        # input(): only a sequence has someone to ask (its point's page); the point's own run shares its answers
+        # listen(): only a sequence has someone to ask (its point's page); the point's own run shares its answers
         with _RUNS_LOCK:
             r = (_JOBS.get((self.card, self.point)) or {}).get("runner")   # the job's, so a sequence that ended still answers
         if r is None:
-            raise LookupError("input needs a sequence: in Starfire, only a sequence asks, on its point's page")
+            raise LookupError("listen needs a sequence: in Starfire, only a sequence asks, on its point's page")
         return r.ask("run", prompt, type_name)
 
     def resolve(self, text):
@@ -2333,7 +2338,7 @@ def _point_files_state(campaign_id: str, card_id: str, point_seq) -> dict:
     try:
         for n in os.listdir(os.getcwd()):
             m = pat.match(n)
-            if m and m.group(1) == str(point_seq) and os.path.isfile(n):
+            if m and m.group(1) == str(point_seq) and os.path.isfile(n) and not _is_inputs_file(n):
                 st = os.stat(n)
                 state[n] = (st.st_mtime_ns, st.st_size)
     except OSError:
@@ -2450,7 +2455,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     except ValueError as e:
         return {"status": "failed", "error": f"bad parameters: {e}"}
     argv = [os.path.join(_modules_dir(), name)]
-    in_signet = name.endswith(".signet")
+    in_signet = name.endswith((".signet", ".sg"))
     if in_signet and not signet:
         return {"status": "failed", "error": f"{_NO_SIGNET} (needed to run {name})"}
     interpreter = _INTERPRETERS.get(os.path.splitext(name)[1])
@@ -2596,7 +2601,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     return result
 
 class _Finished:
-    """The stand-in for a process when a module ran inside Starfire (a .signet): already over."""
+    """The stand-in for a process when a module ran inside Starfire (a .signet or .sg): already over."""
 
     def __init__(self, returncode):
         self.returncode = returncode
@@ -2730,7 +2735,7 @@ class _SeqRunner:
         self.points = self.seq.points
         self.status = signet.Status("waiting", "", "", None, [])
         self.log_name = f"{_point_prefix(campaign_id, key[0])}-{key[1]}-sequence.log"
-        # input(): one question at a time, shown on the point's page. The point's own run reads the same top-level
+        # listen(): one question at a time, shown on the point's page. The point's own run reads the same top-level
         # lines as the sequence, so each asker takes answers in order and an answer given once serves both.
         self.question, self.answers, self.asked, self.stopping = None, [], {"run": 0, "seq": 0}, ""
         self.asking = threading.Condition()
