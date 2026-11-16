@@ -443,6 +443,8 @@
 .sy-line.bus { stroke-width: 4; }
 .sy-line.amber { stroke: var(--amb); }
 .sy-line.dim { stroke: var(--amb); opacity: .4; }
+.sy-line.stepped { stroke-dasharray: 6 4; }     /* a stepped loop's value from the pass before */
+.sy-arrowhead { fill: var(--amb); }
 .sy-hit { fill: none; stroke: transparent; stroke-width: 12; }
 .sy-link { cursor: pointer; }
 .sy-link:hover .sy-line, .sy-link.sel .sy-line { stroke-width: 3.5; }
@@ -451,6 +453,7 @@
 .sy-legend i, .sy-swatch { display: inline-block; width: 22px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 8px; }
 .sy-legend i.amber, .sy-swatch.amber { border-color: var(--amb); }
 .sy-legend i.dim, .sy-swatch.dim { border-color: var(--amb); opacity: .4; }
+.sy-legend i.stepped { border-top-style: dashed; }
 .sy-legend i.box { height: 10px; width: 16px; border: 1.5px solid rgb(0 119 200 / .55); border-radius: 3px; margin-left: 3px; margin-right: 11px; }
 .sy-legend i.box.ok { border-color: var(--ebl); }
 .sy-legend i.box.failed { border-color: var(--rd); }
@@ -528,3 +531,73 @@
 .btn.pin-toggle.on { color: var(--amb); border-color: var(--amb); }
 /* Test Report: a point's parameters on one line, wrapping to two at most, then "..." */
 .report-doc .rp-params { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* ---- Mono mode: one ink on one paper (black on white by default), for screenshots and black-and-white reports. No grey, no transparency:
+   states that colour carries elsewhere become line styles, weight, inversion or symbols. ---- */
+[data-theme="mono"] {
+  --ink:#000; --paper:#fff;      /* the two colours of mono mode: set --ink to any colour, e.g. red or NVIS green */
+  --bg:var(--paper); --panel:var(--paper); --hi:var(--paper); --stroke:var(--ink); --stroke-hi:var(--ink);
+  --nw:var(--ink); --yl:var(--ink); --rd:var(--ink); --bl:var(--ink); --ebl:var(--ink); --amb:var(--ink); --nvg:var(--ink);
+  --magenta:var(--ink); --pu:var(--ink); --ind:var(--ink); --gar:var(--ink); --dim:var(--ink); --faint:var(--ink);
+}
+[data-theme="mono"] ::selection { background: var(--ink); color: var(--paper); }
+[data-theme="mono"] .sig-wrap textarea::selection { background: transparent; }
+[data-theme="mono"] #modTable select { background-image: linear-gradient(45deg, transparent 50%, var(--ink) 50%),
+  linear-gradient(135deg, var(--ink) 50%, transparent 50%); background-size: 5px 5px, 5px 5px;
+  background-position: right 14px center, right 9px center; }
+/* Disabled: dashed instead of faded. */
+[data-theme="mono"] input:disabled, [data-theme="mono"] textarea:disabled, [data-theme="mono"] select:disabled,
+[data-theme="mono"] .btn:disabled, [data-theme="mono"] .sr-item .btn:disabled { opacity: 1; border-style: dashed; }
+[data-theme="mono"] .sig-wrap:has(textarea:disabled) .sig-hl { opacity: 1; }
+[data-theme="mono"] .pt-module label.conn-box.off { text-decoration: line-through; }
+/* Hover, focus and the active tab: a heavier edge. */
+[data-theme="mono"] .btn:hover, [data-theme="mono"] .btn:active, [data-theme="mono"] input:focus,
+[data-theme="mono"] select:focus, [data-theme="mono"] textarea:focus { box-shadow: inset 0 0 0 1px var(--ink); }
+[data-theme="mono"] .btn:disabled:hover { box-shadow: none; }
+[data-theme="mono"] .tab-btn.active { font-weight: 700; box-shadow: inset 0 3px 0 var(--ink); }
+/* On / flagged: inverted. */
+[data-theme="mono"] .flag-btn.flagged, [data-theme="mono"] .btn.pin-toggle.on, [data-theme="mono"] .btn.btn-plot.on,
+[data-theme="mono"] .report-btns .btn.on, [data-theme="mono"] .pin-btn.active { background: var(--ink); color: var(--paper); }
+[data-theme="mono"] .pt-card.flagged { box-shadow: 0 0 0 2px var(--ink); }
+[data-theme="mono"] .pt-card.flagged .pt-head input.seq { font-weight: 700; border-width: 3px; }
+[data-theme="mono"] .live-tick:has(input:checked) { font-weight: 700; }
+/* Connections: a symbol for each state. */
+[data-theme="mono"] .st-on::before, [data-theme="mono"] .pt-module label.conn-box.on::before { content: "\2713 "; }
+[data-theme="mono"] .st-warn::before { content: "\26A0 "; }
+[data-theme="mono"] .st-bad::before, [data-theme="mono"] .pt-module label.conn-box.bad::before { content: "\2717 "; }
+/* Errors and warnings: bold, with a warning sign where it fits. */
+[data-theme="mono"] .calc-out.err, [data-theme="mono"] .pt-cam-msg, [data-theme="mono"] #warningsList textarea,
+[data-theme="mono"] .module-status.failed, [data-theme="mono"] .sy-errors { font-weight: 700; }
+[data-theme="mono"] .sy-errors > div::before { content: "\26A0 "; }
+/* Signals box, as code is set in the book: keywords bold, comments italic. */
+[data-theme="mono"] .sg-k { font-weight: 700; }
+[data-theme="mono"] .sg-c { font-style: italic; }
+/* Report previews: quality by border style; the active point framed. */
+[data-theme="mono"] .report-doc.preview .rp-b-pass { border-style: solid; }
+[data-theme="mono"] .report-doc.preview .rp-b-caution { border-style: dashed; border-width: 2px; }
+[data-theme="mono"] .report-doc.preview .rp-b-fail { border-width: 3px; }
+[data-theme="mono"] .report-doc.preview .rp-b-rfi { border-style: dotted; border-width: 2px; }
+[data-theme="mono"] .report-doc.preview .rp-point.rp-active { box-shadow: 0 0 0 2px var(--ink); }
+[data-theme="mono"] .report-doc.preview th { font-weight: 700; }
+[data-theme="mono"] .report-doc.preview .rp-warn { font-weight: 700; }
+/* Plots: traces by dash pattern; legend names underlined to match. */
+[data-theme="mono"] .rp-plot polyline { stroke: var(--ink) !important; fill: none; }
+[data-theme="mono"] .rp-plot circle, [data-theme="mono"] .rp-plot tspan, [data-theme="mono"] .rp-plot text { fill: var(--ink) !important; }
+[data-theme="mono"] .rp-plot line { stroke: var(--ink); }
+[data-theme="mono"] .rp-plot polyline.s1 { stroke-dasharray: 6 3; }
+[data-theme="mono"] .rp-plot polyline.s2 { stroke-dasharray: 2 3; }
+[data-theme="mono"] .rp-plot polyline.s3 { stroke-dasharray: 8 3 2 3; }
+[data-theme="mono"] .rp-plot tspan.s1 { text-decoration: underline dashed; }
+[data-theme="mono"] .rp-plot tspan.s2 { text-decoration: underline dotted; }
+[data-theme="mono"] .rp-plot tspan.s3 { text-decoration: underline double; }
+/* System diagram: not run 1 px, run OK 2 px, failed 4 px, outside the card dashed;
+   a line with data solid, without data dotted, from the pass before long dashes. */
+[data-theme="mono"] .sy-box rect { stroke: var(--ink); stroke-opacity: 1; stroke-width: 1; }
+[data-theme="mono"] .sy-box.ok rect { stroke-width: 2; }
+[data-theme="mono"] .sy-box.failed rect { stroke-width: 4; }
+[data-theme="mono"] .sy-line.dim { opacity: 1; stroke-dasharray: 2 3; }
+[data-theme="mono"] .sy-line.stepped { stroke-dasharray: 6 4; }
+[data-theme="mono"] .sy-legend i.dim, [data-theme="mono"] .sy-swatch.dim { opacity: 1; border-top-style: dotted; }
+[data-theme="mono"] .sy-legend i.box { border: 1px solid var(--ink); }
+[data-theme="mono"] .sy-legend i.box.ok { border-width: 2px; }
+[data-theme="mono"] .sy-legend i.box.failed { border-width: 4px; }
