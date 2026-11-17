@@ -78,12 +78,13 @@
   .pt-measure, .pt-module { margin-top: 20px; box-sizing: border-box; }
   .pt-module label { display: block; font-size: 11px; color: var(--dim); margin-bottom: 3px; }
   /* A module's text color is its language: green = binary, amber = .py, blue = .jl,
-     white = .sh, purple = .signet, red = anything else. Two classes, to beat .editor-doc select/option. */
+     white = .sh, indigo = .a68, purple = .signet, magenta = a source Signet builds, red = anything else. Two classes, to beat .editor-doc select/option. */
   .editor-doc .mod-bin { color: var(--nvg); }
   .editor-doc .mod-py { color: var(--amb); }
   .editor-doc .mod-jl { color: var(--bl); }
   .editor-doc .mod-sh { color: var(--nw); }
   .editor-doc .mod-sg { color: var(--pu); }
+  .editor-doc .mod-a68 { color: var(--ind); }
   .editor-doc .mod-src { color: var(--magenta); }
   .editor-doc .mod-other { color: var(--rd); }
   /* The native dropdown arrow takes the select's text color, so the arrow is
