@@ -2,8 +2,8 @@
 
 # starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-11-09
-# VERSION:        4.5.0 (ALTAIR)
+# UPDATED:        2026-11-17
+# VERSION:        4.6.0 (BELLATRIX)
 #
 
 """
@@ -1630,12 +1630,13 @@ def _read_static(name: str) -> str:
 # campaign's Modules table; a test point's Activate button runs one.
 
 # Starfire's own files live in dist/ too; none of them is a module.
-_RESERVED_MODULES = {"starfire"}
+_RESERVED_MODULES = {"starfire", "starfire.exe"}
 # A file with one of these extensions is run by its interpreter, so it needs
 # no execute bit or shebang. Anything else must be an executable file (a
-# compiled binary, or a script with a shebang and chmod +x) and is run directly.
-_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia", ".signet": "", ".sg": ""}   # Signet runs inside Starfire, no interpreter
-_MODULE_TIMEOUT_S = 3600      # a module may legitimately run a whole test
+# compiled binary, or a script with a shebang and chmod +x; a .exe on Windows) and is run directly.
+_INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia", ".a68": "a68g", ".signet": "", ".sg": ""}   # Signet runs inside Starfire, no interpreter
+_WINDOWS = os.name == "nt"
+_MODULE_TIMEOUT_S = int(os.environ.get("STARFIRE_MODULE_TIMEOUT") or 3600)   # a module may legitimately run a whole test
 _MODULE_OUTPUT_LINES = 4096   # output lines kept; a longer run keeps its first and last half
 _RUNS: dict = {}              # (card, point) -> running Popen, so BREAK can find it
 _BROKEN: set = set()          # runs a BREAK was sent to
@@ -1657,13 +1658,25 @@ def _is_module(d: str, name: str) -> bool:
     if name in _RESERVED_MODULES or name.startswith(".") or not os.path.isfile(path):
         return False
     ext = os.path.splitext(name)[1]
-    return ext in _INTERPRETERS or (signet and ext.lower() in signet.SOURCE_TYPES) or os.access(path, os.X_OK)
+    if ext in _INTERPRETERS or (signet and ext.lower() in signet.SOURCE_TYPES):
+        return True
+    return ext.lower() == ".exe" if _WINDOWS else os.access(path, os.X_OK)   # X_OK is true for any file on Windows
+
+
+def _interpreter(interp: str):
+    # signet._interpreter's rule, with PyInstaller's sys.frozen: on Windows a frozen Starfire's
+    # sys.executable is Starfire, and python3 is often the Microsoft Store stub.
+    if interp != "python3" or not _WINDOWS:
+        return shutil.which(interp)
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+    return next((p for p in map(shutil.which, ("python", "py", "python3")) if p and "WindowsApps" not in p), None)
 
 
 def list_modules() -> list:
     """Names of runnable files in dist/: regular, not hidden, not Starfire's
-    own, and either an interpreted type (.py, .sh, .jl, .signet, .sg), a source Signet builds (.cpp, .rs, .adb, .f90)
-    or executable."""
+    own, and either an interpreted type (.py, .sh, .jl, .a68, .signet, .sg), a source Signet builds
+    (.c, .cpp, .rs, .adb, .f90, .hs) or executable (.exe on Windows)."""
     d = _modules_dir()
     try:
         names = os.listdir(d)
@@ -2098,10 +2111,10 @@ def signal_value(name: str) -> dict:
     s = signet.series_parts(v) if isinstance(v, dict) else None
     if s:
         vals = v["values"]
-        x = v["x"] if "x" in v else [v["start"] + i * v["step"] for i in range(len(vals["re"] if isinstance(vals, dict) else vals))]
+        x = v["x"] if "x" in v else [v["start"] + i * v["step"] for i in range(len(next(iter(vals.values())) if isinstance(vals, dict) else vals))]
         xl = {"time": "time (s)", "frequency": "frequency (Hz)"}.get(s[0], s[0])
-        if isinstance(vals, dict):
-            series = [(xl, "re", x, vals["re"]), (xl, "im", x, vals["im"])]
+        if isinstance(vals, dict):          # re, im or w, x, y, z: one line each
+            series = [(xl, k, x, vals[k]) for k in vals]
         else:
             series = [(xl, "value", x, vals)]
     elif isinstance(v, list) and v and all(isinstance(c, list) and len(c) == len(v[0]) for c in v) and v[0] \
@@ -2122,15 +2135,21 @@ def signal_value(name: str) -> dict:
     out["scalar"] = not isinstance(v, (list, dict))
     return out
 
+def _hypercomplex_text(q) -> str:
+    # (re, im) as 1+2i, (w, x, y, z) as 1+2i+3j+4k
+    t = ["nan" if c is None else f"{c:.6g}" for c in q]
+    return t[0] + "".join(("" if c.startswith("-") else "+") + c + u for c, u in zip(t[1:], "ijk"))
+
+
 def _head(v, n: int = 5):
     # The first few entries of a vector or series as text, and how many there are.
     f = lambda q: f"{q:.6g}" if isinstance(q, float) else json.dumps(q)
     s = signet.series_parts(v) if isinstance(v, dict) else None
     if s:
         vals = v["values"]
-        ys = [complex(a, b) for a, b in zip(vals["re"], vals["im"])] if isinstance(vals, dict) else vals
+        ys = list(zip(*vals.values())) if isinstance(vals, dict) else vals     # (re, im) or (w, x, y, z)
         xs = v["x"] if "x" in v else [v["start"] + i * v["step"] for i in range(n)]
-        g = lambda q: f"{q.real:.6g}{q.imag:+.6g}i" if isinstance(q, complex) else f(q)
+        g = lambda q: _hypercomplex_text(q) if isinstance(q, tuple) else f(q)
         return [f"{f(x)}: {g(y)}" for x, y in zip(xs[:n], ys[:n])], len(ys)
     if isinstance(v, list):
         return [f(q) for q in v[:n]], len(v)
@@ -2460,10 +2479,13 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         return {"status": "failed", "error": f"{_NO_SIGNET} (needed to run {name})"}
     interpreter = _INTERPRETERS.get(os.path.splitext(name)[1])
     if interpreter:
-        found = shutil.which(interpreter)
+        found = _interpreter(interpreter)
         if not found:
             return {"status": "failed", "error": f"{interpreter} not found on PATH (needed to run {name})"}
-        argv.insert(0, found)
+        if interpreter == "a68g":     # a68g runs Signet's copy: the helper and the module on one line
+            argv = [found, "--quiet", signet.a68_source(argv[0]) if signet else argv[0]]
+        else:
+            argv.insert(0, found)
     argv += extra
     stem = os.path.splitext(name)[0]
     if str(signals or "").strip() and not signet:
@@ -2495,6 +2517,8 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     env = _module_env(card_id, point_seq, campaign_id, param_items, stem,
                       os.path.join(os.getcwd(), inputs_path) if inputs else "")
     env["PYTHONUNBUFFERED"] = "1"   # so a Python module's output reaches its file as it prints
+    if _WINDOWS:
+        env["PYTHONUTF8"] = "1"     # its output file is read as UTF-8, not cp1252
     out_path = _output_path(campaign_id, card_id, point_seq, name)
     key = (str(card_id), str(point_seq))
     started = time.monotonic()
@@ -2502,7 +2526,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
     tests_before = _test_files_state()
     code_out, code_rc = [], 0
     if signet and os.path.splitext(name)[1].lower() in signet.SOURCE_TYPES:
-        # C++, Rust, Ada or Fortran source: Signet builds it (once per change, cached) and gives the program to run
+        # A source (C, C++, Rust, Ada, Fortran, Haskell): Signet builds it (once per change, cached) and gives the program to run
         try:
             argv = signet.build_module(argv[0], log=lambda t: host.lines.append("signet: " + t)) + extra
         except (LookupError, RuntimeError, OSError) as e:
@@ -2543,9 +2567,10 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
             proc = _Finished(code_rc)
         else:
             try:
-                # Own session, so a timeout or BREAK can take down the module's children too.
+                # Own session (process group on Windows), so a timeout or BREAK can take down the module's children too.
+                group = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _WINDOWS else {"start_new_session": True}
                 proc = subprocess.Popen(argv, cwd=os.getcwd(), env=env, stdout=out_file, stderr=subprocess.STDOUT,
-                                        stdin=subprocess.DEVNULL, start_new_session=True)
+                                        stdin=subprocess.DEVNULL, **group)
             except OSError as e:
                 out_file.close()
                 return {"status": "failed", "error": f"could not start {name}: {e}"}
@@ -2555,7 +2580,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
         proc.wait(timeout=_MODULE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         timed_out = True
-        os.killpg(proc.pid, signal.SIGKILL)
+        _kill_tree(proc, hard=True)
         proc.wait()
     finally:
         out_file.close()
@@ -2956,18 +2981,32 @@ def _break_process(card_id, point_seq, grace: float = 3.0) -> dict:
             return {"success": False, "error": "no module is running on this point"}
         _BROKEN.add(key)
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        _kill_tree(proc, hard=False)
     except ProcessLookupError:
         return {"success": True}
 
     def _kill():
         if proc.poll() is None:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                _kill_tree(proc, hard=True)
             except ProcessLookupError:
                 pass
     threading.Timer(grace, _kill).start()
     return {"success": True}
+
+
+def _kill_tree(proc, hard: bool):
+    # SIGTERM (or SIGKILL) the module's session. Windows: CTRL_BREAK to its group, or taskkill the whole tree.
+    if not _WINDOWS:
+        os.killpg(proc.pid, signal.SIGKILL if hard else signal.SIGTERM)
+    elif not hard:
+        try:
+            proc.send_signal(signal.CTRL_BREAK_EVENT)
+        except OSError:                  # no console to send it through: force it now
+            _kill_tree(proc, hard=True)
+    else:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
 
 
 def break_module(card_id, point_seq, grace: float = 3.0) -> dict:
@@ -3202,7 +3241,7 @@ class _Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             self._send_json(200, signal_value((qs.get("file") or [""])[0]))
         elif path == "/list_modules":
-            self._send_json(200, {"modules": list_modules()})
+            self._send_json(200, {"modules": list_modules(), "windows": _WINDOWS})
         elif path == "/point_files":
             qs = parse_qs(parsed.query)
             try:
@@ -3511,6 +3550,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
 
+class _Server(ThreadingHTTPServer):
+    allow_reuse_address = not _WINDOWS     # on Windows SO_REUSEADDR lets a second Starfire share the port
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -3528,10 +3571,10 @@ def main() -> int:
 
     url = f"http://localhost:{args.port}"
     try:
-        server = ThreadingHTTPServer(("localhost", args.port), _Handler)
+        server = _Server(("localhost", args.port), _Handler)
     except OSError as e:
         print(f"ERROR: can't listen on port {args.port}: {e.strerror}.")
-        if e.errno == errno.EADDRINUSE:
+        if e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None)):
             print(f"       Starfire (or something else) is already running there: open {url},")
             print("       stop it first, or use --port to pick another.")
         return 1
