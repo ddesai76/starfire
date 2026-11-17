@@ -1,6 +1,6 @@
 # Starfire
 
-**Starfire 4.6.0 (Bellatrix)** is a test design suite for test campaigns, test cards and reports, run in the browser. Test cards are made of test points, and each point can run a **module** (a program in any language) and record its result.
+**Starfire 4.6.0 (Bellatrix)** is a test design suite for test campaigns, test cards and reports, run in the browser. Test cards comprise a series of test points, and each point can run a **module** (a program in any language) and record its result.
 
 Starfire works with [Signet](https://github.com/ddesai76/signet), a coordination language whose code goes in each point's Signals box. A test card's modules and the Signals connecting them make up a **System**, which Starfire draws as a block diagram.
 
