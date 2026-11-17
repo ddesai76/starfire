@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-# signet.py:      SIGNET, A COORDINATION LANGUAGE FOR WIRING MODULES IN ANY LANGUAGE VIA SIGNALS
+# signet.py:      SIGNET PROGRAMMING LANGUAGE
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-11-16
-# VERSION:        26.b.0.1.6
+# UPDATED:        2026-11-17
+# VERSION:        26.b.0.1.7
 #
 
 """
@@ -15,8 +15,8 @@ Standard library only. See Starfire's README.md, Signals and Signet.
 Code runs against a host object (API 2): resolve, param and optionally echo; a Sequence also uses
 point_param, autorun, run, state and break_runs. FolderHost is a complete example.
 
-Module helpers for Python, Julia, shell, C, C++, Rust, Ada, Fortran and ALGOL 68 are inside this file; a module in C, C++, Rust,
-Ada or Fortran is built by Signet itself (build_module), and --export-helpers DIR writes the helpers out.
+Module helpers for Python, Julia, shell, C, C++, Rust, Ada, Fortran, ALGOL 68 and Haskell are inside this file; a module in C,
+C++, Rust, Ada, Fortran or Haskell is built by Signet itself (build_module), and --export-helpers DIR writes the helpers out.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = "26.b.0.1.6"
+VERSION = "26.b.0.1.7"
 API = 2                       # the interface Starfire uses; raised when it changes
 
 _PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -55,10 +55,10 @@ _KEYWORDS = {"let", "where", "connect", "if", "then", "else", "end", "and", "or"
              "when", "within", "by", "finish", "delay", "escape", "complete", "failed", "broken",
              "running", "column", "autorun", "for", "next", "index", "route", "exit", "merge", "interchange", "output",
              "function", "subprocess", "return", "in", "belongs", "befits", "comment", "xor", "lineage", "ex", "ab", "ad",
-             "elseif", "while", "per", "last"}          # elseif, while and per are reserved for a future version
+             "elseif", "while", "per", "last"}          # while and per are reserved for a future version
 _MAX_NEST = 32                  # deepest vector of vectors that can be written
 _TYPE_WORDS = {"int", "float", "real", "num", "bool", "text", "complex", "vector", "series", "bus", "hex", "stream", "tuple",
-               "range", "bits", "fixed", "quaternion", "units"}      # the last three are reserved for a future version
+               "range", "bits", "fixed", "quaternion", "units", "hypercomplex"}      # fixed and units are reserved for a future version
 _RESERVED_PORTS = {"write", "series", "stream", "sta", "lta", "lle", "lla"}
 _AFFIX = {"sta": "ex", "lta": "ab", "lle": "ad"}      # Finnish case endings and the Latin prefixes they stand for
 _SIG_TOKEN = re.compile(r"""
@@ -284,7 +284,7 @@ class _LineParser:
         a = self.unary()
         n = a[2] if a[0] == "typed" else a
         sig = n[0] == "ref" and n[1].endswith(".sig") or n[0] == "pref" and n[2].endswith(".sig")
-        given = n[0] in ("param", "pparam", "num", "imag", "str", "bool", "bits", "hexraw", "vec", "range", "torange") \
+        given = n[0] in ("param", "pparam", "num", "imag", "str", "bool", "bits", "hexraw", "vec", "quat", "range", "torange") \
             or n[0] in ("ref", "pref") and not sig
         if word == "ex" and not sig:
             raise self.err("ex marks a Signal (the elative, out of): such as ex messenger.output.sig")
@@ -375,6 +375,12 @@ class _LineParser:
             if self.kw("then"):
                 self.take()
             node = ("if", self.line, cond)
+        elif self.kw("elseif"):
+            self.take()
+            cond = self.expr()
+            if self.kw("then"):
+                self.take()
+            node = ("elseif", self.line, cond)
         elif self.kw("when"):
             self.take()
             cond, within, by = self.expr(), None, None
@@ -832,6 +838,15 @@ class _LineParser:
         if (kind, text) == ("op", "("):
             self.take()
             a = self.expr()
+            if self.peek() == ("op", ","):          # (w, x, y, z): a quaternion
+                parts = [a]
+                while self.peek() == ("op", ","):
+                    self.take()
+                    parts.append(self.expr())
+                if len(parts) != 4:
+                    raise self.err(f"a quaternion is written (w, x, y, z), got {len(parts)} values")
+                self.expect_op(")")
+                return ("quat",) + tuple(parts)
             self.expect_op(")")
             return a
         if self.kw("true") or self.kw("false"):
@@ -909,6 +924,7 @@ def parse_signals(code: str, inputs=()) -> list:
     root = []
     stack = [(None, root)]
     inside = {"if": "an if", "when": "a when", "for": "a loop", "function": "a function", "subprocess": "a subprocess"}
+    opened = {}                        # an elseif's if -> the line of the if that began the chain
     for node in flat:
         kind, line = node[0], node[1]
         if kind == "if":
@@ -947,6 +963,15 @@ def parse_signals(code: str, inputs=()) -> list:
                 continue
             block[4] = []
             stack[-1] = (block, block[4])
+        elif kind == "elseif":         # an if inside the else, closed by the same end if
+            block = stack[-1][0]
+            if block is None or block[0] != "if" or block[4] is not None:
+                errors.append(f"line {line}: elseif without if")
+                continue
+            inner = ["if", line, node[2], [], None]
+            block[4] = [inner]
+            stack[-1] = (inner, inner[3])
+            opened[id(inner)] = opened.get(id(block), block[1])
         elif kind == "end":
             block = stack[-1][0]
             if node[2] == "":
@@ -962,7 +987,7 @@ def parse_signals(code: str, inputs=()) -> list:
                 errors.append(f"line {line}: let and where can't be inside " + inside[stack[-1][0][0]])
             stack[-1][1].append(node)
     for block, _ in stack[1:]:
-        errors.append(f"line {block[1]}: {block[0]} without {'next' if block[0] == 'for' else 'end ' + block[0]}")
+        errors.append(f"line {opened.get(id(block), block[1])}: {block[0]} without {'next' if block[0] == 'for' else 'end ' + block[0]}")
     names = {n: False for n in inputs}
     funcs = {}                         # name -> (kind, argument count), in order of definition
     scope = {"kind": None, "locals": None, "name": None}
@@ -1206,8 +1231,82 @@ def _complex_depth(v):
     return d if sr is not None and sr == si else None
 
 
+_QPARTS = ("w", "x", "y", "z")
+
+
+def _quat_depth(v):
+    # Depth of a {"w", "x", "y", "z"} value, or None.
+    if not (isinstance(v, dict) and set(v) == set(_QPARTS)):
+        return None
+    d, a = 0, v["w"]
+    while isinstance(a, list):
+        d += 1
+        a = a[0] if a else None
+    shapes = {_real_array(v[k], d) for k in _QPARTS}
+    return d if len(shapes) == 1 and None not in shapes else None
+
+
+class _Q4(tuple):
+    """A quaternion as (w, x, y, z) floats, with Hamilton's product; a real or complex number promotes."""
+    def __new__(cls, q):
+        if isinstance(q, _Q4):
+            return q
+        if isinstance(q, complex):
+            q = (q.real, q.imag, 0.0, 0.0)
+        elif not isinstance(q, (tuple, list)):
+            q = (q, 0.0, 0.0, 0.0)
+        return super().__new__(cls, (float(c) for c in q))
+
+    def __add__(a, b):
+        return _Q4([p + q for p, q in zip(a, _Q4(b))])
+    __radd__ = __add__
+
+    def __neg__(a):
+        return _Q4([-p for p in a])
+
+    def __sub__(a, b):
+        return a + -_Q4(b)
+
+    def __rsub__(a, b):
+        return _Q4(b) - a
+
+    def __mul__(a, b):
+        (w1, x1, y1, z1), (w2, x2, y2, z2) = a, _Q4(b)
+        return _Q4((w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2, w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                    w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2, w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2))
+
+    def __rmul__(a, b):
+        return _Q4(b) * a
+
+    def __abs__(a):
+        return math.sqrt(sum(p * p for p in a))
+
+    def conj(a):
+        return _Q4((a[0], -a[1], -a[2], -a[3]))
+
+    def inv(a):
+        n = sum(p * p for p in a)
+        if n == 0:
+            raise ZeroDivisionError
+        return _Q4([p / n for p in a.conj()])
+
+    def __truediv__(a, b):              # a times the inverse of b
+        return a * _Q4(b).inv()
+
+    def __rtruediv__(a, b):
+        return _Q4(b) * a.inv()
+
+
+def _q4(v) -> _Q4:
+    return _Q4([math.nan if v[k] is None else v[k] for k in _QPARTS])
+
+
+def _qres(q) -> _SV:
+    return _SV({k: None if math.isnan(c) else c for k, c in zip(_QPARTS, q)}, "quaternion")
+
+
 def _series_parts(v):
-    """(domain, kind) of a valid series, kind "float" or "complex", or None."""
+    """(domain, kind) of a valid series, kind "float", "complex" or "quaternion", or None."""
     if not isinstance(v, dict) or not isinstance(v.get("domain"), str) or "values" not in v:
         return None
     dom, vals = v["domain"], v["values"]
@@ -1217,6 +1316,8 @@ def _series_parts(v):
         kind, n = "float", len(vals)
     elif _complex_depth(vals) == 1:
         kind, n = "complex", len(vals["re"])
+    elif _quat_depth(vals) == 1:
+        kind, n = "quaternion", len(vals["w"])
     else:
         return None
     has_x, has_step = "x" in v, ("start" in v or "step" in v)
@@ -1255,6 +1356,9 @@ def infer_type(v) -> str:
         d = _complex_depth(v)
         if d is not None:
             return "vector::" * d + "complex"
+        d = _quat_depth(v)
+        if d is not None:
+            return "vector::" * d + "quaternion"
         s = _series_parts(v)
         if s:
             return f"series::{s[0]}::{s[1]}"
@@ -1280,8 +1384,12 @@ def type_ok(words, sv: _SV) -> bool:
         return True
     if sv.file:
         return len(words) == 1 and w not in _TYPE_WORDS and str(v).lower().endswith("." + w.lower())
-    if w in ("int", "float", "real", "num", "bool", "complex", "bus", "hex", "tuple") and rest:
+    if w in ("int", "float", "real", "num", "bool", "complex", "bus", "hex", "tuple", "quaternion", "hypercomplex") and rest:
         return False
+    if w == "quaternion":
+        return _quat_depth(v) == 0
+    if w == "hypercomplex":            # a real, complex or quaternion number
+        return v is None or _is_num(v) or isinstance(v, Hex) or _complex_depth(v) == 0 or _quat_depth(v) == 0
     if w == "tuple":
         return isinstance(v, list) and sv.type in ("", "tuple")
     if w == "bits":
@@ -1316,14 +1424,18 @@ def type_ok(words, sv: _SV) -> bool:
             return _complex_depth(v) == k
         if words[k:] == ["num"] and isinstance(v, dict):
             return _complex_depth(v) == k
+        if words[k:] == ["quaternion"]:
+            return _quat_depth(v) == k
+        if words[k:] == ["hypercomplex"] and isinstance(v, dict):
+            return k in (_complex_depth(v), _quat_depth(v))
         return isinstance(v, list) and all(type_ok(rest, _SV(e)) for e in v)
     if w == "series":
         s = _series_parts(v)
         if not s:
             return False
         for r in rest:
-            if r in ("float", "real", "complex", "num"):
-                if r == "num":
+            if r in ("float", "real", "complex", "num", "quaternion", "hypercomplex"):
+                if r == "hypercomplex" or r == "num" and s[1] != "quaternion":
                     continue
                 if (r if r != "real" else "float") != s[1]:
                     return False
@@ -1447,8 +1559,26 @@ def _complex_arith(op, a: _SV, b: _SV, line: int) -> _SV:
     return _SV({"re": part(r.real), "im": part(r.imag)}, "complex")
 
 
+def _hyper(sv: _SV, who: str, line: int) -> _Q4:
+    """A real, complex or quaternion number as a _Q4."""
+    if sv.type == "quaternion" and _quat_depth(sv.value) == 0:
+        return _q4(sv.value)
+    try:
+        return _Q4(_real_or_complex(who, sv, line))
+    except SignalError:
+        raise SignalError(line, f"{who} needs numbers, got {_show_type(sv)}")
+
+
+def _quat_arith(op, a: _SV, b: _SV, line: int) -> _SV:
+    x, y = _hyper(a, op, line), _hyper(b, op, line)
+    try:
+        return _qres(x + y if op == "+" else x - y if op == "-" else x * y if op == "*" else x / y)
+    except ZeroDivisionError:
+        raise SignalError(line, "division by zero")
+
+
 def _is_vec(sv: _SV) -> bool:
-    return isinstance(sv.value, list) or (sv.type == "vector::complex" and isinstance(sv.value, dict))
+    return isinstance(sv.value, list) or (sv.type in ("vector::complex", "vector::quaternion") and isinstance(sv.value, dict))
 
 
 def _is_array(sv: _SV) -> bool:
@@ -1458,12 +1588,14 @@ def _is_array(sv: _SV) -> bool:
 
 def _items(sv: _SV) -> list:
     v = sv.value
+    if isinstance(v, dict) and "w" in v:
+        return [dict(zip(_QPARTS, q)) for q in zip(*(v[k] for k in _QPARTS))]
     return [{"re": r, "im": i} for r, i in zip(v["re"], v["im"])] if isinstance(v, dict) else v
 
 
 def _wrap(x) -> _SV:
     if isinstance(x, dict):
-        return _SV(x, "complex")
+        return _SV(x, "quaternion" if "w" in x else "complex")
     if isinstance(x, list):
         return _SV(x, infer_type(x) or "vector")
     return _SV(x, infer_type(x))
@@ -1491,8 +1623,10 @@ def _gather(out: list, shown: str, line: int) -> _SV:
     vals = [o.value for o in out]
     if vals and all(o.type == "complex" for o in out):
         return _SV({"re": [v["re"] for v in vals], "im": [v["im"] for v in vals]}, "vector::complex")
-    if any(o.type == "complex" for o in out):
-        raise SignalError(line, f"{shown} gives a mix of complex and real values")
+    if vals and all(o.type == "quaternion" for o in out):
+        return _SV({k: [v[k] for v in vals] for k in _QPARTS}, "vector::quaternion")
+    if any(o.type in ("complex", "quaternion") for o in out):
+        raise SignalError(line, f"{shown} gives a mix of {'quaternion' if any(o.type == 'quaternion' for o in out) else 'complex'} and other values")
     t = infer_type(vals) or "vector"
     if t == "vector::float":
         vals = [float(v) if type(v) is int else v for v in vals]
@@ -1506,6 +1640,12 @@ def _re_im(which: str, a: _SV, line: int) -> _SV:
     v = a.value
     if a.file or a.type == "bool" or isinstance(v, str):
         raise SignalError(line, f"{which} needs a complex or real number, got {_show_type(a)}")
+    if a.type in ("quaternion", "vector::quaternion") and _quat_depth(v) in (0, 1):     # Re: w; Im: [x, y, z]
+        if which == "Re":
+            return _SV(v["w"], "vector::float" if isinstance(v["w"], list) else "float")
+        if isinstance(v["w"], list):
+            return _SV([list(t) for t in zip(v["x"], v["y"], v["z"])], "vector::vector::float")
+        return _SV([v["x"], v["y"], v["z"]], "vector::float")
     if isinstance(v, dict) and a.type.endswith("complex"):
         part = v["re" if which == "Re" else "im"]
         return _SV(part, "vector::" * _complex_depth(v) + "float")
@@ -1543,7 +1683,52 @@ def _isnan(x) -> bool:
     return cmath.isnan(x) if isinstance(x, complex) else isinstance(x, float) and math.isnan(x)
 
 
+def _qpow(q: _Q4, p: float) -> _Q4:
+    """q to a real power: by products for a whole power up to 64, else in polar form (principal value)."""
+    if p == int(p) and abs(p) <= 64:
+        out, b = _Q4(1), (q if p >= 0 else q.inv())
+        for _ in range(abs(int(p))):
+            out = out * b
+        return out
+    n = abs(q)
+    if n == 0:
+        if p > 0:
+            return _Q4(0)
+        raise ZeroDivisionError
+    v = math.hypot(*q[1:])
+    axis = [c / v for c in q[1:]] if v else [1.0, 0.0, 0.0]     # a negative real takes i, as complex does
+    t = math.atan2(v, q[0]) * p
+    return _Q4([n ** p * math.cos(t)] + [n ** p * math.sin(t) * c for c in axis])
+
+
+def _quat_maths(name, args, line) -> _SV:
+    if args[0].type != "quaternion":
+        raise SignalError(line, f"{name} takes a real number for the {'exponent' if name == 'power' else 'root'}, not a quaternion")
+    q = _hyper(args[0], name, line)
+    if name not in ("abs", "arg", "conj", "power", "root"):
+        raise SignalError(line, f"{name} needs a real or complex number, got quaternion")
+    if name == "abs":
+        return _fres(abs(q))
+    if name == "arg":                  # the angle from the real axis, 0 to pi
+        return _fres(math.atan2(math.hypot(*q[1:]), q[0]))
+    if name == "conj":
+        return _qres(q.conj())
+    p = _real_or_complex(name, args[1], line)
+    if isinstance(p, complex):
+        raise SignalError(line, f"{name} of a quaternion takes a real {'exponent' if name == 'power' else 'root'}")
+    if name == "root" and p == 0:
+        raise SignalError(line, "root 0 isn't defined")
+    try:
+        return _qres(_qpow(q, p if name == "power" else 1 / p))
+    except ZeroDivisionError:
+        raise SignalError(line, "division by zero")
+    except OverflowError:
+        raise SignalError(line, f"{name} gives a result too large to hold")
+
+
 def _maths_scalar(name, args, line) -> _SV:
+    if any(a.type == "quaternion" for a in args):
+        return _quat_maths(name, args, line)
     x = _real_or_complex(name, args[0], line)
     if name in _TRIG:                 # radians; a complex result where a real one doesn't exist, as for root
         if _isnan(x):
@@ -1613,11 +1798,13 @@ def _maths(name, args, line) -> _SV:
         raise SignalError(line, f"{name} takes one number for the {'exponent' if name == 'power' else 'root'}, not a vector")
     if not _is_vec(args[0]):
         return _maths_scalar(name, args, line)
-    if isinstance(args[0].value, dict) and any(isinstance(r, list) for r in args[0].value["re"]):
+    if isinstance(args[0].value, dict) and any(isinstance(r, list) for r in args[0].value.get("re", args[0].value.get("w"))):
         raise SignalError(line, f"{name} takes a vector, not a complex array")
     out = [_maths(name, [_wrap(item)] + args[1:], line) for item in _items(args[0])]
     if out and all(o.type == "complex" for o in out):
         return _SV({"re": [o.value["re"] for o in out], "im": [o.value["im"] for o in out]}, "vector::complex", "vector")
+    if out and all(o.type == "quaternion" for o in out):
+        return _SV({k: [o.value[k] for o in out] for k in _QPARTS}, "vector::quaternion", "vector")
     if any(o.type == "complex" for o in out):
         raise SignalError(line, f"{name} gives complex and real values for one vector; make them all complex first")
     vals = [o.value for o in out]
@@ -1787,10 +1974,16 @@ def _vec_values(name: str, sv: _SV, line: int, complex_ok=True):
     v = sv.value
     if isinstance(v, dict) and _series_parts(v):
         vals = v["values"]
-    elif isinstance(v, list) or (isinstance(v, dict) and sv.type.endswith("complex") and isinstance(v.get("re"), list)):
+    elif isinstance(v, list) or (isinstance(v, dict) and sv.type.endswith(("complex", "quaternion")) and isinstance(v.get("re", v.get("w")), list)):
         vals = v
     else:
         raise SignalError(line, f"{name} needs a vector or series, got {_show_type(sv)}")
+    if isinstance(vals, dict) and "w" in vals:
+        if any(isinstance(r, list) for r in vals["w"]):
+            raise SignalError(line, f"{name} takes a vector, not an array")
+        if not complex_ok:
+            raise SignalError(line, f"{name} can't order quaternions; use abs first")
+        return [None if None in q else _Q4(q) for q in zip(*(vals[k] for k in _QPARTS))], True
     if isinstance(vals, dict):
         if any(isinstance(r, list) for r in vals["re"]):
             raise SignalError(line, f"{name} takes a vector, not an array")
@@ -1810,6 +2003,8 @@ def _vec_values(name: str, sv: _SV, line: int, complex_ok=True):
 
 
 def _num_sv(x) -> _SV:
+    if isinstance(x, _Q4):
+        return _qres(x)
     if isinstance(x, complex):
         return _cres(x)
     return _fres(x)
@@ -1833,7 +2028,7 @@ def _reduce(name, args, line, ctx=None) -> _SV:
     n = len(vals)
     if name == "mean":
         m = sum(vals, 0) / n
-        return _num_sv(m if isinstance(m, complex) else float(m))
+        return _num_sv(m if isinstance(m, (complex, _Q4)) else float(m))
     if name == "rms":
         return _fres(math.sqrt(sum(abs(x) ** 2 for x in vals) / n))
     if name == "norm":
@@ -1870,7 +2065,9 @@ def _length(name, args, line, ctx=None) -> _SV:
         return _SV(v.width, "int")
     if isinstance(v, dict) and _series_parts(v):
         vals = v["values"]
-        return _SV(len(vals["re"]) if isinstance(vals, dict) else len(vals), "int")
+        return _SV(len(vals.get("re", vals.get("w"))) if isinstance(vals, dict) else len(vals), "int")
+    if isinstance(v, dict) and sv.type == "vector::quaternion" and _quat_depth(v) == 1 and not sv.file:
+        return _SV([len(v["w"])] if name == "size" else len(v["w"]), "vector::int" if name == "size" else "int")
     if (isinstance(v, list) or (isinstance(v, dict) and sv.type.endswith("complex") and isinstance(v.get("re"), list))) \
             and not sv.file:
         dims = _dims(_nest(sv)[0])
@@ -2103,7 +2300,69 @@ def _num2text(name, args, line, ctx=None) -> _SV:
     return _SV(_show_value(x), "text")
 
 
-_DISPATCH = {"text2num": _text2num, "num2text": _num2text, "saturate": _saturate, "excess": _excess, "quantize": _quantize, "hamming": _hamming,
+def _quat_fn(name, args, line, ctx=None) -> _SV:
+    """ang2quat(Z, Y, X): the unit quaternion of a rotation by Z, Y and X in turn (yaw, pitch, roll; radians);
+    quat2ang(q): [Z, Y, X] back (at pitch +-pi/2, X is 0 and Z takes the rest); versor(q): q over its norm."""
+    if name == "ang2quat":
+        a = []
+        for sv in args:
+            x = _real_or_complex(name, sv, line)
+            if isinstance(x, complex):
+                raise SignalError(line, "ang2quat takes real angles, in radians")
+            a.append(x / 2)
+        (cz, sz), (cy, sy), (cx, sx) = ((math.cos(t), math.sin(t)) for t in a)
+        return _qres((cx * cy * cz + sx * sy * sz, sx * cy * cz - cx * sy * sz,
+                      cx * sy * cz + sx * cy * sz, cx * cy * sz - sx * sy * cz))
+    if args[0].file or args[0].type != "quaternion" or _quat_depth(args[0].value) != 0:
+        raise SignalError(line, f"{name} needs a quaternion, got {_show_type(args[0])}")
+    q = _q4(args[0].value)
+    n = abs(q)
+    if n == 0:
+        raise SignalError(line, f"{name} needs a quaternion that isn't zero")
+    w, x, y, z = (c / n for c in q)
+    if name == "versor":
+        return _qres((w, x, y, z))
+    if math.isnan(n):
+        return _SV([None, None, None], "vector::float")
+    s = 2 * (w * y - z * x)
+    if abs(s) >= 1 - 1e-12:            # gimbal lock
+        Z, Y, X = -2 * math.copysign(1, s) * math.atan2(x, w), math.copysign(math.pi / 2, s), 0.0
+        Z = math.atan2(math.sin(Z), math.cos(Z))
+    else:
+        Z, Y, X = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)), math.asin(s), \
+            math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    return _SV([Z, Y, X], "vector::float")
+
+
+_DIGITS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _base(name, args, line, ctx=None) -> _SV:
+    """base(255, 10, 16) is 'FF': an integer's digits read in one base and written in another (2 to 36),
+    as an int in base 10 and text otherwise. A hex or bits value gives its own digits."""
+    x, frm, to = args
+    for b in (frm, to):
+        if b.file or type(b.value) is not int or not 2 <= b.value <= 36:
+            raise SignalError(line, f"base takes bases from 2 to 36, got {_show_type(b) if b.file else _show_value(b)}")
+    v = x.value
+    if x.file or not (isinstance(v, str) and x.type == "text" or type(v) is int or isinstance(v, (Hex, Bits))):
+        raise SignalError(line, f"base takes an integer, or its digits as text, got {_show_type(x)}")
+    digits = format(v, "b").zfill(v.width) if isinstance(v, Bits) else format(v, "X") if isinstance(v, Hex) else str(v).strip()
+    try:
+        n = int(digits, frm.value)
+    except ValueError:
+        raise SignalError(line, f"{digits} isn't a number in base {frm.value}")
+    if to.value == 10:
+        return _SV(n, "int")
+    out, m = "", abs(n)
+    while True:
+        m, d = divmod(m, to.value)
+        out = _DIGITS[d] + out
+        if not m:
+            return _SV("-" * (n < 0) + out, "text")
+
+
+_DISPATCH = {"text2num": _text2num, "num2text": _num2text, "base": _base, "versor": _quat_fn, "quat2ang": _quat_fn, "ang2quat": _quat_fn, "saturate": _saturate, "excess": _excess, "quantize": _quantize, "hamming": _hamming,
          "min": _extreme, "max": _extreme, "argmin": _extreme, "argmax": _extreme,
          "sum": _reduce, "product": _reduce, "mean": _reduce, "std": _reduce, "rms": _reduce, "norm": _reduce,
          "sort": _sort, "length": _length, "size": _length, "dot": _dot, "cross": _dot, "transpose": _transpose}
@@ -2112,9 +2371,9 @@ _TRIG = ("sin", "cos", "tan", "asin", "acos", "atan")
 _ELEMENTWISE = ("Re", "Im", "abs", "arg", "conj") + _TRIG     # one value in, one out: map and warp can use them too
 _MATH = {"Re": 1, "Im": 1, "abs": 1, "arg": 1, "conj": 1, "power": 2, "root": 2}     # built-in maths, and their argument counts
 _MATH.update({n: 1 for n in _TRIG})
-_MATH.update({n: (2 if n in ("saturate", "excess", "quantize", "dot", "cross") else 1) for n in _DISPATCH})
+_MATH.update({n: (2 if n in ("saturate", "excess", "quantize", "dot", "cross") else 3 if n in ("base", "ang2quat") else 1) for n in _DISPATCH})
 _NO_STREAMS = "a function can't read streams: sample or freeze the stream first and pass in the value"
-_FUTURE = ("base", "melt")      # built-ins reserved for a future version
+_FUTURE = ("melt",)             # built-ins reserved for a future version
 _LISTEN = {"input": ": listen(...) asks for a value",     # the old name, before a port could be called input
            **{n: ": reserved for a future version" for n in _FUTURE}}
 _FNARGS = {"map": 1, "warp": 2}      # built-in calls and how many function arguments they start with
@@ -2196,6 +2455,8 @@ def _warp(fx: str, fy: str, s: _SV, line: int, ctx) -> _SV:
 
 
 def _arith(op, a: _SV, b: _SV, line: int) -> _SV:
+    if a.type == "quaternion" or b.type == "quaternion":
+        return _quat_arith(op, a, b, line)
     if a.type == "complex" or b.type == "complex":
         return _complex_arith(op, a, b, line)
     if isinstance(a.value, Hex) and isinstance(b.value, Hex):
@@ -2459,7 +2720,18 @@ def _end_stream(path: str) -> None:
     obj["value"]["ended"] = True
     with open(path + ".tmp", "w", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    os.replace(path + ".tmp", path)
+    _replace(path + ".tmp", path)
+
+
+def _replace(src: str, dst: str) -> None:
+    """os.replace, retried briefly on Windows, where a reader holding dst open blocks it."""
+    for k in range(50):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if os.name != "nt" or k == 49:
+                raise
+            time.sleep(0.02)
 
 
 def _note(ctx, sv: _SV) -> _SV:
@@ -2614,15 +2886,25 @@ def _eval(e, line: int, ctx) -> _SV:
         return _warp(_fn_name(e[2]), _fn_name(e[3]), _eval(e[4], line, ctx), line, ctx)
     if kind == "call":
         return _call_function(e[1], [_eval(a, line, ctx) for a in e[2:]], line, ctx)
+    if kind == "quat":
+        parts = []
+        for a in e[1:]:
+            sv = _unhex(_eval(a, line, ctx))
+            if sv.file or not (sv.value is None or _is_num(sv.value)):
+                raise SignalError(line, f"a quaternion's parts are real numbers, got {_show_type(sv)}")
+            parts.append(math.nan if sv.value is None else sv.value)
+        return _qres(_Q4(parts))
     if kind == "vec":
         items = [_eval(a, line, ctx) for a in e[1:]]
         if len(items) == 1 and not items[0].file and _is_range(items[0].value):     # [r]: a range as a vector
             v = [items[0].value["lo"], items[0].value["hi"]]
             return _SV(v, infer_type(v), "vector")
         for it in items:
-            if it.file or it.type in ("bus",) or isinstance(it.value, (dict, type(None))) and not it.type.endswith("complex"):
-                raise SignalError(line, f"a vector holds numbers, bools, text, hex or complex numbers, got {_show_type(it)}")
+            if it.file or it.type in ("bus",) or isinstance(it.value, (dict, type(None))) and not it.type.endswith(("complex", "quaternion")):
+                raise SignalError(line, f"a vector holds numbers, bools, text, hex, complex numbers or quaternions, got {_show_type(it)}")
         vals = [it.value for it in items]
+        if items and all(it.type == "quaternion" for it in items):
+            return _SV({k: [v[k] for v in vals] for k in _QPARTS}, "vector::quaternion", "vector")
         if items and all(it.type == "complex" for it in items):
             return _SV({"re": [v["re"] for v in vals], "im": [v["im"] for v in vals]}, "vector::complex", "vector")
         if items and len({it.type for it in items}) == 1 and items[0].type.startswith("vector::") and items[0].type.endswith("complex") \
@@ -2785,6 +3067,11 @@ def _eval(e, line: int, ctx) -> _SV:
         return _SV((x == y) == (op == "=="), "bool")
     if op in ("==", "/=") and type(x) is bool and type(y) is bool:
         return _SV((x == y) == (op == "=="), "bool")
+    if "quaternion" in (a.type, b.type) and {a.type, b.type} <= {"quaternion", "complex", "int", "float"}:
+        if op not in ("==", "/="):
+            raise SignalError(line, f"{op} can't order quaternions; compare abs(q) or its parts")
+        u, w = _hyper(a, op, line), _hyper(b, op, line)
+        return _SV((not any(map(math.isnan, u + w)) and tuple(u) == tuple(w)) == (op == "=="), "bool")
     if a.type == "complex" and b.type in ("complex", "int", "float") or b.type == "complex" and a.type in ("int", "float"):
         if op not in ("==", "/="):
             raise SignalError(line, f"{op} can't order complex numbers; compare Re(z) or Im(z)")
@@ -2844,17 +3131,17 @@ def _index(e, line: int, ctx) -> _SV:
     if (isinstance(v, list) and v and isinstance(v[0], list)) or spec[0] == "multi" \
             or (isinstance(v, dict) and isinstance(v.get("re"), list) and v["re"] and isinstance(v["re"][0], list)):
         return _index_array(base, spec, label, line, ctx)
-    if spec[0] == "all" and (isinstance(v, list) or (isinstance(v, dict) and isinstance(v.get("re"), list))):
+    if spec[0] == "all" and (isinstance(v, list) or (isinstance(v, dict) and isinstance(v.get("re", v.get("w")), list))):
         return base
     if isinstance(v, dict) and _series_parts(v):
         if spec[0] == "slice":
             raise SignalError(line, "a series can't be sliced")
         vals = v["values"]
-        n = len(vals["re"]) if isinstance(vals, dict) else len(vals)
+        n = len(next(iter(vals.values()))) if isinstance(vals, dict) else len(vals)
     elif isinstance(v, list):
         vals, n = v, len(v)
-    elif isinstance(v, dict) and base.type.endswith("complex") and isinstance(v.get("re"), list):
-        vals, n = v, len(v["re"])
+    elif isinstance(v, dict) and base.type.endswith(("complex", "quaternion")) and isinstance(v.get("re", v.get("w")), list):
+        vals, n = v, len(next(iter(v.values())))
     else:
         raise SignalError(line, f"can't index {_show_type(base)}")
     if n == 0:
@@ -2865,13 +3152,13 @@ def _index(e, line: int, ctx) -> _SV:
             raise SignalError(line, f"a slice runs from low to high, got [{lo}:{hi}]")
         src = f"{base.source or label}[{lo}:{hi}]"
         if isinstance(vals, dict):
-            return _SV({"re": vals["re"][lo:hi + 1], "im": vals["im"][lo:hi + 1]}, base.type, src)
+            return _SV({k: c[lo:hi + 1] for k, c in vals.items()}, base.type, src)
         return _SV(vals[lo:hi + 1], base.type or infer_type(vals), src)
     i = _position(spec, n, label, line, ctx)
     src = f"{base.source or label}[{i}]"
     if isinstance(vals, dict):
-        t = "complex" if base.type.startswith("series") else base.type[len("vector::"):]
-        return _SV({"re": vals["re"][i], "im": vals["im"][i]}, t, src)
+        t = ("quaternion" if "w" in vals else "complex") if base.type.startswith("series") else base.type[len("vector::"):]
+        return _SV({k: c[i] for k, c in vals.items()}, t, src)
     el = vals[i]
     t = base.type[len("vector::"):] if base.type.startswith("vector::") else infer_type(el)
     if isinstance(v, dict):
@@ -2924,11 +3211,11 @@ def _elements(sv: _SV, line: int):
     t, v = sv.type or infer_type(sv.value), sv.value
     if sv.file or t in ("bool", "bus", "") or t.startswith("series"):
         return None
-    if t == "vector::complex":
-        return "complex", [{"re": r, "im": i} for r, i in zip(v["re"], v["im"])], True
+    if t in ("vector::complex", "vector::quaternion"):
+        return t[len("vector::"):], _items(sv), True
     if t.startswith("vector"):
         return (t[len("vector::"):] or "", list(v), True) if isinstance(v, list) else None
-    if t in ("int", "float", "hex", "text", "complex"):
+    if t in ("int", "float", "hex", "text", "complex", "quaternion"):
         return t, [v], False
     return None
 
@@ -2936,7 +3223,7 @@ def _elements(sv: _SV, line: int):
 def _series_x(v: dict) -> list:
     if "x" in v:
         return list(v["x"])
-    n = len(v["values"]["re"]) if isinstance(v["values"], dict) else len(v["values"])
+    n = len(next(iter(v["values"].values()))) if isinstance(v["values"], dict) else len(v["values"])
     return [v["start"] + v["step"] * i for i in range(n)]
 
 
@@ -2954,7 +3241,7 @@ def _merge2(a: _SV, b: _SV, line: int) -> _SV:
             raise bad
         va, vb = a.value, b.value
         if isinstance(va["values"], dict):
-            vals = {"re": va["values"]["re"] + vb["values"]["re"], "im": va["values"]["im"] + vb["values"]["im"]}
+            vals = {k: c + vb["values"][k] for k, c in va["values"].items()}
         else:
             vals = list(va["values"]) + list(vb["values"])
         return _SV({"domain": va["domain"], "x": _series_x(va) + _series_x(vb), "values": vals}, ta, "route merge")
@@ -2962,8 +3249,8 @@ def _merge2(a: _SV, b: _SV, line: int) -> _SV:
     if ea is None or eb is None or ea[0] != eb[0] or not ea[0]:
         raise bad
     et, items = ea[0], ea[1] + eb[1]
-    if et == "complex":
-        return _SV({"re": [c["re"] for c in items], "im": [c["im"] for c in items]}, "vector::complex", "route merge")
+    if et in ("complex", "quaternion"):
+        return _SV({k: [c[k] for c in items] for k in items[0]}, "vector::" + et, "route merge")
     if et.startswith("series"):
         raise bad
     return _SV(items, "vector::" + et, "route merge")
@@ -2989,7 +3276,7 @@ def _expr_sources(e, names: dict, seen=()) -> tuple:
         consts.append(f"{e[1]}:${e[2]}")
     elif kind == "str":
         consts.append(json.dumps(e[1], ensure_ascii=False))
-    elif kind == "vec":
+    elif kind in ("vec", "quat"):
         for sub in e[1:]:
             r, c, b = _expr_sources(sub, names, seen)
             refs += r; consts += c; buses += b
@@ -3044,6 +3331,10 @@ def _cshow(re_, im_) -> str:
     return f"{r} {'-' if im_ < 0 or (im_ == 0 and math.copysign(1, im_) < 0) else '+'} {abs(im_)!r}i"
 
 
+def _qshow(v) -> str:
+    return "(" + ", ".join("nan" if v[k] is None else repr(float(v[k])) for k in _QPARTS) + ")"
+
+
 def _show_value(sv: _SV) -> str:
     if sv.type == "tuple" and isinstance(sv.value, list):
         return "[" + ", ".join(_show_value(_SV(x, infer_type(x))) for x in sv.value) + "]"
@@ -3057,6 +3348,10 @@ def _show_value(sv: _SV) -> str:
         return "{" + json.dumps(sv.value["lo"]) + ", " + json.dumps(sv.value["hi"]) + "}"
     if sv.type == "complex" and isinstance(sv.value, dict) and not isinstance(sv.value["re"], list):
         return _cshow(sv.value["re"], sv.value["im"])
+    if sv.type == "quaternion" and _quat_depth(sv.value) == 0:
+        return _qshow(sv.value)
+    if sv.type == "vector::quaternion" and _quat_depth(sv.value) == 1:
+        return "[" + ", ".join(_qshow(q) for q in _items(sv)) + "]"
     if sv.type == "vector::complex" and isinstance(sv.value, dict) and not any(isinstance(x, list) for x in sv.value["re"]):
         return "[" + ", ".join(_cshow(r, i) for r, i in zip(sv.value["re"], sv.value["im"])) + "]"
     if isinstance(sv.value, (list, dict)) and sv.type.startswith("vector::vector::") and sv.type.count("vector::") == 2:
@@ -3941,6 +4236,12 @@ def _flat_shape(t: str, v):
     w = t.split("::")
     if w and w[-1] == "num" and isinstance(v, dict):
         w = w[:-1] + ["complex"]
+    if w == ["hypercomplex"]:
+        w = (infer_type(v) or "float").split("::")
+    if w == ["quaternion"] and _quat_depth(v) == 0:
+        return "q", [_flat_item(v[k], True) for k in _QPARTS]
+    if w == ["vector", "quaternion"] and _quat_depth(v) == 1:
+        return "vq", [_flat_item(e, True) for q in zip(*(v[k] for k in _QPARTS)) for e in q]
     scalars = ("int", "float", "real", "num", "hex", "bool", "text")
     if w[0] == "range" and isinstance(v, dict):         # read as a pair: lo, hi
         return "v", [_flat_item(v["lo"], w[1:] != ["int"]), _flat_item(v["hi"], w[1:] != ["int"])]
@@ -3957,9 +4258,12 @@ def _flat_shape(t: str, v):
         return "vc", [_flat_item(e, True) for p in zip(v["re"], v["im"]) for e in p]
     if w[0] == "vector" and len(w) == 2 and w[1] in scalars and isinstance(v, list) and not any(isinstance(e, list) for e in v):
         return "v", [_flat_item(e, w[1] == "float") for e in v]
-    if w[0] == "series" and len(w) == 3 and w[2] in ("float", "complex") and isinstance(v, dict) and series_parts(v):
+    if w[0] == "series" and len(w) == 3 and w[2] in ("float", "complex", "quaternion") and isinstance(v, dict) and series_parts(v):
         x = _series_x(v)
         vals = v["values"]
+        if w[2] == "quaternion":
+            return "xq", [w[1], str(len(x))] + [_flat_item(e, True) for e in x] + \
+                [_flat_item(e, True) for q in zip(*(vals[k] for k in _QPARTS)) for e in q]
         if w[2] == "float":
             return "xs", [w[1], str(len(x))] + [_flat_item(e, True) for e in x] + [_flat_item(e, True) for e in vals]
         return "xc", [w[1], str(len(x))] + [_flat_item(e, True) for e in x] + \
@@ -3969,8 +4273,9 @@ def _flat_shape(t: str, v):
 
 def flat_inputs(inputs: dict) -> str:
     """The run's inputs as plain text, one line per input: name, type, shape, data (tab separated).
-    Shapes: s scalar, c complex, v vector, vc complex vector, xs real series, xc complex series (domain, n,
-    x..., values...), st stream (the .sig files it is read from), json (anything else: the JSON text).
+    Shapes: s scalar, c complex, q quaternion (w x y z), v vector, vc complex vector, vq quaternion vector,
+    xs real series, xc complex series, xq quaternion series (domain, n, x..., values...), st stream (the .sig
+    files it is read from), json (anything else: the JSON text).
     Data tokens are separated by spaces; null is nan."""
     lines = []
     for name, obj in inputs.items():
@@ -4021,10 +4326,10 @@ def module_env(env: dict, prefix: str, module: str, inputs_path: str = "") -> di
         env["SIGNET_HELPERS"] = helpers
         for var in ("CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH"):    # #include <signet.hpp> in a build of your own
             env[var] = helpers + (os.pathsep + env[var] if env.get(var) else "")
-        for var, sep in (("PYTHONPATH", os.pathsep), ("JULIA_LOAD_PATH", ":")):
+        for var in ("PYTHONPATH", "JULIA_LOAD_PATH"):
             old = env.get(var)
-            # JULIA_LOAD_PATH keeps a trailing ":" so Julia's default paths still apply.
-            env[var] = helpers + sep + old if old else helpers + (":" if var == "JULIA_LOAD_PATH" else "")
+            # JULIA_LOAD_PATH keeps a trailing separator so Julia's default paths still apply.
+            env[var] = helpers + os.pathsep + old if old else helpers + (os.pathsep if var == "JULIA_LOAD_PATH" else "")
     return env
 
 
@@ -4032,9 +4337,59 @@ def module_env(env: dict, prefix: str, module: str, inputs_path: str = "") -> di
 _PY_HELPER = r'''# signet:  SIGNALS FOR MODULES; put on PYTHONPATH by Signet or Starfire
 import collections, json, math, os, re, time
 
-__all__ = ["signals", "Series", "Bus", "Stream"]
+__all__ = ["signals", "Series", "Bus", "Stream", "Quaternion"]
 _PORT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_WORDS = {"int", "float", "num", "bool", "text", "complex", "vector", "series", "bus", "stream", "tuple", "bits", "range"}
+_WORDS = {"int", "float", "num", "bool", "text", "complex", "vector", "series", "bus", "stream", "tuple", "bits", "range",
+          "quaternion", "hypercomplex"}
+_QPARTS = ("w", "x", "y", "z")
+
+
+class Quaternion(collections.namedtuple("Quaternion", _QPARTS)):
+    """w + xi + yj + zk, with Hamilton's product; a real or complex number promotes."""
+    __slots__ = ()
+
+    @classmethod
+    def of(cls, q):
+        if isinstance(q, cls):
+            return q
+        c = complex(q)
+        return cls(c.real, c.imag, 0.0, 0.0)
+
+    def __add__(a, b):
+        b = Quaternion.of(b)
+        return Quaternion(a.w + b.w, a.x + b.x, a.y + b.y, a.z + b.z)
+    __radd__ = __add__
+
+    def __neg__(a):
+        return Quaternion(-a.w, -a.x, -a.y, -a.z)
+
+    def __sub__(a, b):
+        return a + -Quaternion.of(b)
+
+    def __rsub__(a, b):
+        return Quaternion.of(b) + -a
+
+    def __mul__(a, b):
+        b = Quaternion.of(b)
+        return Quaternion(a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z, a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                          a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x, a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w)
+
+    def __rmul__(a, b):
+        return Quaternion.of(b) * a
+
+    def __abs__(a):
+        return math.sqrt(a.w * a.w + a.x * a.x + a.y * a.y + a.z * a.z)
+
+    def conjugate(a):
+        return Quaternion(a.w, -a.x, -a.y, -a.z)
+
+    def __truediv__(a, b):             # a times the inverse of b
+        b = Quaternion.of(b)
+        n = b.w * b.w + b.x * b.x + b.y * b.y + b.z * b.z
+        return a * Quaternion(b.w / n, -b.x / n, -b.y / n, -b.z / n)
+
+    def __rtruediv__(a, b):
+        return Quaternion.of(b) / a
 
 
 def _env(key):
@@ -4158,7 +4513,14 @@ class _StreamOut:
                          "count": self.count, "ended": False}, "type": f"stream::{self.domain}::{self.kind}"}
         with open(self.path + ".tmp", "w", encoding="utf-8") as f:
             f.write(json.dumps(sig, allow_nan=False) + "\n")
-        os.replace(self.path + ".tmp", self.path)
+        for k in range(50):            # on Windows a reader holding the file blocks the rename
+            try:
+                os.replace(self.path + ".tmp", self.path)
+                break
+            except PermissionError:
+                if os.name != "nt" or k == 49:
+                    raise
+                time.sleep(0.02)
 
 
 def _fin(e):
@@ -4180,13 +4542,26 @@ def _plain(v):
         v = v.transpose()
     if hasattr(v, "tolist"):          # numpy arrays and scalars
         v = v.tolist()
-    if isinstance(v, tuple):
+    if isinstance(v, tuple) and not isinstance(v, Quaternion):
         v = list(v)
     return [_plain(e) for e in v] if isinstance(v, list) else v
 
 
 def _has_complex(v):
     return isinstance(v, complex) or (isinstance(v, list) and any(_has_complex(e) for e in v))
+
+
+def _has_quat(v):
+    return isinstance(v, Quaternion) or (isinstance(v, list) and any(_has_quat(e) for e in v))
+
+
+def _qpart(v, k):
+    if isinstance(v, list) and not isinstance(v, Quaternion):
+        return [_qpart(e, k) for e in v]
+    if v is None:
+        return None
+    r = float(getattr(Quaternion.of(v), k))
+    return None if math.isnan(r) else r
 
 
 def _part(v, f):
@@ -4202,7 +4577,10 @@ def _out(v):
     # A Python value as JSON: NaN/None -> null, complex -> {"re", "im"}.
     if isinstance(v, Series):
         return v._json()
-    v = _plain(v)
+    if not isinstance(v, Quaternion):
+        v = _plain(v)
+    if _has_quat(v):
+        return {k: _qpart(v, k) for k in _QPARTS}
     if _has_complex(v):
         return {"re": _part(v, lambda c: c.real), "im": _part(v, lambda c: c.imag)}
     if isinstance(v, float) and not math.isfinite(v):
@@ -4237,10 +4615,28 @@ def _cdepth(v):
     return d if r is not None and r == _real(v["im"], d) else None
 
 
+def _qdepth(v):
+    if not (isinstance(v, dict) and set(v) == set(_QPARTS)):
+        return None
+    d, a = 0, v["w"]
+    while isinstance(a, list):
+        d, a = d + 1, (a[0] if a else None)
+    s = {_real(v[k], d) for k in _QPARTS}
+    return d if len(s) == 1 and None not in s else None
+
+
+def _quats(v):
+    # {"w", "x", "y", "z"} (of numbers or lists) as a Quaternion or a list of them; null is NaN.
+    if isinstance(v["w"], list):
+        return [_quats({k: v[k][i] for k in _QPARTS}) for i in range(len(v["w"]))]
+    return Quaternion(*(float("nan") if v[k] is None else float(v[k]) for k in _QPARTS))
+
+
 def _series(v):
     if not isinstance(v, dict) or not isinstance(v.get("domain"), str) or "values" not in v:
         return None
-    kind = "float" if _real(v["values"], 1) is not None else "complex" if _cdepth(v["values"]) == 1 else None
+    kind = "float" if _real(v["values"], 1) is not None else "complex" if _cdepth(v["values"]) == 1 else \
+        "quaternion" if _qdepth(v["values"]) == 1 else None
     return (v["domain"].lower(), kind) if kind else None
 
 
@@ -4254,8 +4650,9 @@ def _infer(v):
     if isinstance(v, str):
         return "text"
     if isinstance(v, dict):
-        d, s = _cdepth(v), _series(v)
-        return "vector::" * d + "complex" if d is not None else f"series::{s[0]}::{s[1]}" if s else ""
+        d, q, s = _cdepth(v), _qdepth(v), _series(v)
+        return "vector::" * d + "complex" if d is not None else "vector::" * q + "quaternion" if q is not None \
+            else f"series::{s[0]}::{s[1]}" if s else ""
     if isinstance(v, list):
         inner = {_infer(e) for e in v}
         if inner and inner <= {"int", "float"}:
@@ -4268,8 +4665,12 @@ def _ok(words, v):
     if not words or words[0] == "text":
         return True
     w, rest = words[0], words[1:]
-    if w in ("int", "float", "real", "num", "bool", "complex") and rest:
+    if w in ("int", "float", "real", "num", "bool", "complex", "quaternion", "hypercomplex") and rest:
         return False
+    if w == "quaternion":
+        return _qdepth(v) == 0
+    if w == "hypercomplex":
+        return v is None or _is_num(v) or _cdepth(v) == 0 or _qdepth(v) == 0
     if w == "int":
         return type(v) is int
     if w == "tuple":
@@ -4295,15 +4696,25 @@ def _ok(words, v):
             return _cdepth(v) == k
         if words[k:] == ["num"] and isinstance(v, dict):
             return _cdepth(v) == k
+        if words[k:] == ["quaternion"]:
+            return _qdepth(v) == k
+        if words[k:] == ["hypercomplex"] and isinstance(v, dict):
+            return k in (_cdepth(v), _qdepth(v))
         return isinstance(v, list) and all(_ok(rest, e) for e in v)
     if w == "series":
         s = _series(v)
-        return bool(s) and all(r == "num" or ((r if r != "real" else "float") == s[1]) if r in ("float", "real", "complex", "num") else r.lower() == s[0] for r in rest)
+        return bool(s) and all(r == "hypercomplex" or r == "num" and s[1] != "quaternion" or ((r if r != "real" else "float") == s[1])
+                               if r in ("float", "real", "complex", "num", "quaternion", "hypercomplex") else r.lower() == s[0] for r in rest)
     return False
 
 
 def _nan(v):
     return float("nan") if v is None else [_nan(e) for e in v] if isinstance(v, list) else v
+
+
+def _qall(v):
+    v = _plain(v)
+    return [_qall(e) for e in v] if isinstance(v, list) else Quaternion.of(v)
 
 
 def _cplx(re_, im):
@@ -4326,14 +4737,16 @@ def _in(entry):
         return (v["lo"], v["hi"])
     if words[:1] == ["series"] and isinstance(v, dict):
         vals = v["values"]
-        vals = _cplx(vals["re"], vals["im"]) if isinstance(vals, dict) else _nan(vals)
+        vals = _quats(vals) if _qdepth(vals) is not None else _cplx(vals["re"], vals["im"]) if isinstance(vals, dict) else _nan(vals)
         if "x" in v:
             return Series(vals, v["domain"], x=v["x"])
         s = Series(vals, v["domain"], start=v["start"], step=v["step"])
         return s
-    if "complex" in words and isinstance(v, dict):
+    if _qdepth(v) is not None:
+        return _quats(v)
+    if ("complex" in words or "hypercomplex" in words) and isinstance(v, dict):
         return _cplx(v["re"], v["im"])
-    if "float" in words or "real" in words or "num" in words:
+    if "float" in words or "real" in words or "num" in words or "hypercomplex" in words:
         return _nan(v)
     return v
 
@@ -4367,6 +4780,9 @@ class _Signals:
         js = _out(value)
         if type:
             words = [w for w in str(type).split("::") if w]
+            if words[-1] == "quaternion" and all(w == "vector" for w in words[:-1]) and _qdepth(js) is None \
+                    and (_real(js, len(words) - 1) is not None or _cdepth(js) is not None):
+                js = _out(_qall(value))                                # a real or complex number as a quaternion
             if words[0] == "range" and isinstance(js, list) and len(js) == 2:
                 js = {"lo": js[0], "hi": js[1]}
             depth = len(words) - 1
@@ -4462,6 +4878,18 @@ end
 native(v) = v
 
 nan(v) = v === nothing ? NaN : v isa AbstractVector ? map(nan, v) : v
+
+# Quaternions come from Quaternions.jl, loaded the first time one is read or written: a module without them needs only JSON3.
+const QUATERNIONS = Base.PkgId(Base.UUID("94ee1d12-ae83-5a48-8b1c-48b8ff168ae0"), "Quaternions")
+const QPARTS = ("w", "x", "y", "z")
+quaternion(w, x, y, z) = Base.invokelatest(getfield(Base.require(QUATERNIONS), :Quaternion),
+                                           (e === nothing ? NaN : Float64(e) for e in (w, x, y, z))...)
+isquat(v) = nameof(typeof(v)) === :Quaternion && hasfield(typeof(v), :v3)
+asquat(n) = isquat(n) ? n : quaternion(real(n), imag(n), 0.0, 0.0)
+quats(q) = q["w"] isa AbstractVector ? [quats(Dict(k => q[k][i] for k in QPARTS)) for i in eachindex(q["w"])] :
+           quaternion(q["w"], q["x"], q["y"], q["z"])
+qdepth(v) = v isa AbstractDict && length(v) == 4 && all(k -> haskey(v, k), QPARTS) ? depth_of(v["w"]) : -1
+qjson(v) = Dict(k => jsonable(isquat(v) ? getfield(v, f) : [getfield(e, f) for e in v]) for (k, f) in zip(QPARTS, (:s, :v1, :v2, :v3)))
 cplx(re, im) = re isa AbstractVector ? [cplx(a, b) for (a, b) in zip(re, im)] :
                complex(re === nothing ? NaN : Float64(re), im === nothing ? NaN : Float64(im))
 
@@ -4471,7 +4899,8 @@ function invalue(v, t::AbstractString)
     if !isempty(words) && words[1] == "bus" && v isa Dict
         return Dict(k => invalue(f["value"], string(get(f, "type", ""))) for (k, f) in v)
     elseif !isempty(words) && words[1] == "series" && v isa Dict
-        vals = v["values"] isa Dict ? cplx(v["values"]["re"], v["values"]["im"]) : nan(v["values"])
+        vals = qdepth(v["values"]) >= 0 ? quats(v["values"]) :
+               v["values"] isa Dict ? cplx(v["values"]["re"], v["values"]["im"]) : nan(v["values"])
         haskey(v, "x") && return series(vals; domain=v["domain"], x=v["x"])
         return series(vals; domain=v["domain"], start=v["start"], step=v["step"])
     elseif !isempty(words) && words[1] == "range" && v isa Dict
@@ -4479,7 +4908,9 @@ function invalue(v, t::AbstractString)
     elseif !isempty(words) && words[1] == "stream" && v isa Dict
         return StreamIn(String.(v["stream"]))
     end
-    r = "complex" in words && v isa Dict ? cplx(v["re"], v["im"]) : ("float" in words || "num" in words) ? nan(v) : v
+    r = qdepth(v) >= 0 ? quats(v) :
+        ("complex" in words || "hypercomplex" in words) && v isa Dict ? cplx(v["re"], v["im"]) :
+        ("float" in words || "num" in words || "hypercomplex" in words) ? nan(v) : v
     # a 2-D array arrives column by column: a Matrix
     if length(words) == 3 && words[1] == words[2] == "vector" && r isa AbstractVector && !isempty(r) &&
        all(e -> e isa AbstractVector && length(e) == length(r[1]), r)
@@ -4570,11 +5001,12 @@ jsonable(v::Complex) = Dict("re" => jsonable(real(v)), "im" => jsonable(imag(v))
 jsonable(v::AbstractVector{<:Complex}) = Dict("re" => jsonable(real.(v)), "im" => jsonable(imag.(v)))
 jsonable(v::AbstractMatrix) = Any[jsonable(collect(c)) for c in eachcol(v)]        # column by column, as Signet keeps arrays
 jsonable(v::AbstractMatrix{<:Complex}) = Dict("re" => jsonable(real.(v)), "im" => jsonable(imag.(v)))
-jsonable(v::AbstractVector) = Any[jsonable(e) for e in v]
+jsonable(v::AbstractVector) = !isempty(v) && all(isquat, v) ? qjson(v) : Any[jsonable(e) for e in v]
 jsonable(v::AbstractDict) = Dict(string(k) => jsonable(e) for (k, e) in v)
-jsonable(v) = v
+jsonable(v) = isquat(v) ? qjson(v) : v
 
 isnum(v) = (v isa Real && !(v isa Bool)) || v === nothing
+seriestype(v) = v["values"] isa AbstractDict ? (haskey(v["values"], "w") ? "quaternion" : "complex") : "float"
 cdepth(v) = v isa AbstractDict && haskey(v, "re") && haskey(v, "im") ?
             (v["re"] isa AbstractVector ? (isempty(v["re"]) ? 1 : 1 + depth_of(v["re"][1])) : 0) : -1
 depth_of(a) = a isa AbstractVector ? (isempty(a) ? 1 : 1 + depth_of(a[1])) : 0
@@ -4587,7 +5019,9 @@ function infer(v)
     if v isa AbstractDict
         d = cdepth(v)
         d >= 0 && return "vector::"^d * "complex"
-        haskey(v, "domain") && return "series::$(v["domain"])::" * (v["values"] isa AbstractDict ? "complex" : "float")
+        d = qdepth(v)
+        d >= 0 && return "vector::"^d * "quaternion"
+        haskey(v, "domain") && return "series::$(v["domain"])::" * seriestype(v)
         return ""
     end
     if v isa AbstractVector
@@ -4601,20 +5035,24 @@ end
 function ok(words, v)
     (isempty(words) || words[1] == "text") && return true
     w, rest = words[1], words[2:end]
-    w in ("int", "float", "num", "bool", "complex") && !isempty(rest) && return false
+    w in ("int", "float", "num", "bool", "complex", "quaternion", "hypercomplex") && !isempty(rest) && return false
     w == "int" && return v isa Integer && !(v isa Bool)
     w in ("float", "num") && return isnum(v)
     w == "bool" && return v isa Bool
     w == "complex" && return cdepth(v) == 0
+    w == "quaternion" && return qdepth(v) == 0
+    w == "hypercomplex" && return isnum(v) || cdepth(v) == 0 || qdepth(v) == 0
     if w == "vector"
         k = findfirst(!=("vector"), words)
         k !== nothing && words[k:end] == ["complex"] && return cdepth(v) == k - 1
+        k !== nothing && words[k:end] == ["quaternion"] && return qdepth(v) == k - 1
+        k !== nothing && words[k:end] == ["hypercomplex"] && v isa AbstractDict && return k - 1 in (cdepth(v), qdepth(v))
         return v isa AbstractVector && all(e -> ok(rest, e), v)
     end
     if w == "series"
         v isa AbstractDict && haskey(v, "domain") || return false
-        kind = v["values"] isa AbstractDict ? "complex" : "float"
-        return all(r -> r in ("float", "complex") ? r == kind : lowercase(r) == v["domain"], rest)
+        kind = seriestype(v)
+        return all(r -> r in ("float", "complex", "quaternion") ? r == kind : r == "hypercomplex" || lowercase(r) == v["domain"], rest)
     end
     false
 end
@@ -4627,6 +5065,9 @@ function Base.write(::Signals, port::AbstractString, v, type::AbstractString="")
         words = filter(!isempty, split(type, "::"))
         if words[end] == "complex" && all(==("vector"), words[1:end-1]) && cdepth(js) < 0
             js = jsonable(v isa AbstractArray ? complex.(v) : complex(v))   # a real number as complex
+        end
+        if words[end] == "quaternion" && all(==("vector"), words[1:end-1]) && qdepth(js) < 0
+            js = jsonable(v isa AbstractArray ? asquat.(v) : asquat(v))     # a real or complex number as a quaternion
         end
         ok(words, js) || error("output $port: expected $type, got $(infer(js))")
     else
@@ -4669,6 +5110,7 @@ end
 
 function Base.write(s::Stream, t::Real, v::Number)
     isfinite(t) || error("a stream's t must be a finite number")
+    isquat(v) && error("stream $(s.port): a stream holds float or complex values")
     kind = v isa Complex ? "complex" : "float"
     isempty(s.kind) && (s.kind = kind)
     kind == "complex" && s.kind == "float" && error("stream $(s.port): expected float, got complex")
@@ -4688,8 +5130,8 @@ end # module
 '''
 _CPP_HELPER = r'''// signet.hpp:  SIGNALS FOR C++ MODULES (C++17, standard library only)
 // AUTHOR:      DANIEL DESAI
-// UPDATED:     2026-10-29
-// VERSION:     0.6.0
+// UPDATED:     2026-11-17
+// VERSION:     0.7.0
 //
 // Built into signet.py: Signet and Starfire put this on the include path, so
 // a module just says #include <signet.hpp>. Inputs: signet::in<double>("voltage").
@@ -4723,6 +5165,8 @@ template <class V> struct SeriesOf {
 using Series = SeriesOf<double>;
 using ComplexSeries = SeriesOf<std::complex<double>>;
 using Complex = std::complex<double>;
+struct Quaternion { double w = 0, x = 0, y = 0, z = 0; };      // w + xi + yj + zk
+using QuaternionSeries = SeriesOf<Quaternion>;
 
 namespace detail {
 
@@ -4825,6 +5269,14 @@ template <> struct Reader<Complex> {
         return {num(r.tok.at(0)), num(r.tok.at(1))};
     }
 };
+template <> struct Reader<Quaternion> {           // a real or complex number is read as a quaternion too
+    static Quaternion read(const std::string& n, const Record& r) {
+        if (r.shape == "s" && r.type != "bool" && r.type != "text") return {num(r.tok.at(0)), 0, 0, 0};
+        if (r.shape == "c") return {num(r.tok.at(0)), num(r.tok.at(1)), 0, 0};
+        need(n, r, "q", "a quaternion");
+        return {num(r.tok.at(0)), num(r.tok.at(1)), num(r.tok.at(2)), num(r.tok.at(3))};
+    }
+};
 template <class T> struct Reader<std::vector<T>, std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool>>> {
     static std::vector<T> read(const std::string& n, const Record& r) {
         need(n, r, "v", "a vector of numbers");
@@ -4849,6 +5301,27 @@ template <> struct Reader<std::vector<Complex>> {
         std::vector<Complex> v;
         for (size_t i = 0; i + 1 < r.tok.size(); i += 2) v.emplace_back(num(r.tok[i]), num(r.tok[i + 1]));
         return v;
+    }
+};
+template <> struct Reader<std::vector<Quaternion>> {
+    static std::vector<Quaternion> read(const std::string& n, const Record& r) {
+        need(n, r, "vq", "a vector of quaternions");
+        std::vector<Quaternion> v;
+        for (size_t i = 0; i + 3 < r.tok.size(); i += 4) v.push_back({num(r.tok[i]), num(r.tok[i + 1]), num(r.tok[i + 2]), num(r.tok[i + 3])});
+        return v;
+    }
+};
+template <> struct Reader<QuaternionSeries> {
+    static QuaternionSeries read(const std::string& n, const Record& r) {
+        need(n, r, "xq", "a quaternion series");
+        size_t k = std::strtoul(r.tok.at(1).c_str(), nullptr, 10);
+        QuaternionSeries s{r.tok[0], {}, {}};
+        for (size_t i = 0; i < k; i++) {
+            s.x.push_back(num(r.tok.at(2 + i)));
+            size_t j = 2 + k + 4 * i;
+            s.values.push_back({num(r.tok.at(j)), num(r.tok.at(j + 1)), num(r.tok.at(j + 2)), num(r.tok.at(j + 3))});
+        }
+        return s;
     }
 };
 template <> struct Reader<Series> {
@@ -4914,6 +5387,13 @@ inline std::string jcomplexes(const std::vector<Complex>& v) {
     return "{\"re\":" + jlist(map(v, [](Complex z) { return jnum(z.real()); })) + ",\"im\":" +
            jlist(map(v, [](Complex z) { return jnum(z.imag()); })) + "}";
 }
+inline std::string jquat(Quaternion q) {
+    return "{\"w\":" + jnum(q.w) + ",\"x\":" + jnum(q.x) + ",\"y\":" + jnum(q.y) + ",\"z\":" + jnum(q.z) + "}";
+}
+inline std::string jquats(const std::vector<Quaternion>& v) {
+    return "{\"w\":" + jlist(map(v, [](Quaternion q) { return jnum(q.w); })) + ",\"x\":" + jlist(map(v, [](Quaternion q) { return jnum(q.x); })) +
+           ",\"y\":" + jlist(map(v, [](Quaternion q) { return jnum(q.y); })) + ",\"z\":" + jlist(map(v, [](Quaternion q) { return jnum(q.z); })) + "}";
+}
 
 // <prefix>-<module>.<name>.sig, written whole and then renamed: a reader never sees half a file
 inline void emit(const std::string& name, const std::string& value, const std::string& type) {
@@ -4925,7 +5405,8 @@ inline void emit(const std::string& name, const std::string& value, const std::s
         f << "{\"value\":" << value << ",\"type\":" << jstr(type) << "}\n";
         if (!f) throw std::runtime_error("can't write " + tmp);
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("can't rename " + tmp);
+    if (std::rename(tmp.c_str(), path.c_str()) != 0 && (std::remove(path.c_str()), std::rename(tmp.c_str(), path.c_str()) != 0))
+        throw std::runtime_error("can't rename " + tmp);    // Windows won't rename over a file
 }
 
 // An error nobody catches ends the module with "signet: message" and exit code 2, not an abort
@@ -4948,7 +5429,8 @@ inline const bool terminate_installed = [] {
 inline bool has(const std::string& name) { return detail::inputs().count(name) > 0; }
 
 // An input by name: in<double>("v"), in<long long>("n"), in<bool>, in<std::string>, in<std::complex<double>>,
-// in<std::vector<double>> (or int, std::string, complex), in<signet::Series>, in<signet::ComplexSeries>
+// in<signet::Quaternion>, in<std::vector<double>> (or int, std::string, complex, Quaternion), in<signet::Series>,
+// in<signet::ComplexSeries>, in<signet::QuaternionSeries>
 template <class T> T in(const std::string& name) { return detail::Reader<T>::read(name, detail::get(name)); }
 
 // Outputs. The type is optional ("float", "vector::float", ...); a float type turns whole numbers into floats.
@@ -4960,6 +5442,15 @@ inline void out(const std::string& name, bool v, const std::string& type = "bool
 inline void out(const std::string& name, const std::string& v, const std::string& type = "text") { detail::emit(name, detail::jstr(v), type); }
 inline void out(const std::string& name, const char* v, const std::string& type = "text") { detail::emit(name, detail::jstr(v), type); }
 inline void out(const std::string& name, Complex v, const std::string& type = "complex") { detail::emit(name, detail::jcomplex(v), type); }
+inline void out(const std::string& name, Quaternion v, const std::string& type = "quaternion") { detail::emit(name, detail::jquat(v), type); }
+inline void out(const std::string& name, const std::vector<Quaternion>& v, const std::string& type = "vector::quaternion") {
+    detail::emit(name, detail::jquats(v), type);
+}
+inline void out(const std::string& name, const QuaternionSeries& s, const std::string& type = "") {
+    detail::emit(name, "{\"domain\":" + detail::jstr(s.domain) + ",\"x\":" + detail::jlist(detail::map(s.x, detail::jnum)) +
+                           ",\"values\":" + detail::jquats(s.values) + "}",
+                 type.empty() ? "series::" + s.domain + "::quaternion" : type);
+}
 template <class T, class = std::enable_if_t<std::is_floating_point_v<T>>>
 void out(const std::string& name, const std::vector<T>& v, const std::string& type = "vector::float") {
     detail::emit(name, detail::jlist(detail::map(v, [](T e) { return detail::jnum(e); })), type);
@@ -5146,8 +5637,8 @@ namespace sf = signet;   // for modules written against the older starfire_signa
 '''
 _RS_HELPER = r'''// signet.rs:  SIGNALS FOR RUST MODULES (standard library only)
 // AUTHOR:     DANIEL DESAI
-// UPDATED:    2026-10-29
-// VERSION:    0.6.0
+// UPDATED:    2026-11-17
+// VERSION:    0.7.0
 //
 // Built into signet.py: Signet and Starfire compile a module against this as the crate `signet`, so a
 // module just says `use signet::{get_f64, put};`. Inputs: get_f64("voltage"). Outputs: put("power", &power, "float").
@@ -5160,6 +5651,15 @@ use std::sync::OnceLock;
 pub struct Complex {
     pub re: f64,
     pub im: f64,
+}
+
+/// w + xi + yj + zk
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Quaternion {
+    pub w: f64,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -5309,6 +5809,34 @@ pub fn get_vec_complex(name: &str) -> Vec<Complex> {
     r.tok.chunks(2).map(|p| Complex { re: num(&p[0]), im: num(&p[1]) }).collect()
 }
 
+fn quat(p: &[String]) -> Quaternion {
+    Quaternion { w: num(&p[0]), x: num(&p[1]), y: num(&p[2]), z: num(&p[3]) }
+}
+
+/// A quaternion; a real or complex number is read as one too.
+pub fn get_quaternion(name: &str) -> Quaternion {
+    let r = inputs().get(name).unwrap_or_else(|| fail(&format!("no input {name} (see the point's Signet code)")));
+    match r.shape.as_str() {
+        "s" if r.kind != "bool" && r.kind != "text" => Quaternion { w: num(&r.tok[0]), x: 0.0, y: 0.0, z: 0.0 },
+        "c" => Quaternion { w: num(&r.tok[0]), x: num(&r.tok[1]), y: 0.0, z: 0.0 },
+        _ => quat(&rec(name, "q", "a quaternion").tok),
+    }
+}
+
+pub fn get_vec_quaternion(name: &str) -> Vec<Quaternion> {
+    rec(name, "vq", "a vector of quaternions").tok.chunks(4).map(quat).collect()
+}
+
+pub fn get_quaternion_series(name: &str) -> Series<Quaternion> {
+    let r = rec(name, "xq", "a quaternion series");
+    let n: usize = r.tok[1].parse().unwrap_or(0);
+    Series {
+        domain: r.tok[0].clone(),
+        x: r.tok[2..2 + n].iter().map(|t| num(t)).collect(),
+        values: r.tok[2 + n..2 + 5 * n].chunks(4).map(quat).collect(),
+    }
+}
+
 pub fn get_series(name: &str) -> Series<f64> {
     let r = rec(name, "xs", "a real series");
     let n: usize = r.tok[1].parse().unwrap_or(0);
@@ -5362,6 +5890,11 @@ fn jcomplexes(v: &[Complex]) -> String {
     format!("{{\"re\":{},\"im\":{}}}", jlist(v, |z| jnum(z.re)), jlist(v, |z| jnum(z.im)))
 }
 
+fn jquats(v: &[Quaternion]) -> String {
+    format!("{{\"w\":{},\"x\":{},\"y\":{},\"z\":{}}}", jlist(v, |q| jnum(q.w)), jlist(v, |q| jnum(q.x)),
+            jlist(v, |q| jnum(q.y)), jlist(v, |q| jnum(q.z)))
+}
+
 fn floaty(ty: &str) -> bool {
     ty.ends_with("float")
 }
@@ -5404,6 +5937,23 @@ impl Put for Vec<Complex> {
 }
 impl Put for [Complex] {
     fn json(&self, _: &str) -> (String, String) { (jcomplexes(self), "vector::complex".into()) }
+}
+impl Put for Quaternion {
+    fn json(&self, _: &str) -> (String, String) {
+        (format!("{{\"w\":{},\"x\":{},\"y\":{},\"z\":{}}}", jnum(self.w), jnum(self.x), jnum(self.y), jnum(self.z)), "quaternion".into())
+    }
+}
+impl Put for Vec<Quaternion> {
+    fn json(&self, _: &str) -> (String, String) { (jquats(self), "vector::quaternion".into()) }
+}
+impl Put for [Quaternion] {
+    fn json(&self, _: &str) -> (String, String) { (jquats(self), "vector::quaternion".into()) }
+}
+impl Put for Series<Quaternion> {
+    fn json(&self, _: &str) -> (String, String) {
+        (format!("{{\"domain\":{},\"x\":{},\"values\":{}}}", jstr(&self.domain), jlist(&self.x, |e| jnum(*e)), jquats(&self.values)),
+         format!("series::{}::quaternion", self.domain))
+    }
 }
 impl Put for Vec<String> {
     fn json(&self, _: &str) -> (String, String) { (jlist(self, |e| jstr(e)), "vector::text".into()) }
@@ -5587,8 +6137,8 @@ impl Iterator for StreamIn {
 '''
 _ADS_HELPER = r'''--  signet.ads:  SIGNALS FOR ADA MODULES (Ada 2012, standard library only)
 --  AUTHOR:      DANIEL DESAI
---  UPDATED:     2026-10-29
---  VERSION:     0.6.0
+--  UPDATED:     2026-11-17
+--  VERSION:     0.7.0
 --
 --  Built into signet.py: Signet and Starfire put this on the compiler's search path, so a module
 --  just says "with Signet;". Inputs: Signet.Get_Float ("voltage"). Outputs: Signet.Put ("power", P, "float").
@@ -5622,6 +6172,17 @@ package Signet is
       Values : Complex_Vector (1 .. N);
    end record;
 
+   type Quaternion is record                 --  W + Xi + Yj + Zk
+      W, X, Y, Z : Long_Float := 0.0;
+   end record;
+   type Quaternion_Vector is array (Positive range <>) of Quaternion;
+
+   type Quaternion_Series (N : Natural) is record
+      Domain : Text;
+      X      : Float_Vector (1 .. N);
+      Values : Quaternion_Vector (1 .. N);
+   end record;
+
    function Has (Name : String) return Boolean;
 
    --  Inputs; null reads as NaN
@@ -5636,6 +6197,9 @@ package Signet is
    function Get_Complexes      (Name : String) return Complex_Vector;
    function Get_Series         (Name : String) return Series;
    function Get_Complex_Series (Name : String) return Complex_Series;
+   function Get_Quaternion     (Name : String) return Quaternion;      --  a real or complex number promotes
+   function Get_Quaternions    (Name : String) return Quaternion_Vector;
+   function Get_Quaternion_Series (Name : String) return Quaternion_Series;
 
    --  Outputs: <prefix>-<module>.<name>.sig. Kind is the Signet type ("float", "vector::float", ...),
    --  or "" for the value's own; a float Kind turns whole numbers into floats.
@@ -5650,6 +6214,9 @@ package Signet is
    procedure Put (Name : String; Value : Complex_Vector;     Kind : String := "");
    procedure Put (Name : String; Value : Series;             Kind : String := "");
    procedure Put (Name : String; Value : Complex_Series;     Kind : String := "");
+   procedure Put (Name : String; Value : Quaternion;         Kind : String := "");
+   procedure Put (Name : String; Value : Quaternion_Vector;  Kind : String := "");
+   procedure Put (Name : String; Value : Quaternion_Series;  Kind : String := "");
 
    --  Output streams: S : Signet.Stream := Signet.Open ("volts"); then Signet.Write (S, T, V). Its .sig keeps
    --  the last Window samples, rewritten whole at each write.
@@ -5688,8 +6255,8 @@ end Signet;
 '''
 _ADB_HELPER = r'''--  signet.adb:  SIGNALS FOR ADA MODULES (body)
 --  AUTHOR:      DANIEL DESAI
---  UPDATED:     2026-10-29
---  VERSION:     0.6.0
+--  UPDATED:     2026-11-17
+--  VERSION:     0.7.0
 
 with Ada.Containers.Vectors;
 with Ada.Environment_Variables;
@@ -5707,6 +6274,8 @@ package body Signet is
      with Import, Convention => C, External_Name => "strtod";
    function C_Rename (Old_Name, New_Name : Interfaces.C.char_array) return Interfaces.C.int
      with Import, Convention => C, External_Name => "rename";
+   function C_Remove (Name : Interfaces.C.char_array) return Interfaces.C.int
+     with Import, Convention => C, External_Name => "remove";
 
    package LF_IO is new Ada.Text_IO.Float_IO (Long_Float);
 
@@ -6006,6 +6575,51 @@ package body Signet is
       return R;
    end Get_Complex_Series;
 
+   function Quat (T : Text_Vector; I : Positive) return Quaternion is
+     ((W => Num (To_String (T (I))), X => Num (To_String (T (I + 1))),
+       Y => Num (To_String (T (I + 2))), Z => Num (To_String (T (I + 3)))));
+
+   function Get_Quaternion (Name : String) return Quaternion is
+      It : constant Item := Find (Name);
+      S  : constant String := To_String (It.Shape);
+      T  : constant Text_Vector := Tokens (To_String (It.Data));
+   begin
+      if S = "s" then
+         Need_Number (Name, It, "a quaternion");
+         return (W => Num (To_String (T (T'First))), others => 0.0);
+      elsif S = "c" then
+         return (W => Num (To_String (T (T'First))), X => Num (To_String (T (T'First + 1))), others => 0.0);
+      elsif S /= "q" then
+         raise Error with "input " & Name & " is " & To_String (It.Kind) & ", not a quaternion";
+      end if;
+      return Quat (T, T'First);
+   end Get_Quaternion;
+
+   function Get_Quaternions (Name : String) return Quaternion_Vector is
+      It : constant Item := Get (Name, "vq", "a vector of quaternions");
+      T  : constant Text_Vector := Tokens (To_String (It.Data));
+      R  : Quaternion_Vector (1 .. T'Length / 4);
+   begin
+      for I in R'Range loop
+         R (I) := Quat (T, T'First + 4 * (I - 1));
+      end loop;
+      return R;
+   end Get_Quaternions;
+
+   function Get_Quaternion_Series (Name : String) return Quaternion_Series is
+      It : constant Item := Get (Name, "xq", "a quaternion series");
+      T  : constant Text_Vector := Tokens (To_String (It.Data));
+      N  : constant Natural := Natural'Value (To_String (T (T'First + 1)));
+      R  : Quaternion_Series (N);
+   begin
+      R.Domain := T (T'First);
+      for I in 1 .. N loop
+         R.X (I) := Num (To_String (T (T'First + 1 + I)));
+         R.Values (I) := Quat (T, T'First + 2 + N + 4 * (I - 1));
+      end loop;
+      return R;
+   end Get_Quaternion_Series;
+
    --  JSON text. NaN and infinity are null, and a float always shows a "."
    function Trim (S : String) return String is
       A : Natural := S'First;
@@ -6100,6 +6714,25 @@ package body Signet is
       return "{""re"":[" & To_String (Re) & "],""im"":[" & To_String (Im) & "]}";
    end JComplexes;
 
+   function JQuat (V : Quaternion) return String is
+     ("{""w"":" & JNum (V.W) & ",""x"":" & JNum (V.X) & ",""y"":" & JNum (V.Y) & ",""z"":" & JNum (V.Z) & "}");
+
+   function JQuats (V : Quaternion_Vector) return String is
+      W, X, Y, Z : Unbounded_String;
+   begin
+      for I in V'Range loop
+         declare
+            C : constant String := (if I > V'First then "," else "");
+         begin
+            Append (W, C & JNum (V (I).W));
+            Append (X, C & JNum (V (I).X));
+            Append (Y, C & JNum (V (I).Y));
+            Append (Z, C & JNum (V (I).Z));
+         end;
+      end loop;
+      return "{""w"":[" & To_String (W) & "],""x"":[" & To_String (X) & "],""y"":[" & To_String (Y) & "],""z"":[" & To_String (Z) & "]}";
+   end JQuats;
+
    --  <prefix>-<module>.<name>.sig, written whole and then renamed: a reader never sees half a file
    procedure Emit (Name, Value, Kind : String) is
       Module : constant String := Env ("MODULE");
@@ -6115,7 +6748,12 @@ package body Signet is
       Ada.Text_IO.Put_Line (F, "{""value"":" & Value & ",""type"":" & JStr (Kind) & "}");
       Ada.Text_IO.Close (F);
       if C_Rename (Interfaces.C.To_C (Tmp), Interfaces.C.To_C (Path)) /= 0 then
-         raise Error with "can't rename " & Tmp;
+         if C_Remove (Interfaces.C.To_C (Path)) /= 0 then    --  Windows won't rename over a file
+            null;
+         end if;
+         if C_Rename (Interfaces.C.To_C (Tmp), Interfaces.C.To_C (Path)) /= 0 then
+            raise Error with "can't rename " & Tmp;
+         end if;
       end if;
    end Emit;
 
@@ -6186,6 +6824,23 @@ package body Signet is
    begin
       Emit (Name, "{""domain"":" & JStr (D) & ",""x"":" & JFloats (Value.X) & ",""values"":" & JComplexes (Value.Values) & "}",
             Or_Own (Kind, "series::" & D & "::complex"));
+   end Put;
+
+   procedure Put (Name : String; Value : Quaternion; Kind : String := "") is
+   begin
+      Emit (Name, JQuat (Value), Or_Own (Kind, "quaternion"));
+   end Put;
+
+   procedure Put (Name : String; Value : Quaternion_Vector; Kind : String := "") is
+   begin
+      Emit (Name, JQuats (Value), Or_Own (Kind, "vector::quaternion"));
+   end Put;
+
+   procedure Put (Name : String; Value : Quaternion_Series; Kind : String := "") is
+      D : constant String := To_String (Value.Domain);
+   begin
+      Emit (Name, "{""domain"":" & JStr (D) & ",""x"":" & JFloats (Value.X) & ",""values"":" & JQuats (Value.Values) & "}",
+            Or_Own (Kind, "series::" & D & "::quaternion"));
    end Put;
 
    function Open (Name : String; Domain : String := "time"; Window : Positive := 1024) return Stream is
@@ -6407,8 +7062,8 @@ end Signet;
 '''
 _F90_HELPER = r'''! signet.f90:  SIGNALS FOR FORTRAN MODULES (Fortran 2008, standard library only)
 ! AUTHOR:      DANIEL DESAI
-! UPDATED:     2026-10-29
-! VERSION:     0.6.0
+! UPDATED:     2026-11-17
+! VERSION:     0.7.0
 !
 ! Built into signet.py: Signet and Starfire compile a module with this on the search path, so a module
 ! just says "use signet". Inputs: call signet_get("voltage", v). Outputs: call signet_put("power", p, "float").
@@ -6419,7 +7074,7 @@ module signet
   use, intrinsic :: iso_fortran_env, only: iostat_eor, error_unit
   implicit none
   private
-  public :: signet_has, signet_get, signet_put, signet_text, signet_series, signet_cseries
+  public :: signet_has, signet_get, signet_put, signet_text, signet_series, signet_cseries, signet_quaternion, signet_qseries
   public :: signet_stream, signet_stream_open, signet_stream_write
   public :: signet_stream_in, signet_get_stream, signet_stream_next, signet_stream_latest, signet_stream_ended
 
@@ -6434,6 +7089,14 @@ module signet
     character(:), allocatable :: domain
     real(8), allocatable :: x(:)
     complex(8), allocatable :: values(:)
+  end type
+  type :: signet_quaternion          ! w + xi + yj + zk
+    real(8) :: w = 0, x = 0, y = 0, z = 0
+  end type
+  type :: signet_qseries
+    character(:), allocatable :: domain
+    real(8), allocatable :: x(:)
+    type(signet_quaternion), allocatable :: values(:)
   end type
   ! An output stream: call signet_stream_open(s, 'volts'), then call signet_stream_write(s, t, v) with a real(8)
   ! or complex(8) v. Its .sig keeps the last window samples (1024 unless given), rewritten whole at each write.
@@ -6460,10 +7123,12 @@ module signet
   interface signet_get
     module procedure get_real, get_int4, get_int8, get_logical, get_text, get_complex
     module procedure get_reals, get_ints4, get_ints8, get_texts, get_complexes, get_series, get_cseries
+    module procedure get_quaternion, get_quaternions, get_qseries
   end interface
   interface signet_put
     module procedure put_real, put_real4, put_int4, put_int8, put_logical, put_text, put_complex
     module procedure put_reals, put_ints4, put_ints8, put_texts, put_complexes, put_series, put_cseries
+    module procedure put_quaternion, put_quaternions, put_qseries
   end interface
 
   interface signet_stream_write
@@ -6475,6 +7140,11 @@ module signet
       import :: c_char, c_int
       character(kind=c_char), intent(in) :: old(*), new(*)
       integer(c_int) :: c_rename
+    end function
+    function c_remove(name) bind(C, name="remove")
+      import :: c_char, c_int
+      character(kind=c_char), intent(in) :: name(*)
+      integer(c_int) :: c_remove
     end function
     function c_usleep(us) bind(C, name="usleep")
       import :: c_int
@@ -6831,7 +7501,75 @@ contains
     end do
   end subroutine
 
+  function shape_of(name) result(s)
+    character(*), intent(in) :: name
+    character(:), allocatable :: s
+    integer :: i
+    if (.not. loaded) call load()
+    s = ''
+    do i = 1, size(recs)
+      if (recs(i)%name == name) s = recs(i)%shape
+    end do
+  end function
+
+  subroutine get_quaternion(name, v)       ! a real or complex number promotes
+    character(*), intent(in) :: name
+    type(signet_quaternion), intent(out) :: v
+    type(rec) :: r
+    type(signet_text), allocatable :: t(:)
+    character(:), allocatable :: sh
+    sh = shape_of(name)
+    if (sh /= 's' .and. sh /= 'c') sh = 'q'
+    r = find(name, sh, 'a quaternion')
+    if (sh == 's') call need_number(name, r, 'a quaternion')
+    t = tokens(r%data)
+    v%w = num(t(1)%s)
+    if (sh /= 's') v%x = num(t(2)%s)
+    if (sh == 'q') then
+      v%y = num(t(3)%s)
+      v%z = num(t(4)%s)
+    end if
+  end subroutine
+
+  subroutine get_quaternions(name, v)
+    character(*), intent(in) :: name
+    type(signet_quaternion), allocatable, intent(out) :: v(:)
+    type(rec) :: r
+    type(signet_text), allocatable :: t(:)
+    integer :: i
+    r = find(name, 'vq', 'a vector of quaternions')
+    t = tokens(r%data)
+    allocate (v(size(t) / 4))
+    do i = 1, size(v)
+      v(i) = signet_quaternion(num(t(4 * i - 3)%s), num(t(4 * i - 2)%s), num(t(4 * i - 1)%s), num(t(4 * i)%s))
+    end do
+  end subroutine
+
+  subroutine get_qseries(name, s)
+    character(*), intent(in) :: name
+    type(signet_qseries), intent(out) :: s
+    type(rec) :: r
+    type(signet_text), allocatable :: t(:)
+    integer :: i, j, n
+    r = find(name, 'xq', 'a quaternion series')
+    t = tokens(r%data)
+    n = int(whole(t(2)%s))
+    s%domain = t(1)%s
+    allocate (s%x(n), s%values(n))
+    do i = 1, n
+      s%x(i) = num(t(2 + i)%s)
+      j = 2 + n + 4 * (i - 1)
+      s%values(i) = signet_quaternion(num(t(j + 1)%s), num(t(j + 2)%s), num(t(j + 3)%s), num(t(j + 4)%s))
+    end do
+  end subroutine
+
   ! ---- outputs: JSON text ----
+
+  function jquats(v) result(s)
+    type(signet_quaternion), intent(in) :: v(:)
+    character(:), allocatable :: s
+    s = '{"w":' // jreals(v%w) // ',"x":' // jreals(v%x) // ',"y":' // jreals(v%y) // ',"z":' // jreals(v%z) // '}'
+  end function
 
   function jnum(x) result(s)
     real(8), intent(in) :: x
@@ -6950,7 +7688,10 @@ contains
     if (ios /= 0) call fail("can't write " // tmp)
     write (u, '(A)') '{"value":' // value // ',"type":' // jstr(vtype) // '}'
     close (u)
-    if (c_rename(tmp // c_null_char, path // c_null_char) /= 0) call fail("can't rename " // tmp)
+    if (c_rename(tmp // c_null_char, path // c_null_char) /= 0) then
+      ios = c_remove(path // c_null_char)                ! Windows won't rename over a file
+      if (c_rename(tmp // c_null_char, path // c_null_char) /= 0) call fail("can't rename " // tmp)
+    end if
   end subroutine
 
   subroutine put_real(name, v, vtype)
@@ -7026,6 +7767,36 @@ contains
     t = 'complex'
     if (present(vtype)) t = own(vtype, t)
     call emit(name, '{"re":' // jnum(real(v, 8)) // ',"im":' // jnum(aimag(v)) // '}', t)
+  end subroutine
+
+  subroutine put_quaternion(name, v, vtype)
+    character(*), intent(in) :: name
+    type(signet_quaternion), intent(in) :: v
+    character(*), intent(in), optional :: vtype
+    character(:), allocatable :: t
+    t = 'quaternion'
+    if (present(vtype)) t = own(vtype, t)
+    call emit(name, '{"w":' // jnum(v%w) // ',"x":' // jnum(v%x) // ',"y":' // jnum(v%y) // ',"z":' // jnum(v%z) // '}', t)
+  end subroutine
+
+  subroutine put_quaternions(name, v, vtype)
+    character(*), intent(in) :: name
+    type(signet_quaternion), intent(in) :: v(:)
+    character(*), intent(in), optional :: vtype
+    character(:), allocatable :: t
+    t = 'vector::quaternion'
+    if (present(vtype)) t = own(vtype, t)
+    call emit(name, jquats(v), t)
+  end subroutine
+
+  subroutine put_qseries(name, s, vtype)
+    character(*), intent(in) :: name
+    type(signet_qseries), intent(in) :: s
+    character(*), intent(in), optional :: vtype
+    character(:), allocatable :: t
+    t = 'series::' // s%domain // '::quaternion'
+    if (present(vtype)) t = own(vtype, t)
+    call emit(name, '{"domain":' // jstr(s%domain) // ',"x":' // jreals(s%x) // ',"values":' // jquats(s%values) // '}', t)
   end subroutine
 
   subroutine put_reals(name, v, vtype)
@@ -7551,8 +8322,8 @@ signet_stream_follow() { # signet_stream_follow NAME: prints "t value" for each 
 
 _C_HELPER = r'''// signet.h:    SIGNALS FOR C MODULES (C11, standard library only)
 // AUTHOR:      DANIEL DESAI
-// UPDATED:     2026-11-11
-// VERSION:     0.6.0
+// UPDATED:     2026-11-17
+// VERSION:     0.7.0
 //
 // Built into signet.py: Signet and Starfire put this on the include path, so a module
 // just says #include <signet.h>. Inputs: signet_get_double("voltage").
@@ -7580,6 +8351,9 @@ typedef struct { size_t n; char **v; } signet_texts;
 typedef struct { size_t n; signet_complex *v; } signet_complexes;
 typedef struct { const char *domain; size_t n; double *x; double *values; } signet_series;
 typedef struct { const char *domain; size_t n; double *x; signet_complex *values; } signet_cseries;
+typedef struct { double w, x, y, z; } signet_quaternion;
+typedef struct { size_t n; signet_quaternion *v; } signet_quaternions;
+typedef struct { const char *domain; size_t n; double *x; signet_quaternion *values; } signet_qseries;
 
 // Errors: one message, then exit code 2
 static inline void signet_fail(const char *fmt, ...) {
@@ -7742,6 +8516,28 @@ static inline signet_complex signet_get_complex(const char *name) {
     return z;
 }
 
+static inline signet_quaternion signet__quat(const char *name, const signet__rec *r, size_t i) {
+    signet_quaternion q = {signet__num(signet__tok(name, r, i)), signet__num(signet__tok(name, r, i + 1)),
+                           signet__num(signet__tok(name, r, i + 2)), signet__num(signet__tok(name, r, i + 3))};
+    return q;
+}
+
+static inline signet_quaternion signet_get_quaternion(const char *name) {     // a real or complex number promotes
+    const signet__rec *r = signet__get(name);
+    signet_quaternion q = {0, 0, 0, 0};
+    if (!strcmp(r->shape, "s") && strcmp(r->type, "bool") && strcmp(r->type, "text")) {
+        q.w = signet__num(signet__tok(name, r, 0));
+        return q;
+    }
+    if (!strcmp(r->shape, "c")) {
+        q.w = signet__num(signet__tok(name, r, 0));
+        q.x = signet__num(signet__tok(name, r, 1));
+        return q;
+    }
+    signet__need(name, r, "q", "a quaternion");
+    return signet__quat(name, r, 0);
+}
+
 static inline signet_doubles signet_get_doubles(const char *name) {
     const signet__rec *r = signet__get(name);
     signet__need(name, r, "v", "a vector of numbers");
@@ -7782,6 +8578,14 @@ static inline signet_complexes signet_get_complexes(const char *name) {
     return d;
 }
 
+static inline signet_quaternions signet_get_quaternions(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "vq", "a vector of quaternions");
+    signet_quaternions d = {r->n / 4, (signet_quaternion *)signet__alloc(r->n / 4 * sizeof(signet_quaternion))};
+    for (size_t i = 0; i < d.n; i++) d.v[i] = signet__quat(name, r, 4 * i);
+    return d;
+}
+
 static inline signet_series signet_get_series(const char *name) {
     const signet__rec *r = signet__get(name);
     signet__need(name, r, "xs", "a real series");
@@ -7792,6 +8596,20 @@ static inline signet_series signet_get_series(const char *name) {
     for (size_t i = 0; i < k; i++) {
         s.x[i] = signet__num(r->tok[2 + i]);
         s.values[i] = signet__num(r->tok[2 + k + i]);
+    }
+    return s;
+}
+
+static inline signet_qseries signet_get_qseries(const char *name) {
+    const signet__rec *r = signet__get(name);
+    signet__need(name, r, "xq", "a quaternion series");
+    size_t k = strtoul(signet__tok(name, r, 1), NULL, 10);
+    signet__tok(name, r, 1 + 5 * k);
+    signet_qseries s = {signet__unescape(r->tok[0]), k, (double *)signet__alloc(k * sizeof(double)),
+                        (signet_quaternion *)signet__alloc(k * sizeof(signet_quaternion))};
+    for (size_t i = 0; i < k; i++) {
+        s.x[i] = signet__num(r->tok[2 + i]);
+        s.values[i] = signet__quat(name, r, 2 + k + 4 * i);
     }
     return s;
 }
@@ -7881,6 +8699,17 @@ static inline void signet__jcomplexes(signet__buf *b, const signet_complex *v, s
     signet__puts(b, "]}");
 }
 
+static inline void signet__jquats(signet__buf *b, const signet_quaternion *v, size_t n) {
+    for (int k = 0; k < 4; k++) {
+        signet__puts(b, k == 0 ? "{\"w\":[" : k == 1 ? "],\"x\":[" : k == 2 ? "],\"y\":[" : "],\"z\":[");
+        for (size_t i = 0; i < n; i++) {
+            if (i) signet__puts(b, ",");
+            signet__jnum(b, k == 0 ? v[i].w : k == 1 ? v[i].x : k == 2 ? v[i].y : v[i].z);
+        }
+    }
+    signet__puts(b, "]}");
+}
+
 // <prefix>-<module>.<name>.sig, written whole and then renamed: a reader never sees half a file
 static inline void signet__emit(const char *name, signet__buf *value, const char *type) {
     const char *prefix = signet__env("PREFIX", false), *module = signet__env("MODULE", true);
@@ -7893,7 +8722,8 @@ static inline void signet__emit(const char *name, signet__buf *value, const char
     FILE *f = fopen(tmp, "wb");
     if (!f || fprintf(f, "{\"value\":%s,\"type\":%s}\n", value->s ? value->s : "null", t.s) < 0 || fclose(f) != 0)
         signet_fail("can't write %s", tmp);
-    if (rename(tmp, path) != 0) signet_fail("can't rename %s", tmp);
+    if (rename(tmp, path) != 0 && (remove(path), rename(tmp, path) != 0))      /* Windows won't rename over a file */
+        signet_fail("can't rename %s", tmp);
     free(t.s);
     free(value->s);
     free(path);
@@ -7935,6 +8765,40 @@ static inline void signet_put_complex(const char *name, signet_complex v, const 
     signet__jnum(&b, v.im);
     signet__puts(&b, "}");
     signet__emit(name, &b, SIGNET__TYPE(type, "complex"));
+}
+
+static inline void signet_put_quaternion(const char *name, signet_quaternion v, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, "{\"w\":");
+    signet__jnum(&b, v.w);
+    signet__puts(&b, ",\"x\":");
+    signet__jnum(&b, v.x);
+    signet__puts(&b, ",\"y\":");
+    signet__jnum(&b, v.y);
+    signet__puts(&b, ",\"z\":");
+    signet__jnum(&b, v.z);
+    signet__puts(&b, "}");
+    signet__emit(name, &b, SIGNET__TYPE(type, "quaternion"));
+}
+
+static inline void signet_put_quaternions(const char *name, const signet_quaternion *v, size_t n, const char *type) {
+    signet__buf b = {0};
+    signet__jquats(&b, v, n);
+    signet__emit(name, &b, SIGNET__TYPE(type, "vector::quaternion"));
+}
+
+static inline void signet_put_qseries(const char *name, signet_qseries s, const char *type) {
+    signet__buf b = {0};
+    signet__puts(&b, "{\"domain\":");
+    signet__jstr(&b, s.domain);
+    signet__puts(&b, ",\"x\":");
+    signet__jnums(&b, s.x, s.n);
+    signet__puts(&b, ",\"values\":");
+    signet__jquats(&b, s.values, s.n);
+    signet__puts(&b, "}");
+    char t[160];
+    snprintf(t, sizeof t, "series::%s::quaternion", s.domain);
+    signet__emit(name, &b, SIGNET__TYPE(type, t));
 }
 
 static inline void signet_put_doubles(const char *name, const double *v, size_t n, const char *type) {
@@ -8231,8 +9095,8 @@ static inline bool signet_stream_next(signet_stream_in *s, double *t, double *v)
 
 _A68_HELPER = r'''# signet.a68:  SIGNALS FOR ALGOL 68 MODULES (Algol 68 Genie, a68g 3) #
 # AUTHOR:      DANIEL DESAI #
-# UPDATED:     2026-11-11 #
-# VERSION:     0.6.0 #
+# UPDATED:     2026-11-17 #
+# VERSION:     0.7.0 #
 #
   Built into signet.py: Signet runs a .a68 module with this placed before it, so a module
   calls the procedures directly. Inputs: signet get real ("voltage").
@@ -8246,6 +9110,8 @@ PR precision=800 PR
 MODE SIGNETREC = STRUCT (STRING name, type, shape, FLEX [1:0] STRING tok);
 MODE SIGNETSERIES = STRUCT (STRING domain, FLEX [1:0] REAL x, values);
 MODE SIGNETCSERIES = STRUCT (STRING domain, FLEX [1:0] REAL x, FLEX [1:0] COMPL values);
+MODE SIGNETQUAT = STRUCT (REAL w, x, y, z);    # w + xi + yj + zk #
+MODE SIGNETQSERIES = STRUCT (STRING domain, FLEX [1:0] REAL x, FLEX [1:0] SIGNETQUAT values);
 
 FLEX [1:0] SIGNETREC signet recs;
 BOOL signet loaded := FALSE;
@@ -8529,6 +9395,18 @@ PROC signet json compls = ([] COMPL v) STRING:
       "{""re"":" + signet json reals (re) + ",""im"":" + signet json reals (im) + "}"
    END;
 
+PROC signet json quat = (SIGNETQUAT q) STRING:
+   "{""w"":" + signet json real (w OF q) + ",""x"":" + signet json real (x OF q) + ",""y"":" + signet json real (y OF q)
+   + ",""z"":" + signet json real (z OF q) + "}";
+
+PROC signet json quats = ([] SIGNETQUAT v) STRING:
+   BEGIN
+      [LWB v : UPB v] REAL qw, qx, qy, qz;
+      FOR i FROM LWB v TO UPB v DO qw[i] := w OF v[i]; qx[i] := x OF v[i]; qy[i] := y OF v[i]; qz[i] := z OF v[i] OD;
+      "{""w"":" + signet json reals (qw) + ",""x"":" + signet json reals (qx) + ",""y"":" + signet json reals (qy)
+      + ",""z"":" + signet json reals (qz) + "}"
+   END;
+
 # <prefix>-<module>.<name>.sig, written whole and then renamed: a reader never sees half a file #
 PROC signet emit = (STRING name, value, type) VOID:
    BEGIN
@@ -8648,6 +9526,49 @@ PROC signet get cseries = (STRING name) SIGNETCSERIES:
       (signet unescape ((tok OF r)[1]), x, v)
    END;
 
+PROC signet quat = (SIGNETREC r, INT i, STRING name) SIGNETQUAT:
+   (signet read real ((tok OF r)[i], name), signet read real ((tok OF r)[i + 1], name),
+    signet read real ((tok OF r)[i + 2], name), signet read real ((tok OF r)[i + 3], name));
+
+# a real or complex number promotes #
+PROC signet get quaternion = (STRING name) SIGNETQUAT:
+   BEGIN
+      INT i = signet find (name);
+      IF i = 0 THEN signet fail ("no input " + name + " (see the point's Signet code)") FI;
+      IF shape OF signet recs[i] = "s" THEN
+         SIGNETQUAT (signet get real (name), 0.0, 0.0, 0.0)
+      ELIF shape OF signet recs[i] = "c" THEN
+         COMPL z = signet get compl (name);
+         SIGNETQUAT (RE z, IM z, 0.0, 0.0)
+      ELSE
+         SIGNETREC r = signet get (name, "q", "a quaternion");
+         VOID (signet tok (r, 4));
+         signet quat (r, 1, name)
+      FI
+   END;
+
+PROC signet get quaternions = (STRING name) [] SIGNETQUAT:
+   BEGIN
+      SIGNETREC r = signet get (name, "vq", "a vector of quaternions");
+      [UPB tok OF r OVER 4] SIGNETQUAT v;
+      FOR i TO UPB v DO v[i] := signet quat (r, 4 * i - 3, name) OD;
+      v
+   END;
+
+PROC signet get qseries = (STRING name) SIGNETQSERIES:
+   BEGIN
+      SIGNETREC r = signet get (name, "xq", "a quaternion series");
+      INT k = signet read int (signet tok (r, 2));
+      VOID (signet tok (r, 2 + 5 * k));
+      [k] REAL x;
+      [k] SIGNETQUAT v;
+      FOR i TO k DO
+         x[i] := signet read real ((tok OF r)[2 + i], name);
+         v[i] := signet quat (r, 3 + k + 4 * (i - 1), name)
+      OD;
+      (signet unescape ((tok OF r)[1]), x, v)
+   END;
+
 # Outputs. The type is optional ("" for the default); a float type turns whole numbers into floats. #
 PROC signet put real = (STRING name, REAL v, STRING type) VOID:
    signet emit (name, signet json real (v), signet type (type, "float"));
@@ -8694,11 +9615,299 @@ PROC signet put cseries = (STRING name, SIGNETCSERIES s, STRING type) VOID:
    signet emit (name, "{""domain"":" + signet json text (domain OF s) + ",""x"":" + signet json reals (x OF s)
                 + ",""values"":" + signet json compls (values OF s) + "}",
                 signet type (type, "series::" + domain OF s + "::complex"));
+
+PROC signet put quaternion = (STRING name, SIGNETQUAT v, STRING type) VOID:
+   signet emit (name, signet json quat (v), signet type (type, "quaternion"));
+
+PROC signet put quaternions = (STRING name, [] SIGNETQUAT v, STRING type) VOID:
+   signet emit (name, signet json quats (v), signet type (type, "vector::quaternion"));
+
+PROC signet put qseries = (STRING name, SIGNETQSERIES s, STRING type) VOID:
+   signet emit (name, "{""domain"":" + signet json text (domain OF s) + ",""x"":" + signet json reals (x OF s)
+                + ",""values"":" + signet json quats (values OF s) + "}",
+                signet type (type, "series::" + domain OF s + "::quaternion"));
+'''
+
+_HS_HELPER = r'''--  Signet.hs:   SIGNALS FOR HASKELL MODULES (GHC, base only)
+--  AUTHOR:      DANIEL DESAI
+--  UPDATED:     2026-11-17
+--  VERSION:     0.7.0
+--
+--  Built into signet.py: Signet builds a .hs module with this on GHC's search path, so a module just says
+--  "import Signet". Inputs: v <- getFloat "voltage". Outputs: put "power" p "float"; the type is optional
+--  (pass ""). A whole number needs its type: put "n" (3 :: Int) "". Anything wrong stops the module with
+--  "signet: message" and exit code 2.
+
+{-# LANGUAGE FlexibleInstances #-}
+module Signet
+  ( Complex (..), Quaternion (..), Series (..), qconj, qnorm
+  , has, getFloat, getInt, getBool, getText, getComplex, getQuaternion
+  , getFloats, getInts, getTexts, getComplexes, getQuaternions
+  , getSeries, getComplexSeries, getQuaternionSeries
+  , Put, put
+  ) where
+
+import Control.Monad (unless)
+import Data.Complex (Complex (..), imagPart, realPart)
+import Data.List (intercalate, isSuffixOf)
+import Foreign.C.String (CString, withCString)
+import Foreign.C.Types (CInt (..))
+import System.Environment (lookupEnv)
+import System.Exit (ExitCode (..), exitWith)
+import System.IO
+
+-- | w + xi + yj + zk, with Hamilton's product
+data Quaternion = Quaternion { qw, qx, qy, qz :: Double } deriving (Eq, Show)
+
+instance Num Quaternion where
+  Quaternion a b c d + Quaternion e f g h = Quaternion (a + e) (b + f) (c + g) (d + h)
+  Quaternion a b c d * Quaternion e f g h =
+    Quaternion (a * e - b * f - c * g - d * h) (a * f + b * e + c * h - d * g) (a * g - b * h + c * e + d * f) (a * h + b * g - c * f + d * e)
+  negate (Quaternion a b c d) = Quaternion (-a) (-b) (-c) (-d)
+  abs q = Quaternion (qnorm q) 0 0 0
+  signum q@(Quaternion a b c d) = let n = qnorm q in if n == 0 then q else Quaternion (a / n) (b / n) (c / n) (d / n)
+  fromInteger n = Quaternion (fromInteger n) 0 0 0
+
+instance Fractional Quaternion where
+  recip q@(Quaternion a b c d) = let n = qnorm q ^ (2 :: Int) in Quaternion (a / n) (-b / n) (-c / n) (-d / n)
+  fromRational r = Quaternion (fromRational r) 0 0 0
+
+qconj :: Quaternion -> Quaternion
+qconj (Quaternion a b c d) = Quaternion a (-b) (-c) (-d)
+
+qnorm :: Quaternion -> Double
+qnorm (Quaternion a b c d) = sqrt (a * a + b * b + c * c + d * d)
+
+-- | Values against an axis
+data Series a = Series { seriesDomain :: String, seriesX :: [Double], seriesValues :: [a] } deriving (Eq, Show)
+
+-- Inputs, read from the plain-text form Signet writes: name, type, shape, data (tab separated)
+data Rec = Rec { rType, rShape :: String, rTok :: [String] }
+
+envVar :: String -> IO (Maybe String)
+envVar k = lookupEnv ("SIGNET_" ++ k) >>= maybe (lookupEnv ("STARFIRE_" ++ k)) (return . Just)
+
+signetFail :: String -> IO a
+signetFail msg = hPutStrLn stderr ("signet: " ++ msg) >> exitWith (ExitFailure 2)
+
+inputs :: IO [(String, Rec)]
+inputs = do
+  p <- envVar "SIGNALS_TXT"
+  case p of
+    Nothing -> return []                  -- a module with no inputs
+    Just path -> do
+      h <- openFile path ReadMode
+      hSetEncoding h utf8
+      txt <- hGetContents h
+      let rs = [(n, Rec t s (words d)) | (n : t : s : d : _) <- map (tabs 3) (lines txt)]
+      length rs `seq` hClose h >> return rs
+  where
+    tabs :: Int -> String -> [String]
+    tabs 0 s = [s]
+    tabs k s = case break (== '\t') s of
+      (a, _ : rest) -> a : tabs (k - 1) rest
+      (a, []) -> [a]
+
+has :: String -> IO Bool
+has name = maybe False (const True) . lookup name <$> inputs
+
+record :: String -> IO Rec
+record name = inputs >>= maybe (signetFail ("no input " ++ name ++ " (see the point's Signet code)")) return . lookup name
+
+shaped :: String -> String -> String -> IO Rec
+shaped name shape want = do
+  r <- record name
+  unless (rShape r == shape) $ signetFail ("input " ++ name ++ " is " ++ rType r ++ ", not " ++ want)
+  return r
+
+tok :: String -> Rec -> Int -> IO String
+tok name r i = if i < length (rTok r) then return (rTok r !! i) else signetFail ("input " ++ name ++ " is cut short")
+
+num :: String -> Double                   -- "nan" reads as NaN
+num t = case reads t of
+  [(d, "")] -> d
+  _ -> case t of
+    "inf" -> 1 / 0
+    "-inf" -> -1 / 0
+    _ -> 0 / 0
+
+unescape :: String -> String
+unescape "\\e" = ""
+unescape ('\\' : c : rest) = (case c of 's' -> ' '; 't' -> '\t'; 'n' -> '\n'; 'r' -> '\r'; _ -> c) : unescape rest
+unescape (c : rest) = c : unescape rest
+unescape [] = []
+
+numeric :: String -> Rec -> String -> IO ()
+numeric name r want = unless (rType r `notElem` ["bool", "text", "vector::bool", "vector::text"]) $
+  signetFail ("input " ++ name ++ " is " ++ rType r ++ ", not " ++ want)
+
+getFloat :: String -> IO Double
+getFloat name = do
+  r <- shaped name "s" "a number"
+  numeric name r "a number"
+  num <$> tok name r 0
+
+getInt :: String -> IO Int
+getInt name = do
+  r <- shaped name "s" "an integer"
+  unless (rType r `elem` ["int", "hex"]) $ signetFail ("input " ++ name ++ " is " ++ rType r ++ ", not an integer")
+  read <$> tok name r 0
+
+getBool :: String -> IO Bool
+getBool name = do
+  r <- shaped name "s" "a bool"
+  unless (rType r == "bool") $ signetFail ("input " ++ name ++ " is " ++ rType r ++ ", not a bool")
+  (== "true") <$> tok name r 0
+
+getText :: String -> IO String
+getText name = do
+  r <- shaped name "s" "text"
+  unless (rType r == "text") $ signetFail ("input " ++ name ++ " is " ++ rType r ++ ", not text")
+  return (case rTok r of (t : _) -> unescape t; [] -> "")
+
+getComplex :: String -> IO (Complex Double)
+getComplex name = do
+  r <- shaped name "c" "a complex number"
+  (:+) <$> (num <$> tok name r 0) <*> (num <$> tok name r 1)
+
+-- | A quaternion; a real or complex number is read as one too
+getQuaternion :: String -> IO Quaternion
+getQuaternion name = do
+  r <- record name
+  case rShape r of
+    "s" -> numeric name r "a quaternion" >> (\w -> Quaternion w 0 0 0) . num <$> tok name r 0
+    "c" -> (\w x -> Quaternion w x 0 0) <$> (num <$> tok name r 0) <*> (num <$> tok name r 1)
+    _ -> shaped name "q" "a quaternion" >>= \q -> tok name q 3 >> return (head (quats (rTok q)))
+
+quats :: [String] -> [Quaternion]
+quats (a : b : c : d : rest) = Quaternion (num a) (num b) (num c) (num d) : quats rest
+quats _ = []
+
+getFloats :: String -> IO [Double]
+getFloats name = do
+  r <- shaped name "v" "a vector of numbers"
+  numeric name r "a vector of numbers"
+  return (map num (rTok r))
+
+getInts :: String -> IO [Int]
+getInts name = do
+  r <- shaped name "v" "a vector of numbers"
+  numeric name r "a vector of numbers"
+  return (map read (rTok r))
+
+getTexts :: String -> IO [String]
+getTexts name = do
+  r <- shaped name "v" "a vector of text"
+  unless (rType r == "vector::text") $ signetFail ("input " ++ name ++ " is " ++ rType r ++ ", not a vector of text")
+  return (map unescape (rTok r))
+
+getComplexes :: String -> IO [Complex Double]
+getComplexes name = pairs . rTok <$> shaped name "vc" "a vector of complex numbers"
+
+pairs :: [String] -> [Complex Double]
+pairs (a : b : rest) = (num a :+ num b) : pairs rest
+pairs _ = []
+
+getQuaternions :: String -> IO [Quaternion]
+getQuaternions name = quats . rTok <$> shaped name "vq" "a vector of quaternions"
+
+series :: String -> String -> String -> Int -> ([String] -> [a]) -> IO (Series a)
+series name shape want per f = do
+  r <- shaped name shape want
+  k <- read <$> tok name r 1
+  _ <- tok name r (1 + k + per * k)
+  let rest = drop 2 (rTok r)
+  return (Series (unescape (head (rTok r))) (map num (take k rest)) (f (take (per * k) (drop k rest))))
+
+getSeries :: String -> IO (Series Double)
+getSeries name = series name "xs" "a real series" 1 (map num)
+
+getComplexSeries :: String -> IO (Series (Complex Double))
+getComplexSeries name = series name "xc" "a complex series" 2 pairs
+
+getQuaternionSeries :: String -> IO (Series Quaternion)
+getQuaternionSeries name = series name "xq" "a quaternion series" 4 quats
+
+-- JSON text for a .sig. NaN and infinity are null, and a float always shows a "."
+jnum :: Double -> String
+jnum d | isNaN d || isInfinite d = "null"
+       | otherwise = show d
+
+jstr :: String -> String
+jstr t = "\"" ++ concatMap esc t ++ "\""
+  where
+    esc '"' = "\\\""
+    esc '\\' = "\\\\"
+    esc '\n' = "\\n"
+    esc '\r' = "\\r"
+    esc '\t' = "\\t"
+    esc c | c < ' ' = "\\u" ++ replicate (4 - length (hex (fromEnum c))) '0' ++ hex (fromEnum c)
+          | otherwise = [c]
+    hex n = let (q, r) = n `divMod` 16 in (if q > 0 then hex q else "") ++ ["0123456789abcdef" !! r]
+
+jlist :: [String] -> String
+jlist xs = "[" ++ intercalate "," xs ++ "]"
+
+jparts :: [(String, [String])] -> String
+jparts kv = "{" ++ intercalate "," [jstr k ++ ":" ++ jlist v | (k, v) <- kv] ++ "}"
+
+jquats :: [Quaternion] -> String
+jquats qs = jparts [(k, map (jnum . f) qs) | (k, f) <- [("w", qw), ("x", qx), ("y", qy), ("z", qz)]]
+
+jcomplexes :: [Complex Double] -> String
+jcomplexes zs = jparts [("re", map (jnum . realPart) zs), ("im", map (jnum . imagPart) zs)]
+
+jseries :: Series a -> String -> String
+jseries s vals = "{\"domain\":" ++ jstr (seriesDomain s) ++ ",\"x\":" ++ jlist (map jnum (seriesX s)) ++ ",\"values\":" ++ vals ++ "}"
+
+-- | What put can write: its JSON text and its own type, given the type asked for
+class Put a where
+  json :: a -> String -> (String, String)
+
+jint :: Integral n => String -> n -> String
+jint ty n = if "float" `isSuffixOf` ty then jnum (fromIntegral n) else show (toInteger n)
+
+instance Put Double where json v _ = (jnum v, "float")
+instance Put Int where json v ty = (jint ty v, "int")
+instance Put Integer where json v ty = (jint ty v, "int")
+instance Put Bool where json v _ = (if v then "true" else "false", "bool")
+instance Put [Char] where json v _ = (jstr v, "text")
+instance Put (Complex Double) where json z _ = ("{\"re\":" ++ jnum (realPart z) ++ ",\"im\":" ++ jnum (imagPart z) ++ "}", "complex")
+instance Put Quaternion where
+  json (Quaternion a b c d) _ = ("{\"w\":" ++ jnum a ++ ",\"x\":" ++ jnum b ++ ",\"y\":" ++ jnum c ++ ",\"z\":" ++ jnum d ++ "}", "quaternion")
+instance Put [Double] where json v _ = (jlist (map jnum v), "vector::float")
+instance Put [Int] where json v ty = (jlist (map (jint ty) v), "vector::int")
+instance Put [[Char]] where json v _ = (jlist (map jstr v), "vector::text")
+instance Put [Complex Double] where json v _ = (jcomplexes v, "vector::complex")
+instance Put [Quaternion] where json v _ = (jquats v, "vector::quaternion")
+instance Put (Series Double) where json s _ = (jseries s (jlist (map jnum (seriesValues s))), "series::" ++ seriesDomain s ++ "::float")
+instance Put (Series (Complex Double)) where json s _ = (jseries s (jcomplexes (seriesValues s)), "series::" ++ seriesDomain s ++ "::complex")
+instance Put (Series Quaternion) where json s _ = (jseries s (jquats (seriesValues s)), "series::" ++ seriesDomain s ++ "::quaternion")
+
+foreign import ccall unsafe "stdio.h rename" c_rename :: CString -> CString -> IO CInt
+foreign import ccall unsafe "stdio.h remove" c_remove :: CString -> IO CInt
+
+-- | Writes output name as <prefix>-<module>.<name>.sig, whole and then renamed so a reader never sees half a file.
+-- The type is the Signet type ("float", "vector::float", ...), or "" for the value's own.
+put :: Put a => String -> a -> String -> IO ()
+put name v ty = do
+  let (text, own) = json v ty
+  m <- envVar "MODULE" >>= maybe (signetFail "SIGNET_MODULE is not set (run from Signet or Starfire)") return
+  prefix <- maybe "" id <$> envVar "PREFIX"
+  let path = (if null prefix then "" else prefix ++ "-") ++ m ++ "." ++ name ++ ".sig"
+      tmp = path ++ ".tmp"
+  withFile tmp WriteMode $ \h -> do
+    hSetEncoding h utf8
+    hPutStrLn h ("{\"value\":" ++ text ++ ",\"type\":" ++ jstr (if null ty then own else ty) ++ "}")
+  ok <- withCString tmp $ \a -> withCString path $ \b -> do
+    r <- c_rename a b
+    if r == 0 then return True else c_remove b >> (== 0) <$> c_rename a b    -- Windows won't rename over a file
+  unless ok $ signetFail ("can't rename " ++ tmp)
 '''
 
 _HELPER_FILES = lambda: {os.path.join("signet", "__init__.py"): _PY_HELPER, "Signet.jl": _JL_HELPER, "signet.hpp": _CPP_HELPER,
                          "signet.rs": _RS_HELPER, "signet.ads": _ADS_HELPER, "signet.adb": _ADB_HELPER, "signet.f90": _F90_HELPER,
-                         "signet.sh": _SH_HELPER, "signet.h": _C_HELPER, "signet.a68": _A68_HELPER}
+                         "signet.sh": _SH_HELPER, "signet.h": _C_HELPER, "signet.a68": _A68_HELPER, "Signet.hs": _HS_HELPER}
 _HELPER_DIR = None
 
 
@@ -8745,13 +9954,15 @@ def export_helpers(dest: str) -> list:
     return out
 
 
-# Modules written in compiled languages: Signet builds <module>.cpp, .rs, .adb or .f90 itself, with the
+# Modules written in compiled languages: Signet builds <module>.cpp, .rs, .adb, .f90 or .hs itself, with the
 # helper above on the compiler's search path, and keeps the binary in the cache until the source changes.
 SOURCE_TYPES = {".c": "c", ".cpp": "cpp", ".cc": "cpp", ".rs": "rust", ".adb": "ada",
-                ".f90": "fortran", ".f95": "fortran", ".f03": "fortran", ".f08": "fortran"}
+                ".f90": "fortran", ".f95": "fortran", ".f03": "fortran", ".f08": "fortran", ".hs": "haskell"}
 SIGNET_TYPES = (".signet", ".sg")      # a module written in Signet
-_COMPILERS = {"c": ("gcc", "cc", "clang"), "cpp": ("g++", "c++", "clang++"), "rust": ("rustc",), "ada": ("gnatmake",), "fortran": ("gfortran",)}
+_COMPILERS = {"c": ("gcc", "cc", "clang"), "cpp": ("g++", "c++", "clang++"), "rust": ("rustc",), "ada": ("gnatmake",), "fortran": ("gfortran",),
+              "haskell": ("ghc",)}
 _BUILD_TIMEOUT = 600          # seconds for one compile
+_EXE = ".exe" if os.name == "nt" else ""
 _NEIGHBOURS = (".h", ".hpp", ".hh", ".ads", ".adb", ".rs", ".inc") + tuple(SOURCE_TYPES)
 _TOOL_IDS = {}
 
@@ -8832,7 +10043,7 @@ def build_module(path: str, log=None) -> list:
             st = os.stat(os.path.join(srcdir, n))
             h.update(f"{n} {st.st_size} {st.st_mtime_ns}".encode())
     base = _cache_base()
-    out = os.path.join(base, "bin", f"{stem}-{h.hexdigest()[:16]}")
+    out = os.path.join(base, "bin", f"{stem}-{h.hexdigest()[:16]}{_EXE}")
     if os.access(out, os.X_OK):
         return [out]
     os.makedirs(os.path.join(base, "bin"), exist_ok=True)
@@ -8841,7 +10052,7 @@ def build_module(path: str, log=None) -> list:
     lib = _support_lib(lang, cc, helpers) if lang in ("rust", "fortran") else ""
     tmp = tempfile.mkdtemp(dir=base, prefix="build-")
     try:
-        exe = os.path.join(tmp, "module")
+        exe = os.path.join(tmp, "module" + _EXE)
         if lang == "c":
             cmd = [cc, "-O2", "-std=c11", "-I", helpers, "-I", srcdir, path, "-o", exe, "-lm"]
         elif lang == "cpp":
@@ -8852,6 +10063,8 @@ def build_module(path: str, log=None) -> list:
                    "--extern", "signet=" + os.path.join(lib, "libsignet.rlib"), path, "-o", exe]
         elif lang == "ada":
             cmd = [cc, "-q", "-O2", "-gnat2012", "-I" + helpers, "-I" + srcdir, path, "-o", exe]
+        elif lang == "haskell":
+            cmd = [cc, "-O1", "-v0", "-i" + helpers, "-i" + srcdir, "-outputdir", tmp, path, "-o", exe]
         else:
             cmd = [cc, "-O2", "-ffree-line-length-none", "-I", lib, "-J", tmp, path, os.path.join(lib, "signet.o"), "-o", exe]
         _build(cmd, tmp, f"building {name}")
@@ -8859,7 +10072,7 @@ def build_module(path: str, log=None) -> list:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     for n in os.listdir(os.path.dirname(out)):    # the older builds of this module
-        if re.fullmatch(re.escape(stem) + r"-[0-9a-f]{16}", n) and n != os.path.basename(out):
+        if re.fullmatch(re.escape(stem) + r"-[0-9a-f]{16}" + re.escape(_EXE), n) and n != os.path.basename(out):
             try:
                 os.remove(os.path.join(os.path.dirname(out), n))
             except OSError:
@@ -8869,6 +10082,16 @@ def build_module(path: str, log=None) -> list:
 
 # The standalone runner: python3 signet.py runner.signet
 _INTERPRETERS = {".py": "python3", ".sh": "bash", ".jl": "julia", ".a68": "a68g"}
+
+
+def _interpreter(interp: str):
+    """The interpreter's path, or None. On Windows, Python is this Python (from source) or python/py on PATH,
+    not the Microsoft Store's python3 stub."""
+    if interp != "python3" or os.name != "nt":
+        return shutil.which(interp)
+    if "__compiled__" not in globals():
+        return sys.executable
+    return next((p for p in map(shutil.which, ("python", "py", "python3")) if p and "WindowsApps" not in p), None)
 
 
 def a68_source(path: str) -> str:
@@ -8949,7 +10172,8 @@ _KIND_HINT = {"range": ": a range is written {lo, hi}", "vector": ": a vector is
 _FITS = {"vector": {"vector"}, "hex": {"hex"}, "int": {"int", "hex"}, "float": {"float", "real", "int", "hex"},
          "real": {"float", "real", "int", "hex"}, "num": {"float", "real", "int", "hex", "num", "complex"},
          "bool": {"bool"}, "complex": {"complex"}, "bus": {"bus"}, "stream": {"stream"}, "tuple": {"tuple"}, "series": {"series"},
-         "bits": {"bits"}, "range": {"range"}}
+         "bits": {"bits"}, "range": {"range"}, "quaternion": {"quaternion"},
+         "hypercomplex": {"float", "real", "int", "hex", "num", "complex", "quaternion", "hypercomplex"}}
 
 
 def _fits(src, dst) -> bool:
@@ -8974,7 +10198,7 @@ def _literal_words(e):
         return ["range"]
     if e[0] == "vec":
         return ["vector"]
-    return {"imag": ["complex"], "str": ["text"], "bool": ["bool"]}.get(e[0])
+    return {"imag": ["complex"], "quat": ["quaternion"], "str": ["text"], "bool": ["bool"]}.get(e[0])
 
 
 def check_wiring(code, ports=lambda m: None, is_file=lambda t: False) -> list:
@@ -9062,7 +10286,7 @@ def check_wiring(code, ports=lambda m: None, is_file=lambda t: False) -> list:
         line = here[0] = nd[1]
         if nd[0] == "connect":
             src = nd[2]
-            w = source(src, line) if src[0] in ("ref", "num", "imag", "str", "bool", "range", "torange", "vec") else reads(src, line)
+            w = source(src, line) if src[0] in ("ref", "num", "imag", "quat", "str", "bool", "range", "torange", "vec") else reads(src, line)
             target(nd[3], nd[4], nd[5], line, w)
         elif nd[0] == "route":
             w = source(nd[3], line) if nd[3][0] == "ref" else reads(nd[3], line)
@@ -9234,7 +10458,7 @@ class FolderHost:
     def _hits(self, module):
         return [n for n in sorted(os.listdir("."))
                 if n != "signet.py" and os.path.isfile(n) and (n in (module + e for e in (*_INTERPRETERS, *SOURCE_TYPES, *SIGNET_TYPES))
-                                                               or (n == module and os.access(n, os.X_OK)))]
+                                                               or (n == module + _EXE and os.access(n, os.X_OK)))]
 
     @staticmethod
     def _file_ports(name):
@@ -9279,7 +10503,7 @@ class FolderHost:
         if os.path.splitext(name)[1].lower() in SOURCE_TYPES:
             argv = build_module(name, lambda t: print("signet: " + t, file=sys.stderr, flush=True))
         elif interp:
-            found = shutil.which(interp)
+            found = _interpreter(interp)
             if not found:
                 raise LookupError(f"{interp} not found on PATH (needed to run {name})")
             argv = [found, "--quiet", a68_source(name)] if interp == "a68g" else [found] + argv
@@ -9352,10 +10576,13 @@ def main(argv=None) -> int:
     ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE", help="a parameter for $NAME")
     ap.add_argument("--check", action="store_true", help="only read the file and report bad lines")
     ap.add_argument("--lineage", metavar="SIG", help="show the chain that made a Signal (name.sig or name!) in this folder, and stop")
-    ap.add_argument("--export-helpers", metavar="DIR", help="write the module helpers (Python, Julia, shell, C, C++, Rust, Ada, Fortran, ALGOL 68) into DIR and stop")
+    ap.add_argument("--export-helpers", metavar="DIR", help="write the module helpers (Python, Julia, shell, C, C++, Rust, Ada, Fortran, ALGOL 68, Haskell) into DIR and stop")
     ap.add_argument("--connections", action="store_true", help="print the file's connect()s as JSON, without running it, and stop")
     ap.add_argument("--version", action="version", version=f"signet {VERSION} (API {API})")
     a = ap.parse_args(argv)
+    if os.name == "nt":                # a pipe would otherwise be the ANSI code page
+        for f in (sys.stdout, sys.stderr):
+            f.reconfigure(encoding="utf-8")
     if a.export_helpers:
         for p in export_helpers(a.export_helpers):
             print(p)
@@ -9423,9 +10650,9 @@ _HELPER_MODULE = None
 
 def __getattr__(name):
     # A module in the same folder as signet.py imports this file rather than the helper package,
-    # so `from signet import signals` (and Series, Bus) is answered with the same helper.
+    # so `from signet import signals` (and Series, Bus, Quaternion) is answered with the same helper.
     global _HELPER_MODULE
-    if name in ("signals", "Series", "Bus", "Stream"):
+    if name in ("signals", "Series", "Bus", "Stream", "Quaternion"):
         if _HELPER_MODULE is None:
             import types
             _HELPER_MODULE = types.ModuleType("signet_helper")
