@@ -740,11 +740,11 @@ function modulePanelHtml(i, p) {
 }
 
 // Pinned modules (the campaign's Modules table): up to 4 in this point's scope, shown while the module column is open.
-const SOURCE_EXT = /^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i;   // sources Signet builds
+const SOURCE_EXT = /^\.(c|cpp|cc|rs|adb|f90|f95|f03|f08|hs)$/i;   // sources Signet builds
 function moduleKind(name) {
   const dot = (name || "").lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot) : "";
-  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg", ".sg": "sg"})[ext] || (SOURCE_EXT.test(ext) ? "src" : "other");
+  return ext === "" ? "bin" : ({".exe": "bin", ".py": "py", ".jl": "jl", ".sh": "sh", ".a68": "a68", ".signet": "sg", ".sg": "sg"})[ext] || (SOURCE_EXT.test(ext) ? "src" : "other");
 }
 function pinnedFor(p) {
   return campaignModules().filter(m => m.pinned && (m.module || "").trim() && moduleInScope(m, card.id, p.seq)).map(m => m.module).slice(0, 4);
