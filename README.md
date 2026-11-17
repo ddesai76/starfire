@@ -1,10 +1,10 @@
 # Starfire
 
-**Starfire 4.5.0 (Altair)** is a test design suite for test campaigns, test cards and reports, run in the browser. Test cards are made of test points, and each point can run a **module** (a program in any language) and record its result.
+**Starfire 4.6.0 (Bellatrix)** is a test design suite for test campaigns, test cards and reports, run in the browser. Test cards are made of test points, and each point can run a **module** (a program in any language) and record its result.
 
 Starfire works with [Signet](https://github.com/ddesai76/signet), a coordination language whose code goes in each point's Signals box. A test card's modules and the Signals connecting them make up a **System**, which Starfire draws as a block diagram.
 
-This repository goes with the book *The Signet Programming Language* (Daniel Desai, 2026), Chapters 11–15.
+For further detail, see *The Signet Programming Language* (Daniel Desai, 2026), Chapters 11–15.
 
 ## Contents
 
@@ -12,6 +12,9 @@ This repository goes with the book *The Signet Programming Language* (Daniel Des
 |---|---|
 | `starfire.py` | The server and application |
 | `starfi.sh` | Builds the Linux binary `starfire` (PyInstaller), and runs it |
+| `starfire.ps1` | Builds the Windows binary `starfire.exe` (PyInstaller), and runs it |
+| `tests/smoke.py` | Smoke test over the HTTP API, from source or a built binary |
+| `.github/workflows/smoke.yml` | Runs the smoke test on Linux and Windows |
 | `static/starfire.css` | Styles: dark (NVIS) and mono themes |
 | `static/campaign.html` | The campaign page |
 | `static/test.html` | The test card page |
@@ -19,9 +22,9 @@ This repository goes with the book *The Signet Programming Language* (Daniel Des
 
 ## Requirements
 
-Starfire runs on Linux. It needs:
+Starfire runs on Linux and Windows. It needs:
 
-- Python 3
+- Python 3 (on Windows, from python.org or winget, not the Microsoft Store stub)
 - `python-docx` (`.docx` export)
 - NumPy 2 or later (the test point Calculator)
 - Optionally, `signet.py` from the [Signet repo](https://github.com/ddesai76/signet), placed next to `starfire.py`. Without it, Starfire builds and runs as usual, but the Signals box, live list, System diagrams and stamping are off.
@@ -29,7 +32,7 @@ Starfire runs on Linux. It needs:
 - To build the binary, PyInstaller.
 
 ```sh
-pip install python-docx numpy pyinstaller
+python3 -m pip install python-docx numpy pyinstaller      # Windows: python -m pip install ...
 ```
 
 ## Quick start
@@ -38,6 +41,7 @@ From source:
 
 ```sh
 python3 starfire.py [--port <n>] [--no-browser]     # → http://localhost:5791
+python starfire.py [--port <n>] [--no-browser]      # Windows
 ```
 
 Or build and run the standalone binary with `starfi.sh`:
@@ -58,10 +62,24 @@ The build puts `starfire`, and `jira_config.json` if present, into `dist/`. If `
 - `--clean` also deletes any modules already in `dist/`.
 - `--install-desktop` uses `static/assets/icon.png` for the menu entry, if present.
 
+On Windows, `starfire.ps1` does the same in PowerShell and builds `dist\starfire.exe`:
+
+```powershell
+.\starfire.ps1                      # run dist\starfire.exe (no build)
+.\starfire.ps1 -Build               # build only
+.\starfire.ps1 -All                 # build, then run
+.\starfire.ps1 -Clean -All          # delete dist\, then build and run
+.\starfire.ps1 -Clean               # just delete dist\
+.\starfire.ps1 -All -New dist2      # build and run in dist2\
+```
+
+If scripts are blocked, run it as `powershell -ExecutionPolicy Bypass -File starfire.ps1 -All`. There is no `--install-desktop`: pin `starfire.exe` to Start instead.
+
 Folder layout before a build:
 
 ```
-├── starfi.sh
+├── starfi.sh          (Linux)
+├── starfire.ps1       (Windows)
 ├── starfire.py
 ├── signet.py          (optional)
 └── static
@@ -73,6 +91,8 @@ Folder layout before a build:
 ```
 
 Modules go in `dist/`, next to the `starfire` binary or `starfire.py`.
+
+Each push runs `tests/smoke.py` on Linux and Windows (GitHub Actions), from source and against the built binary. To run it yourself: `python3 tests/smoke.py starfire.py` or `python3 tests/smoke.py dist/starfire`.
 
 ## Campaigns
 
@@ -124,9 +144,11 @@ Each point has six tools:
    - `TC-001`: any point on card `TC-001`;
    - `TC-001-20`: only point 20 of `TC-001`.
 
-   Pinned modules show as icons on the points in their scope. Module names are colored by type: amber `.py`, blue `.jl`, white `.sh`, purple `.sg`, green a binary, and magenta a source Signet builds (`.c`, `.cpp`, `.rs`, `.adb`, `.f90`).
+   Pinned modules show as icons on the points in their scope. Module names are colored by type: amber `.py`, blue `.jl`, white `.sh`, indigo `.a68` (ALGOL 68, run by `a68g`), purple `.sg`, green a binary (`.exe` on Windows), and magenta a source Signet builds (`.c`, `.cpp`, `.rs`, `.adb`, `.f90`, `.hs`).
 3. Draft the points on a card opened from the Test Series table.
 4. Press Activate, enter the Signals code, and press RUN.
+
+A run is stopped after an hour; set `STARFIRE_MODULE_TIMEOUT` (seconds) to change that. BREAK asks the module and its child processes to stop (SIGTERM; Ctrl+Break on Windows) and forces them after 3 s. On Windows a `.py` module runs with the Python that runs Starfire (or, for `starfire.exe`, `python` on the `PATH`), and a `.sh` module needs `bash` (Git Bash) on the `PATH`.
 
 A module declares its ports in a comment, as in Signet:
 
@@ -148,6 +170,8 @@ connect(TC-002-10:watts!, report.watts)     # …or from point 10 on card TC-002
 ```
 
 Parameters are `$name` on the current point and `<point>:$name` on another one. A module also sees them as `STARFIRE_PARAM_<NAME>` environment variables. A run writes and stamps Signals named after the campaign, card, point, module and port, for example `SC-001-TC-001-10-source.k1.sig`.
+
+Signals can be numbers, text, vectors, series, complex numbers and quaternions (`hypercomplex` as a declared port type takes a real, complex or quaternion number). The System view plots a vector or series, with one line for each part of a complex (re, im) or quaternion (w, x, y, z) series.
 
 **BUILD SYSTEM** in a card's sidebar opens an `SY-xxx` tab (`TC-001` opens `SY-001`). It shows the card's modules, sources and live files, with one line per source of every `connect()`. A box is outlined by its module's last run, and a line turns amber when its source has data. Stepped feedback loops are drawn dashed.
 
@@ -184,6 +208,7 @@ Starfire runs in dark mode by default. Its palette follows military night-vision
 | Red | `#FF2800` | Failed runs and errors |
 | Magenta | `#FD3DB5` | Signals in code |
 | Purple | `#B388FF` | Signet modules, commands in code |
+| Indigo | `#6B7BFF` | ALGOL 68 modules |
 
 ## Security
 
@@ -193,4 +218,3 @@ The server listens on `localhost` only. POST requests must carry a JSON content 
 
 MIT. The software is provided "as is", without warranty of any kind. See `LICENSE`.
 
-Developed with AI assistance (Claude, Anthropic); all technical claims and results were reviewed and verified by the author.
