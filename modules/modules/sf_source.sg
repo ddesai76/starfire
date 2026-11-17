@@ -1,3 +1,0 @@
-# signet: out float::k1
-where quantity = 1.234
-output(float::k1, quantity)

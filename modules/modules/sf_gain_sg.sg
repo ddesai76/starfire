@@ -1,3 +1,0 @@
-# signet: in float::k1, in series::time::float::s1, out series::time::float::s2
-gain(a) = a * k1
-output(s2, warp(unity, gain, s1))

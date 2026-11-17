@@ -1,8 +1,0 @@
-# signet: in float::k1, in series::time::float::s1, out series::time::float::s2 #
-REAL k1 = signet get real ("k1");
-SIGNETSERIES s1 = signet get series ("s1");
-[LWB values OF s1 : UPB values OF s1] REAL s2;
-FOR i FROM LWB s2 TO UPB s2 DO
-   s2[i] := k1 * (values OF s1)[i]
-OD;
-signet put series ("s2", (domain OF s1, x OF s1, s2), "")
