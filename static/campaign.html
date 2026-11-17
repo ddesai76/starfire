@@ -162,13 +162,14 @@ document.getElementById("addReqBtn").addEventListener("click", () => {
 // Activate button may run. Scope blank = any point; TC-001 = any point on
 // that card; TC-001-20 = that point only.
 let moduleFiles = [];
+let moduleWin = false;      // the server runs on Windows (from /list_modules)
 // Kind by name, mirroring how the server runs it (case-sensitive, like os.path.splitext):
-// no extension = a binary, .py/.jl/.sh/.signet = that language, a source Signet builds = "src", anything else = "other".
+// no extension or .exe = a binary, .py/.jl/.sh/.a68/.signet/.sg = that language, a source Signet builds = "src", anything else = "other".
 function moduleKind(name) {
   if (!name) return "";
   const dot = name.lastIndexOf(".");
   const ext = dot > 0 ? name.slice(dot) : "";
-  return ext === "" ? "bin" : ({".py": "py", ".jl": "jl", ".sh": "sh", ".signet": "sg"})[ext] || (/^\.(cpp|cc|rs|adb|f90|f95|f03|f08)$/i.test(ext) ? "src" : "other");
+  return ext === "" ? "bin" : ({".exe": "bin", ".py": "py", ".jl": "jl", ".sh": "sh", ".a68": "a68", ".signet": "sg", ".sg": "sg"})[ext] || (/^\.(c|cpp|cc|rs|adb|f90|f95|f03|f08|hs)$/i.test(ext) ? "src" : "other");
 }
 function renderModules() {
   const t = document.getElementById("modTable");
@@ -202,13 +203,14 @@ function renderModules() {
     btn.addEventListener("click", () => { camp.modules.splice(+btn.dataset.del, 1); renderModules(); });
   });
   document.getElementById("modHint").textContent = !moduleFiles.length
-    ? "No runnable files found. Put programs (chmod +x) or .py / .sh / .jl / .signet scripts, or .cpp / .rs / .adb / .f90 sources in the dist/ folder next to starfire."
+    ? `No runnable files found. Put programs (${moduleWin ? ".exe" : "chmod +x"}) or .py / .sh / .jl / .a68 / .signet / .sg scripts, or .c / .cpp / .rs / .adb / .f90 / .hs sources in the dist/ folder next to starfire.`
     : camp.modules.filter(m => m.pinned).length > 4 ? "More than 4 modules pinned: a test point shows the first 4 in its scope." : "";
 }
 async function loadModuleFiles() {
   try {
     const res = await fetch("/list_modules");
-    const next = (await res.json()).modules || [];
+    const j = await res.json(), next = j.modules || [];
+    moduleWin = !!j.windows;
     // Redrawing while a picker is open would close it, so only when the list actually changed.
     if (JSON.stringify(next) !== JSON.stringify(moduleFiles)) { moduleFiles = next; renderModules(); }
   } catch (err) { /* leave the list as it was */ }
