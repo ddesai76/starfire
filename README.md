@@ -13,8 +13,6 @@ For further detail, see *The Signet Programming Language* (Daniel Desai, 2026), 
 | `starfire.py` | The server and application |
 | `starfi.sh` | Builds the Linux binary `starfire` (PyInstaller), and runs it |
 | `starfire.ps1` | Builds the Windows binary `starfire.exe` (PyInstaller), and runs it |
-| `tests/smoke.py` | Smoke test over the HTTP API, from source or a built binary |
-| `.github/workflows/smoke.yml` | Runs the smoke test on Linux and Windows |
 | `static/starfire.css` | Styles: dark (NVIS) and mono themes |
 | `static/campaign.html` | The campaign page |
 | `static/test.html` | The test card page |
