@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# signet.py:      SIGNET PROGRAMMING LANGUAGE
+# signet.py:      SIGNET PROGRAMMING LANGUAGE SPECIFICATION
 # AUTHOR:         DANIEL DESAI
 # UPDATED:        2026-11-17
 # VERSION:        26.b.0.1.7
