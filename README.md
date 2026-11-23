@@ -1,8 +1,8 @@
 # Starfire
 
-**Starfire 4.6.0 (Bellatrix)** is a test design suite for test campaigns, test cards and reports, that runs in a browser. Test cards comprise a series of test points, and each point can run a **module** (a program in any language) and record its result.
+**Starfire 4.6.3 (Bellatrix)** is a test design suite for test campaigns, test cards and reports, that runs in a browser. Test cards comprise a series of test points, and each point can run a **module** (a program in any language) and record its result.
 
-Starfire works with [Signet](https://github.com/ddesai76/signet), a coordination language whose code goes in each point's Signals box. A test card's modules and the Signals connecting them make up a **System**, which Starfire draws as a block diagram.
+Starfire is designed to work with [Signet](https://github.com/ddesai76/signet), a coordination language whose code goes in each point's Signals box. A test card's modules and the Signals connecting them make up a **System**, which Starfire draws as a block diagram.
 
 For further detail, see *The Signet Programming Language* (Daniel Desai, 2026), Chapters 11–15.
 
@@ -13,10 +13,12 @@ For further detail, see *The Signet Programming Language* (Daniel Desai, 2026), 
 | `starfire.py` | The server and application |
 | `starfi.sh` | Builds the Linux binary `starfire` (PyInstaller), and runs it |
 | `starfire.ps1` | Builds the Windows binary `starfire.exe` (PyInstaller), and runs it |
-| `static/starfire.css` | Styles: dark (NVIS) and mono themes |
+| `static/starfire.css` | Styles |
 | `static/campaign.html` | The campaign page |
 | `static/test.html` | The test card page |
 | `static/system.html` | The System view |
+| `tests/regress.py` | Regression suite over the HTTP API, from source or a built binary |
+| `.github/workflows/regress.yml` | Runs it on Linux and Windows |
 
 ## Requirements
 
@@ -41,6 +43,8 @@ From source:
 python3 starfire.py [--port <n>] [--no-browser]     # → http://localhost:5791
 python starfire.py [--port <n>] [--no-browser]      # Windows
 ```
+
+Starfire prints its working folder (where cards, campaigns and run outputs go: the folder it was started in) and its modules folder. If Starfire is already running in the same folder, a second copy opens that one instead; if it is running in another folder, the second copy starts on the next free port.
 
 Or build and run the standalone binary with `starfi.sh`:
 
@@ -88,9 +92,9 @@ Folder layout before a build:
     └── test.html
 ```
 
-Modules go in `dist/`, next to the `starfire` binary or `starfire.py`.
+Modules go in `dist/` beside `starfire.py`, or beside the `starfire` binary. For your own work, keep a project folder holding the binary and its modules; a `dist/` folder beside the binary is used instead, if there is one. A `.starfireignore` file in the modules folder lists files that aren't modules (wiring scripts, helper tools), one file-name pattern per line, such as `*.sg` or `outline.py`.
 
-Each push runs `tests/smoke.py` on Linux and Windows (GitHub Actions), from source and against the built binary. To run it yourself: `python3 tests/smoke.py starfire.py` or `python3 tests/smoke.py dist/starfire`.
+Each push runs `tests/regress.py` on Linux and Windows (GitHub Actions), from source and against the built binary, and must stay at 0 failed. It brings its own small modules, so it doesn't depend on the examples in `modules/`. To run it yourself: `python3 tests/regress.py starfire.py` or `python3 tests/regress.py dist/starfire` (add `-k gain` for just the cases named gain).
 
 ## Campaigns
 
@@ -171,6 +175,8 @@ Parameters are `$name` on the current point and `<point>:$name` on another one. 
 
 Signals can be numbers, text, vectors, series, complex numbers and quaternions (`hypercomplex` as a declared port type takes a real, complex or quaternion number). The System view plots a vector or series, with one line for each part of a complex (re, im) or quaternion (w, x, y, z) series.
 
+**IMPORT WIRING (.SG)** in the campaign sidebar turns a Signet wiring script (`connect()`, `run()` and comments) into a new card. Each module gets a point: modules in series are numbered 10, 20, 30, and modules that don't feed each other share a step, 10, 11, 12. Each point's Signals box holds the `connect()`s into its module, and its action is the comment above them. The campaign gets each module pinned and scoped to its point, the card as a Test Series row, and every output a later point connects ticked live. **EXPORT WIRING (.SG)** in a card's sidebar does the reverse, one `run()` per point with a module. From a terminal, `python3 starfire.py --import-sg SCRIPT.sg [--id TC-001] [--camp SC-001.camp]` writes the card (and updates the campaign) without opening the browser.
+
 **BUILD SYSTEM** in a card's sidebar opens an `SY-xxx` tab (`TC-001` opens `SY-001`). It shows the card's modules, sources and live files, with one line per source of every `connect()`. A box is outlined by its module's last run, and a line turns amber when its source has data. Stepped feedback loops are drawn dashed.
 
 ## Reports and export
@@ -195,7 +201,16 @@ Signals can be numbers, text, vectors, series, complex numbers and quaternions (
 
 ## Look and feel
 
-Starfire runs in dark mode by default. Its palette follows military night-vision (NVIS) lighting, to suit darkened test areas and cockpits, and its font is Airbus B612, designed for cockpit displays. **MONO MODE** in the campaign sidebar switches every page to monochrome, and the choice is remembered. When building from source, you can change the mono colors with `--ink` and `--paper` in `static/starfire.css`.
+Starfire runs in dark mode by default. Its palette follows military night-vision (NVIS) lighting, to suit darkened test areas and cockpits, and its font is Airbus B612, designed for cockpit displays. **THEME** in the campaign sidebar cycles every page through four themes, and the choice is remembered:
+
+| Theme | Look |
+|---|---|
+| Dark | The default, in the colors below |
+| B/W | Black on white, for screenshots and black-and-white reports |
+| Retro | Amber `#FFB300` on `#0B0A0C` |
+| NVIS | NVIS green `#39FF14` on `#0B0A0C` |
+
+B/W, Retro and NVIS each draw everything in one color (their `--ink`) on one background (`--paper`), set in `static/starfire.css`. Report previews stay black on white in all three, as printed.
 
 | Color | Hex | Used for |
 |---|---|---|
@@ -215,4 +230,3 @@ The server listens on `localhost` only. POST requests must carry a JSON content 
 ## License
 
 MIT. The software is provided "as is", without warranty of any kind. See `LICENSE`.
-
