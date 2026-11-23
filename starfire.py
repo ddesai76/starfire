@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 
-# starfire.py:    TEST CAMPAIGN / TEST CARD DESIGNER
+# starfire.py:    TEST ENGINEERING DESIGN SUITE
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-11-17
-# VERSION:        4.6.0 (BELLATRIX)
+# UPDATED:        2026-11-22
+# VERSION:        4.6.3 (BELLATRIX)
 #
 
 """
@@ -22,6 +22,7 @@ import base64
 import binascii
 import csv
 import errno
+import fnmatch
 import io
 import json
 import math
@@ -430,6 +431,169 @@ def create_test(camp: Campaign, codes: list) -> dict:
     with open(os.path.join(os.getcwd(), test_filename(card.id)), "w", encoding="utf-8") as f:
         json.dump(card.to_dict(), f, indent=2)
     return {"id": card.id, "title": "", "author": card.author, "requirements": card.requirements}
+
+
+# ---- Wiring scripts (.sg) in and out of a card: one point per module (after signet2starfire.py) ----
+# Modules in series are numbered 10, 20, 30; modules that don't feed each other share a step: 10, 11, 12.
+
+_WIRE_STMT = re.compile(r"\s*(connect|run)\s*\(")
+_WIRE_PARAM = re.compile(r"\$([A-Za-z_]\w*)")
+_WIRE_POINT_REF = re.compile(r"(?<![\w:.-])(?:[\w.-]+:)+(?=[A-Za-z_][\w-]*\.[A-Za-z_]\w*(?:!|\.sig))")   # 10:, SC-001:TC-001-10:
+
+
+def _wire_statements(text: str) -> list:
+    """[(comments, code, line)] for each connect() or run(): the comment block just above it, and its code,
+    joined across lines until the brackets close."""
+    out, notes, code, start = [], [], [], 0
+    for n, line in enumerate(text.splitlines(), 1):
+        s = line.strip()
+        if code:
+            code.append(line)
+        elif not s:
+            notes = []
+            continue
+        elif s.startswith("#"):
+            notes.append(line)
+            continue
+        elif _WIRE_STMT.match(line):
+            code, start = [line], n
+        else:
+            raise ValueError(f"line {n}: only connect(), run() and comments can be split into points: {s}")
+        joined = "\n".join(code)
+        if joined.count("(") <= joined.count(")"):
+            out.append((notes, joined, start))
+            notes, code = [], []
+    if code:
+        raise ValueError(f"line {start}: unclosed statement")
+    return out
+
+
+def _wire_split(text: str) -> dict:
+    """{module: {"box": [lines], "feeds": {module: [ports]}, "params": [names]}} in run() order."""
+    mods = {}
+    mod = lambda stem: mods.setdefault(stem, {"box": [], "feeds": {}, "params": []})
+    for notes, code, line in _wire_statements(text):
+        if code.lstrip().startswith("run"):
+            stem = re.search(r"\(\s*([A-Za-z_][\w-]*)\s*\)", code)
+            if not stem:
+                raise ValueError(f"line {line}: run() takes a module name here")
+            m = mod(stem.group(1))
+            if notes and not m["box"]:
+                m["box"] += notes
+            continue
+        (c,) = signet.connections(code, points=True)
+        if not c["module"]:
+            raise ValueError(f"line {line}: connect to a module, not a point")
+        m = mod(c["module"])
+        if m["box"] and notes:
+            m["box"].append("")
+        m["box"] += notes + [code]
+        for ref in c["refs"]:
+            parts = ref[:-4].split(".") if ref.endswith(".sig") else []
+            if len(parts) == 2 and parts[0] != c["module"]:
+                m["feeds"].setdefault(parts[0], []).append(parts[1])
+        for p in _WIRE_PARAM.findall(code):
+            if p not in m["params"]:
+                m["params"].append(p)
+    for stem, m in mods.items():
+        for src in m["feeds"]:
+            if src not in mods:
+                raise ValueError(f"{stem} connects {src}'s output, but nothing runs it")
+    return mods
+
+
+def _wire_number(mods: dict) -> dict:
+    """{stem: point}: 10 per step in series, +1 for each module beside another in the same step."""
+    level = {}
+
+    def depth(stem, seen=()):
+        if stem in seen:
+            raise ValueError("modules feed each other: " + " -> ".join(seen + (stem,)))
+        if stem not in level:
+            level[stem] = 1 + max((depth(s, seen + (stem,)) for s in mods[stem]["feeds"]), default=0)
+        return level[stem]
+
+    for stem in mods:
+        depth(stem)
+    steps = {}
+    for stem in mods:               # run() order within a step
+        steps.setdefault(level[stem], []).append(stem)
+    if max((len(v) for v in steps.values()), default=0) > 9:
+        raise ValueError("more than 9 modules side by side in one step")
+    return {stem: 10 * lv + k for lv, stems in steps.items() for k, stem in enumerate(stems)}
+
+
+def import_wiring(text: str, camp: dict, card_id: str = "") -> dict:
+    """Writes a card from a .sg wiring script; returns {"id", "points": [[seq, module]], "campaign"}: camp with
+    each module pinned and scoped to its point, the card as a Test Series row, and every output a later point
+    connects ticked live."""
+    if not signet:
+        raise ValueError(_NO_SIGNET)
+    mods = _wire_split(text)
+    if not mods:
+        raise ValueError("no connect() or run() in this script")
+    seqs = _wire_number(mods)
+    names, files = list_modules(), {}
+    for stem in mods:
+        hits = [n for n in names if os.path.splitext(n)[0] == stem]
+        if len(hits) != 1:
+            raise ValueError(f"{stem}: expected one module file in {_modules_dir()}, found {', '.join(hits) or 'none'}")
+        files[stem] = hits[0]
+    c = Campaign.from_dict(camp or {})
+    cid = card_id or next_test_id(c)
+    if os.path.exists(os.path.join(os.getcwd(), test_filename(cid))):
+        raise ValueError(f"{test_filename(cid)} already exists here")
+    order = sorted(mods, key=seqs.get)
+    points = []
+    for stem in order:
+        m = mods[stem]
+        first = next((ln.strip().lstrip("#").strip() for ln in m["box"] if ln.strip().startswith("#")), "")
+        points.append(TestPoint(seq=seqs[stem], action=first.split(":")[0] or f"Run {stem}", parameters=[[p, ""] for p in m["params"]],
+                                signals="\n".join(m["box"]) + "\n" if m["box"] else "", module=files[stem]))
+    card = TestCard(id=cid, title="", author=c.test_lead or c.author, project=c.project,
+                    quality_assurance=c.quality_assurance, points=points)
+    with open(os.path.join(os.getcwd(), test_filename(cid)), "w", encoding="utf-8") as f:
+        json.dump(card.to_dict(), f, indent=2)
+    camp = dict(camp or {})
+    rows, tests, live = list(camp.get("modules") or []), list(camp.get("tests") or []), list(camp.get("live") or [])
+    for stem in order:
+        scope = f"{cid}-{seqs[stem]}"
+        if not any(r.get("module") == files[stem] and r.get("scope") == scope for r in rows):
+            rows.append({"module": files[stem], "description": "", "scope": scope, "pinned": True})
+    if not any(t.get("test_id") == cid for t in tests + list(camp.get("ancillary_tests") or [])):
+        tests.append({"seq": max((int(t.get("seq") or 0) for t in tests), default=0) + 1, "test_id": cid, "title": "",
+                      "author": card.author, "requirements": ""})
+    head = _point_prefix(c.id, cid)
+    for stem in order:
+        for src, ports in mods[stem]["feeds"].items():
+            for port in ports:
+                entry = {"card": cid, "point": str(seqs[src]), "file": f"{head}-{seqs[src]}-{src}.{port}.sig"}
+                if entry not in live:
+                    live.append(entry)
+    camp.update(modules=rows, tests=tests, live=live)
+    return {"id": cid, "points": [[seqs[s], files[s]] for s in order], "campaign": camp}
+
+
+def export_wiring(card: TestCard) -> str:
+    """A card's wiring as a .sg script: for each point with a module, its Signals box (point references back in
+    script form) and run(module), in point order."""
+    pts = sorted((p for p in card.points if (p.module or "").strip()), key=lambda p: _seq_int(p.seq))
+    stems = [os.path.splitext(p.module.strip())[0] for p in pts]
+    twice = sorted({s for s in stems if stems.count(s) > 1})
+    if twice:
+        raise ValueError(f"{', '.join(twice)} runs on more than one point; a wiring script can't tell them apart")
+    if not pts:
+        raise ValueError("no point on this card runs a module")
+    out = [f"# {card.id}" + (f": {card.title}" if card.title else ""), ""]
+    for p, stem in zip(pts, stems):
+        box = _WIRE_POINT_REF.sub("", (p.signals or "").strip())
+        action = (p.action or "").strip().splitlines()
+        if action and not box.startswith("#"):
+            out.append(f"# {action[0]}")
+        if box:
+            out.append(box)
+        out += [f"run({stem})", ""]
+    return "\n".join(out)
 
 
 def card_text(text: str):
@@ -1451,9 +1615,10 @@ def _program_dir() -> str:
 
 
 def _modules_dir() -> str:
-    # The dist/ folder: next to the built binary, or ./dist beside this script when run from source (where starfi.sh puts its output).
+    # dist/ beside this script or the binary, if there is one; else the binary's own folder (a project folder, or dist/ itself).
     here = _program_dir()
-    return here if getattr(sys, "frozen", False) else os.path.join(here, "dist")
+    d = os.path.join(here, "dist")
+    return d if os.path.isdir(d) or not getattr(sys, "frozen", False) else here
 
 
 # Jira tickets: on only if jira_config.json is in the working directory or next to the program.
@@ -1676,13 +1841,23 @@ def _interpreter(interp: str):
 def list_modules() -> list:
     """Names of runnable files in dist/: regular, not hidden, not Starfire's
     own, and either an interpreted type (.py, .sh, .jl, .a68, .signet, .sg), a source Signet builds
-    (.c, .cpp, .rs, .adb, .f90, .hs) or executable (.exe on Windows)."""
+    (.c, .cpp, .rs, .adb, .f90, .hs) or executable (.exe on Windows); none matching .starfireignore."""
     d = _modules_dir()
     try:
         names = os.listdir(d)
     except OSError:
         return []
-    return sorted(n for n in names if _is_module(d, n))
+    skip = _ignored(d)
+    return sorted(n for n in names if _is_module(d, n) and not any(fnmatch.fnmatch(n, p) for p in skip))
+
+
+def _ignored(d: str) -> list:
+    # .starfireignore in the modules folder: file-name patterns (one a line, # comments) that aren't modules
+    try:
+        with open(os.path.join(d, ".starfireignore"), encoding="utf-8") as f:
+            return [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+    except OSError:
+        return []
 
 
 def _module_env(card_id, point_seq, campaign_id="", params=(), stem="", inputs_path="") -> dict:
@@ -1954,7 +2129,7 @@ def port_map(points) -> dict:
                     f, m = _connectable(ow, nw), _mergeable(ow, nw)
                     if f or m:
                         pairs.append({"src": a["seq"], "out": o, "dst": b["seq"], "input": n, "fits": f, "merge": m})
-    return {"points": rows, "links": links, "pairs": pairs}
+    return {"points": rows, "links": links, "pairs": pairs, "modules_dir": _modules_dir()}
 
 
 def system_graph(card: dict, campaign_id: str, live) -> dict:
@@ -2506,6 +2681,7 @@ def run_module(name: str, card_id: str = "", point_seq: str = "", campaign_id: s
             inputs[port] = v
         if signet:
             decl = _ports_lookup(modules)(stem)
+            inputs = signet.with_defaults(decl, inputs)     # an unconnected optional input gets its default
             errs = signet.contract_errors(stem, decl, inputs=inputs)
             if errs:
                 raise ValueError("; ".join(errs + _elsewhere(stem, point_seq, points, set(inputs))))
@@ -3240,6 +3416,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/signal_value":
             qs = parse_qs(parsed.query)
             self._send_json(200, signal_value((qs.get("file") or [""])[0]))
+        elif path == "/info":           # the folders this copy serves (a second copy asks, see main)
+            self._send_json(200, {"folder": os.getcwd(), "modules": _modules_dir()})
         elif path == "/list_modules":
             self._send_json(200, {"modules": list_modules(), "windows": _WINDOWS})
         elif path == "/point_files":
@@ -3470,10 +3648,12 @@ class _Handler(BaseHTTPRequestHandler):
     def _route_json(self, path: str, data) -> None:
         host = self.headers.get("Host", "localhost")
         # Test-card routes
-        if path in ("/export/csv", "/export/print", "/export/test/docx", "/save"):
+        if path in ("/export/csv", "/export/print", "/export/test/docx", "/export/wiring", "/save"):
             card = TestCard.from_dict(data)
             if path == "/export/csv":
                 self._send(200, "text/csv", export_csv(card).encode())
+            elif path == "/export/wiring":
+                self._send(200, "text/plain; charset=utf-8", export_wiring(card).encode())
             elif path == "/export/print":
                 self._send(200, "text/html", export_print_html(procedure_only(card), host).encode())
             elif path == "/export/test/docx":
@@ -3519,6 +3699,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/feed_card":
             self._send_json(200, feed_card(data))
         # Create test: {"campaign": <the .camp dict>, "requirements": [codes]}
+        elif path == "/import_wiring":
+            self._send_json(200, import_wiring(str(data["script"]), data.get("campaign") or {}))
         elif path == "/create_test":
             self._send_json(200, create_test(Campaign.from_dict(data["campaign"]), data["requirements"]))
         # Test Report routes: {"card", "campaign", "files": {seq: [names]}, "preview"}
@@ -3550,6 +3732,36 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
 
+def _import_sg(script: str, card_id, camp_path) -> int:
+    camp = Campaign(id=os.path.splitext(os.path.basename(camp_path))[0]).to_dict() if camp_path else {}
+    try:
+        if camp_path and os.path.exists(camp_path):
+            with open(camp_path, encoding="utf-8") as f:
+                camp = json.load(f)
+        with open(script, encoding="utf-8") as f:
+            r = import_wiring(f.read(), camp, card_id or "")
+    except (OSError, ValueError) as e:
+        print(f"ERROR: {e}")
+        return 1
+    for seq, name in r["points"]:
+        print(f"{seq:>4}  {name}")
+    print(f"wrote {test_filename(r['id'])}")
+    if camp_path:
+        with open(camp_path, "w", encoding="utf-8") as f:
+            json.dump(r["campaign"], f, indent=2)
+        print(f"wrote {camp_path}: {len(r['campaign']['live'])} live outputs")
+    return 0
+
+
+def _served_folder(port: int):
+    # The working folder of the Starfire already on this port, or None if it isn't Starfire.
+    try:
+        with urllib.request.urlopen(f"http://localhost:{port}/info", timeout=2) as r:
+            return json.load(r).get("folder")
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 class _Server(ThreadingHTTPServer):
     allow_reuse_address = not _WINDOWS     # on Windows SO_REUSEADDR lets a second Starfire share the port
 
@@ -3559,7 +3771,12 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", type=int, default=5791)
     p.add_argument("--no-browser", action="store_true")
+    p.add_argument("--import-sg", metavar="SCRIPT", help="write a card from a .sg wiring script here, then exit")
+    p.add_argument("--id", help="with --import-sg: the card's id (default: the next free TC-nnn)")
+    p.add_argument("--camp", help="with --import-sg: a .camp file to add the card, its modules and live outputs to")
     args = p.parse_args()
+    if args.import_sg:
+        return _import_sg(args.import_sg, args.id, args.camp)
 
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         print("WARNING: Running as root. sudo is not needed to run this --")
@@ -3569,15 +3786,32 @@ def main() -> int:
         print("         so the browser likely will fail to open correctly,")
         print("         and any files this writes would end up root-owned as well.\n")
 
-    url = f"http://localhost:{args.port}"
-    try:
-        server = _Server(("localhost", args.port), _Handler)
-    except OSError as e:
-        print(f"ERROR: can't listen on port {args.port}: {e.strerror}.")
-        if e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None)):
-            print(f"       Starfire (or something else) is already running there: open {url},")
-            print("       stop it first, or use --port to pick another.")
-        return 1
+    port = args.port
+    while True:
+        url = f"http://localhost:{port}"
+        try:
+            server = _Server(("localhost", port), _Handler)
+            break
+        except OSError as e:
+            busy = e.errno in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None))
+            other = _served_folder(port) if busy else None
+            if other is None:
+                print(f"ERROR: can't listen on port {port}: {e.strerror}.")
+                if busy:
+                    print("       Something other than Starfire is using it: use --port to pick another.")
+                return 1
+            if os.path.normcase(os.path.realpath(other)) == os.path.normcase(os.path.realpath(os.getcwd())):
+                print(f"Starfire is already running in this folder: {url}")
+                if not args.no_browser:
+                    webbrowser.open(url)
+                return 0
+            print(f"Starfire on port {port} is serving {other}")
+            if port >= args.port + 20:
+                print("ERROR: no free port nearby: use --port to pick another.")
+                return 1
+            port += 1
+    print(f"Working folder: {os.getcwd()}")
+    print(f"Modules folder: {_modules_dir()}")
     print(f"Serving GUI at {url}")
     print("Press Ctrl+C to stop\n")
     if not args.no_browser:
