@@ -2,8 +2,8 @@
 
 # signet.py:      SIGNET PROGRAMMING LANGUAGE SPECIFICATION
 # AUTHOR:         DANIEL DESAI
-# UPDATED:        2026-11-17
-# VERSION:        26.b.0.1.7
+# UPDATED:        2026-11-19
+# VERSION:        26.b.0.1.7.5
 #
 
 """
@@ -41,7 +41,7 @@ import dataclasses
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-VERSION = "26.b.0.1.7"
+VERSION = "26.b.0.1.7.5"
 API = 2                       # the interface Starfire uses; raised when it changes
 
 _PARAM_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -9967,6 +9967,23 @@ _NEIGHBOURS = (".h", ".hpp", ".hh", ".ads", ".adb", ".rs", ".inc") + tuple(SOURC
 _TOOL_IDS = {}
 
 
+def graph(conns: list) -> str:
+    """The connect()s (from connections()) as a Graphviz graph, as the book's sys2dot.py draws them."""
+    def q(t):
+        return str(t).replace("\\", "\\\\").replace('"', '\\"')
+    out = ["digraph signet {\n  rankdir=LR; node [shape=box];"]
+    for c in conns:
+        dst, port = q(c["module"]), q(c["port"])
+        for ref in c["refs"]:
+            src, sport = (q(x) for x in ref.split(".")[:2])
+            dash = ", style=dashed" if ref in c.get("stepped", ()) else ""
+            out.append(f'  "{src}" -> "{dst}" [label="{sport} \u2192 {port}"{dash}];')
+        for k in c["constants"]:
+            node = f"{dst}.{port}={q(k)}"     # one node per use
+            out += [f'  "{node}" [label="{q(k)}", shape=plaintext];', f'  "{node}" -> "{dst}" [label="{port}"];']
+    return "\n".join(out + ["}"])
+
+
 def _tool_id(cc: str) -> str:
     """A compiler's own version text, so a new compiler rebuilds what the old one built."""
     if cc not in _TOOL_IDS:
@@ -10578,6 +10595,7 @@ def main(argv=None) -> int:
     ap.add_argument("--lineage", metavar="SIG", help="show the chain that made a Signal (name.sig or name!) in this folder, and stop")
     ap.add_argument("--export-helpers", metavar="DIR", help="write the module helpers (Python, Julia, shell, C, C++, Rust, Ada, Fortran, ALGOL 68, Haskell) into DIR and stop")
     ap.add_argument("--connections", action="store_true", help="print the file's connect()s as JSON, without running it, and stop")
+    ap.add_argument("--graph", action="store_true", help="print the system as a Graphviz graph, without running it, and stop")
     ap.add_argument("--version", action="version", version=f"signet {VERSION} (API {API})")
     a = ap.parse_args(argv)
     if os.name == "nt":                # a pipe would otherwise be the ANSI code page
@@ -10604,12 +10622,13 @@ def main(argv=None) -> int:
     except OSError as e:
         print(f"can't read {a.file}: {e.strerror}", file=sys.stderr)
         return 1
-    if a.connections:            # For tools such as visualizer.py, which can't import a binary
+    if a.connections or a.graph:     # For tools such as visualizer.py, which can't import a binary; or Graphviz
         try:
-            print(json.dumps(connections(code, points=True)))
+            c = connections(code, points=True)
         except ValueError as e:
             print(e, file=sys.stderr)
             return 1
+        print(graph(c) if a.graph else json.dumps(c))
         return 0
     params = {}
     for p in a.param:
