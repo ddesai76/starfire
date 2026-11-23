@@ -1,10 +1,10 @@
 # Starfire
 
-**Starfire 4.6.3 (Bellatrix)** is a design suite for engineering test plans (campaigns) and procedures (cards), that runs in a browser. Test cards comprise a series of test points, and each point can run a **module** (a program in any language) and record its result.
+**Starfire 4.6.3 (Bellatrix)** is a design suite for engineering test plans (campaigns) and procedures (cards), that runs in a browser. Test cards comprise a series of test points, and each point can run a ***module*** (a program in any language) and record its result.
 
-Starfire is designed to work with [Signet](https://github.com/ddesai76/signet), a coordination language whose code goes in each point's Signals box. A test card's modules and the Signals connecting them make up a **System**, which Starfire draws as a block diagram.
+Starfire is designed to work with [Signet](https://github.com/ddesai76/signet), a coordination language whose code goes in each point's Signals box. A test card's modules and the Signals connecting them make up a ***System***, which Starfire draws as a block diagram.
 
-Together, Starfire and Signet enable a test evolution to be organized, visualized, and evaluated as a **System of Signals**.
+Together, Starfire and Signet enable a test evolution to be organized, visualized, and evaluated as a ***System of Signals***.
 
 For further detail, see *The Signet Programming Language* (Daniel Desai, 2026), Chapters 11–15.
 
