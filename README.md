@@ -2,7 +2,7 @@
 
 **Starfire 4.6.3 (Bellatrix)** is a design suite for engineering test plans (campaigns) and procedures (cards), that runs in a browser. Test cards comprise a series of test points, and each point can run a ***module*** (a program in any language) and record its result.
 
-Starfire is designed to work with [Signet](https://github.com/ddesai76/signet), a coordination language whose code goes in each point's Signals box. A test card's modules and the Signals connecting them make up a ***System***, which Starfire draws as a block diagram.
+Starfire is designed to work with [Signet](https://github.com/ddesai76/signet), a coordination language for wiring modules written in different languages. Signet comes built into Starfire, and also runs on its own as the `signet` command (`pipx install signet-lang`). Each point's Signals box holds the Signet that connects its module to Signals from earlier points, and a whole card can be imported from or exported as a Signet wiring script (`.sg`). A test card's modules and the Signals connecting them make up a ***System***, which Starfire draws as a block diagram.
 
 Together, Starfire and Signet enable a test evolution to be organized, visualized, and evaluated as a ***System of Signals***.
 
@@ -12,15 +12,15 @@ For further detail, see *The Signet Programming Language* (Daniel Desai, 2026), 
 
 | File | What it is |
 |---|---|
-| `starfire.py` | The server and application |
-| `starfi.sh` | Builds the Linux binary `starfire` (PyInstaller), and runs it |
-| `starfire.ps1` | Builds the Windows binary `starfire.exe` (PyInstaller), and runs it |
+| `starfire.py` | Server and application |
+| `starfi.sh` | Builds/runs the Linux binary `starfire` (PyInstaller) |
+| `starfire.ps1` | Builds/runs the Windows binary `starfire.exe` (PyInstaller) |
 | `static/starfire.css` | Styles |
-| `static/campaign.html` | The campaign page |
-| `static/test.html` | The test card page |
-| `static/system.html` | The System view |
+| `static/campaign.html` | Campaign page |
+| `static/test.html` | Test card page |
+| `static/system.html` | System visualizer |
 | `tests/regress.py` | Regression suite over the HTTP API, from source or a built binary |
-| `.github/workflows/regress.yml` | Runs it on Linux and Windows |
+| `.github/workflows/regress.yml` | Runs on Linux and Windows |
 
 ## Requirements
 
